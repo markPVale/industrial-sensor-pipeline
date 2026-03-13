@@ -1,0 +1,77 @@
+# =============================================================================
+# Gateway Stack — Laptop simulation of Raspberry Pi 5 environment
+# Services: Mosquitto (MQTT), InfluxDB v2 (time-series DB), Grafana (viz)
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down -v   # destroys volumes (data loss)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Mosquitto — MQTT Broker
+  # Port 1883: standard MQTT (used by firmware / mock script / bridge)
+  # Port 9001: MQTT over WebSocket (used by Next.js dashboard directly)
+  # ---------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: sensor_mosquitto
+    ports:
+      - "1883:1883"   # MQTT
+      - "9001:9001"   # MQTT over WebSocket
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # InfluxDB v2 — Time-Series Database
+  # Auto-initialised on first boot via DOCKER_INFLUXDB_INIT_* env vars.
+  # UI available at http://localhost:8086
+  # WARNING: Token below is for local dev only — rotate before any deployment.
+  # ---------------------------------------------------------------------------
+  influxdb:
+    image: influxdb:2.7
+    container_name: sensor_influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=adminpassword
+      - DOCKER_INFLUXDB_INIT_ORG=industrial
+      - DOCKER_INFLUXDB_INIT_BUCKET=sensors
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=dev-token-change-in-production
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Grafana — Dashboards
+  # UI available at http://localhost:3001
+  # Mapped to host port 3001 to avoid conflict with Next.js dev server (3000).
+  # Default login: admin / admin (prompted to change on first boot)
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sensor_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - influxdb
+    restart: unless-stopped
+
+# -----------------------------------------------------------------------------
+# Named Volumes — persist data across container restarts
+# -----------------------------------------------------------------------------
+volumes:
+  mosquitto_data:
+  mosquitto_log:
+  influxdb_data:
+  grafana_data:
