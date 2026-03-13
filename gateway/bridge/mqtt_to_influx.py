@@ -63,7 +63,7 @@ def write_telemetry(node_id: str, payload: dict) -> None:
     )
     # Prefer edge-side timestamp if provided; otherwise InfluxDB uses server time.
     if "timestamp" in payload:
-        point = point.time(int(payload["timestamp"]), WritePrecision.MILLISECONDS)
+        point = point.time(int(payload["timestamp"]), WritePrecision.MS)
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
     log.debug("Written telemetry for %s: rms=%.4f flags=%d",

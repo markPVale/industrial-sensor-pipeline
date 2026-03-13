@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "sensor": {
+      "command": "node",
+      "args": ["./mcp-server/dist/index.js"],
+      "env": {
+        "INFLUX_URL":    "http://localhost:8086",
+        "INFLUX_TOKEN":  "dev-token-change-in-production",
+        "INFLUX_ORG":    "industrial",
+        "INFLUX_BUCKET": "sensors"
+      }
+    }
+  }
+}

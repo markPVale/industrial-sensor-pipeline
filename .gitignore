@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+mcp-server/dist/
+dashboard/.next/
+
+# Misc
+.DS_Store
+*.log
