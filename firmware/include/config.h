@@ -28,7 +28,7 @@
 // -----------------------------------------------------------------------------
 // Store-and-Forward Buffer
 // Sized against available PSRAM. 8MB OPI PSRAM gives ~8,388,608 bytes.
-// TelemetryRecord is 13 bytes; 50,000 records ~ 650 KB — well within budget.
+// TelemetryRecord is 44 bytes; 50,000 records ~ 2.1 MB — well within budget.
 // -----------------------------------------------------------------------------
 #define PSRAM_BUFFER_CAPACITY 50000  // max telemetry records held in PSRAM
 
