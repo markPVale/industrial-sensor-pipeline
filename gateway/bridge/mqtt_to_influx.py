@@ -16,6 +16,7 @@ Environment variables (override defaults for non-local deployments):
 
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -54,20 +55,44 @@ write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
 
 def write_telemetry(node_id: str, payload: dict) -> None:
-    """Write a telemetry record to InfluxDB."""
+    """
+    Write a telemetry record to InfluxDB.
+
+    Payload shape follows docs/telemetry-schema.md.
+    vibration_rms is not transmitted by firmware — it is derived here as
+    sqrt(ax² + ay² + az²) for use by Grafana panels and MCP queries.
+    """
+    ax = float(payload.get("ax", 0.0))
+    ay = float(payload.get("ay", 0.0))
+    az = float(payload.get("az", 0.0))
+    vibration_rms = math.sqrt(ax ** 2 + ay ** 2 + az ** 2)
+
+    flags = int(payload.get("flags", 0))
+
     point = (
         Point("vibration")
         .tag("node_id", node_id)
-        .field("vibration_rms", float(payload["vibration_rms"]))
-        .field("flags", int(payload.get("flags", 0)))
+        # Per-axis filtered values (firmware units)
+        .field("ax",           ax)
+        .field("ay",           ay)
+        .field("az",           az)
+        .field("gx",           float(payload.get("gx", 0.0)))
+        .field("gy",           float(payload.get("gy", 0.0)))
+        .field("gz",           float(payload.get("gz", 0.0)))
+        # Derived metric: accel vector magnitude in m/s²
+        .field("vibration_rms", vibration_rms)
+        # Record identity
+        .field("boot_id",      int(payload.get("boot", 0)))
+        .field("sequence_id",  int(payload.get("seq",  0)))
+        .field("flags",        flags)
     )
-    # Prefer edge-side timestamp if provided; otherwise InfluxDB uses server time.
-    if "timestamp" in payload:
-        point = point.time(int(payload["timestamp"]), WritePrecision.MS)
+    # Prefer edge-side timestamp ("ts") over broker-arrival time.
+    if "ts" in payload:
+        point = point.time(int(payload["ts"]), WritePrecision.MS)
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-    log.debug("Written telemetry for %s: rms=%.4f flags=%d",
-              node_id, payload["vibration_rms"], payload.get("flags", 0))
+    log.debug("Written telemetry for %s: rms=%.4f m/s² flags=0x%02x seq=%d",
+              node_id, vibration_rms, flags, payload.get("seq", -1))
 
 
 def write_estop(node_id: str, payload: dict) -> None:

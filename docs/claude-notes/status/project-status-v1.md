@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Phase 1 complete, Phase 2 in progress (BufferManager + types done)._
+_Last updated: Phase 2 in progress — MQTT + state machine implemented. Ready for intermediate integration checkpoint._
 
 ---
 
@@ -78,12 +78,15 @@ industrial-sensor-pipeline/
 |------|--------|-------|
 | `include/types.h` — `TelemetryRecord` + `BufferStats` | ✅ Done | 44-byte record: 6-axis IMU, boot_id, sequence_id, status_flags |
 | `lib/BufferManager` — PSRAM ring buffer | ✅ Done | Mutex-protected; push/pop/peek/getStats; overflow evicts oldest |
-| `lib/KalmanFilter` — 1D scalar filter | ❌ Not started | |
-| FreeRTOS task skeletons (all four tasks) | ❌ Not started | Stubs in `main.cpp` |
-| Safety ISR (`IRAM_ATTR`) + event group | ❌ Not started | |
-| MQTT connection manager + reconnect backoff | ❌ Not started | |
-| `NORMAL → BUFFERING → SYNCING` state machine | ❌ Not started | |
+| `lib/KalmanFilter` — 1D scalar filter | ✅ Done | Q=0.01, R=0.1 defaults; spike rejection; NaN/Inf guard; 7/7 validation tests pass |
+| FreeRTOS tasks — `sensorTask` + `filterTask` | ✅ Done | `sensorTask` @ 100Hz via `vTaskDelayUntil`; `filterTask` with 6 Kalman instances, rolling RMS window, anomaly detection, pushes to BufferManager |
+| FreeRTOS tasks — `telemetryTask` + `syncTask` | ✅ Done | peek/enqueue/pop pattern; state-gated; syncTask drains on kBitReconnect EventGroup |
+| MQTT connection manager (`lib/MqttManager`) | ✅ Done | WiFi + PubSubClient; exponential backoff 1s→60s; onConnect/onDisconnect callbacks |
+| `NORMAL → BUFFERING → SYNCING` state machine | ✅ Done | `NodeState` enum in types.h; `std::atomic<NodeState>`; transitions in MQTT callbacks |
+| `connectionTask` — MQTT socket owner | ✅ Done | Sole caller of MqttManager::loop() and publish(); drains g_publishQueue each tick |
+| Safety ISR (`IRAM_ATTR`) + event group | ❌ Not started | GPIO10, falling edge; posts to FreeRTOS EventGroup |
 | MPU-6050 calibration offsets in NVS | ❌ Not started | Low priority until hardware arrives |
+| NVS boot_id persistence | ❌ Not started | Currently hardcoded to 1 in `main.cpp` |
 
 ### Phase 3 — Hardware Integration ⏳ Blocked
 
@@ -95,47 +98,71 @@ Hardware not yet arrived. Can begin once ESP32-S3 N16R8 is in hand.
 
 ## Next Steps (Priority Order)
 
-### 1. `firmware/lib/KalmanFilter` ← do this next
+### Step 1 — MQTT + State Machine ✅ Done
 
-A prerequisite for `filterTask`. One instance per IMU axis (6 total).
+These belong together: the connection manager emits events; the state machine
+consumes them immediately. Implementing them separately would require wiring
+them together anyway.
 
-- Class with configurable `Q` (process noise) and `R` (measurement noise)
-- Single `update(float measurement) → float` method
-- Stateless between instances — no global state
-- Starting defaults: Q = 0.01, R = 0.1 (tune against real hardware later)
+**MQTT connection manager:**
+- WiFi init with credentials from NVS (not hardcoded)
+- PubSubClient connect + exponential reconnect backoff
+- On disconnect callback: post event to state machine
+- On reconnect callback: post event to state machine + set FreeRTOS EventGroup bit
+- MQTT topics: `sensor/<node>/telemetry` (QoS 1), `sensor/<node>/estop`
 
-### 2. FreeRTOS Tasks in `main.cpp`
+**State machine (keyed from a single enum, not scattered conditionals):**
 
-Uncomment and implement the four tasks once KalmanFilter exists:
+| State | `telemetryTask` | `syncTask` |
+|-------|----------------|-----------|
+| `NORMAL` | Pop buffer, publish live | Idle |
+| `BUFFERING` | Skip pop — records accumulate in PSRAM | Idle |
+| `SYNCING` | Resume live publish | Burst-flush at `SYNC_BATCH_SIZE` / `SYNC_BATCH_DELAY_MS` |
 
-| Task | Core | Priority | Responsibility |
-|------|------|----------|----------------|
-| `sensorTask` | 1 | 5 | Sample MPU-6050 @ 100 Hz via `xQueueSend` |
-| `filterTask` | 1 | 5 | Dequeue raw samples, apply Kalman per axis, compute RMS/peak, push to `BufferManager` |
-| `telemetryTask` | 0 | 3 | Pop from buffer (NORMAL state) and publish via MQTT QoS 1 |
-| `syncTask` | 0 | 3 | On reconnect: burst-flush buffer in rate-limited batches |
+Transition rules:
+- `NORMAL → BUFFERING` on MQTT disconnect
+- `BUFFERING → SYNCING` on MQTT reconnect
+- `SYNCING → NORMAL` when `g_buffer.isEmpty()`
 
-Inter-task communication: a single `QueueHandle_t` between `sensorTask` → `filterTask`. `BufferManager` shared between `filterTask` (producer) and `telemetryTask`/`syncTask` (consumers).
+### Step 2 — Intermediate Integration Checkpoint ← do this next
 
-### 3. Safety ISR + Event Group
+Before adding more firmware features, prove the core loop works end-to-end:
+
+1. Cold boot → one filtered sample publishes live → appears in InfluxDB
+2. Pull network → records accumulate in PSRAM buffer
+3. Restore network → controlled drain, no broker flood
+4. Ask Claude Code "Is node01 healthy?" → MCP path returns real data
+
+If this works, everything else is mechanical. If it doesn't, find out here.
+
+### Step 3 — Safety ISR + Event Group
+
+Independent of MQTT; can be developed in parallel but validated after Step 2.
 
 - `IRAM_ATTR` ISR on `PIN_SAFETY_INTERLOCK` (GPIO 10), falling edge
-- Sets a bit in a `FreeRTOS EventGroup`; a lightweight safety task blocks on it
-- On trigger: set `STATUS_INTERLOCK_OPEN` flag, publish to `sensor/<node>/estop`, halt `telemetryTask`
+- Sets a bit in a FreeRTOS EventGroup
+- Safety consumer task: blocks on EventGroup bit, sets `STATUS_INTERLOCK_OPEN`,
+  publishes to `sensor/<node>/estop`, halts `telemetryTask`
+- Must survive: safety interrupt during normal run, during SYNCING, during reboot mid-sync
 
-### 4. MQTT Manager + State Machine
+### Step 4 — NVS boot_id
 
-- WiFi connection with credential loading from NVS (not hardcoded)
-- PubSubClient reconnect loop with exponential backoff
-- State machine: `NORMAL` → `BUFFERING` (on disconnect) → `SYNCING` (on reconnect) → `NORMAL`
-- `SYNCING` rate-limits historical burst to avoid overwhelming the broker
+- Load persistent boot counter from NVS on startup
+- Increment and write back each boot
+- Include in all telemetry and heartbeat payloads (currently hardcoded to `1`)
 
-### 5. End-to-End Validation
+### Step 5 — Full Smoke Test
 
-- Run full simulation stack (docker, bridge, mock script)
-- Flash firmware, confirm telemetry reaches InfluxDB
-- Unplug network, verify PSRAM buffering, reconnect, verify burst sync
-- Ask Claude Code "Is node01 healthy?" to validate MCP path
+Validate the complete failure matrix:
+
+| Scenario | Expected outcome |
+|----------|-----------------|
+| Cold boot | Connects, publishes within 5s |
+| Disconnect during run | Transitions to BUFFERING, no data loss |
+| Prolonged buffering | PSRAM fills gracefully, oldest records evicted |
+| Reconnect | Controlled drain, transitions back to NORMAL |
+| Safety interrupt during SYNCING | E-Stop published immediately, sync resumes/halts correctly |
+| Reboot mid-sync | `boot_id` increments; `sequence_id` resets; no duplicate confusion |
 
 ---
 

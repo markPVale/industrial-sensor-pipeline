@@ -54,3 +54,20 @@ struct BufferStats {
     size_t free_space;
     size_t dropped;
 };
+
+// -----------------------------------------------------------------------------
+// NodeState — store-and-forward state machine.
+//
+// Transitions (enforced in main.cpp via setState()):
+//   NORMAL    → BUFFERING  on MQTT disconnect
+//   BUFFERING → SYNCING    on MQTT reconnect
+//   SYNCING   → NORMAL     when g_buffer is empty after drain
+//
+// All tasks key their behavior off this single enum.
+// No task owns a local "connected" flag — check getState() instead.
+// -----------------------------------------------------------------------------
+enum class NodeState : uint8_t {
+    NORMAL,     // Connected. telemetryTask pops and publishes live.
+    BUFFERING,  // Disconnected. Records accumulate in PSRAM. No task pops.
+    SYNCING,    // Reconnected. syncTask drains buffer; telemetryTask resumes.
+};

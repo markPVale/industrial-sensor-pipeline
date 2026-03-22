@@ -22,6 +22,15 @@ import {
 import { InfluxDB } from "@influxdata/influxdb-client";
 
 // ---------------------------------------------------------------------------
+// Status flag bit masks — must match firmware/include/types.h and
+// docs/telemetry-schema.md exactly.
+// ---------------------------------------------------------------------------
+const FLAG_ACCEL_CLIPPED  = 0x01;
+const FLAG_GYRO_CLIPPED   = 0x02;
+const FLAG_INTERLOCK_OPEN = 0x04;  // E-Stop / safety interlock
+const FLAG_ANOMALY        = 0x08;
+
+// ---------------------------------------------------------------------------
 // Configuration — override via environment variables
 // ---------------------------------------------------------------------------
 const INFLUX_URL    = process.env.INFLUX_URL    ?? "http://localhost:8086";
@@ -71,14 +80,21 @@ async function getLatestTelemetry(nodeId: string) {
     return { node_id: nodeId, status: "no_data", message: "No telemetry found in the last hour." };
   }
 
-  const r = rows[0];
+  const r     = rows[0];
+  const flags = r["flags"] as number;
   return {
-    node_id:       nodeId,
-    timestamp:     r["_time"],
-    vibration_rms: r["vibration_rms"],
-    flags:         r["flags"],
-    flag_estop:    ((r["flags"] as number) & 0x01) !== 0,
-    flag_anomaly:  ((r["flags"] as number) & 0x02) !== 0,
+    node_id:              nodeId,
+    timestamp:            r["_time"],
+    vibration_rms_mps2:   r["vibration_rms"],
+    ax: r["ax"], ay: r["ay"], az: r["az"],
+    gx: r["gx"], gy: r["gy"], gz: r["gz"],
+    boot_id:              r["boot_id"],
+    sequence_id:          r["sequence_id"],
+    flags,
+    flag_accel_clipped:   (flags & FLAG_ACCEL_CLIPPED)  !== 0,
+    flag_gyro_clipped:    (flags & FLAG_GYRO_CLIPPED)   !== 0,
+    flag_interlock_open:  (flags & FLAG_INTERLOCK_OPEN) !== 0,
+    flag_anomaly:         (flags & FLAG_ANOMALY)        !== 0,
   };
 }
 
@@ -106,25 +122,27 @@ async function getSensorHealth(nodeId: string) {
     };
   }
 
-  const r   = rows[0];
-  const age = Math.round((Date.now() - new Date(r["_time"] as string).getTime()) / 1000);
+  const r     = rows[0];
+  const flags = r["flags"] as number;
+  const rms   = r["vibration_rms"] as number;
+  const age   = Math.round((Date.now() - new Date(r["_time"] as string).getTime()) / 1000);
 
   return {
     node_id:              nodeId,
     is_online:            age < 30,
     last_seen_seconds_ago: age,
-    vibration_rms:        r["vibration_rms"],
-    flag_estop:           ((r["flags"] as number) & 0x01) !== 0,
-    flag_anomaly:         ((r["flags"] as number) & 0x02) !== 0,
-    health_summary:       buildHealthSummary(age, r["flags"] as number, r["vibration_rms"] as number),
+    vibration_rms_mps2:   rms,
+    flag_interlock_open:  (flags & FLAG_INTERLOCK_OPEN) !== 0,
+    flag_anomaly:         (flags & FLAG_ANOMALY)        !== 0,
+    health_summary:       buildHealthSummary(age, flags, rms),
   };
 }
 
 function buildHealthSummary(ageSeconds: number, flags: number, rms: number): string {
-  if (ageSeconds >= 30) return "OFFLINE — no recent telemetry.";
-  if (flags & 0x01)     return "CRITICAL — E-Stop is active.";
-  if (flags & 0x02)     return `WARNING — Anomaly detected. Vibration RMS: ${rms.toFixed(4)}g`;
-  return `OK — Normal operation. Vibration RMS: ${rms.toFixed(4)}g`;
+  if (ageSeconds >= 30)              return "OFFLINE — no recent telemetry.";
+  if (flags & FLAG_INTERLOCK_OPEN)   return "CRITICAL — E-Stop / safety interlock is active.";
+  if (flags & FLAG_ANOMALY)          return `WARNING — Anomaly detected. Vibration RMS: ${rms.toFixed(4)} m/s²`;
+  return `OK — Normal operation. Vibration RMS: ${rms.toFixed(4)} m/s²`;
 }
 
 /**
@@ -153,13 +171,17 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
     };
   }
 
-  const events = rows.map((r) => ({
-    timestamp:     r["_time"],
-    vibration_rms: r["vibration_rms"],
-    flags:         r["flags"],
-    flag_estop:    ((r["flags"] as number) & 0x01) !== 0,
-    flag_anomaly:  ((r["flags"] as number) & 0x02) !== 0,
-  }));
+  const events = rows.map((r) => {
+    const flags = r["flags"] as number;
+    return {
+      timestamp:           r["_time"],
+      vibration_rms_mps2:  r["vibration_rms"],
+      ax: r["ax"], ay: r["ay"], az: r["az"],
+      flags,
+      flag_interlock_open: (flags & FLAG_INTERLOCK_OPEN) !== 0,
+      flag_anomaly:        (flags & FLAG_ANOMALY)        !== 0,
+    };
+  });
 
   return {
     node_id:        nodeId,

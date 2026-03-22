@@ -33,10 +33,47 @@
 #define PSRAM_BUFFER_CAPACITY 50000  // max telemetry records held in PSRAM
 
 // -----------------------------------------------------------------------------
-// MQTT
-// Placeholders — fill from NVS, provisioning flow, or compile-time defines.
+// Filter / Telemetry pipeline
 // -----------------------------------------------------------------------------
+// filterTask accumulates this many raw samples before emitting one
+// TelemetryRecord. At SAMPLE_RATE_HZ=100 this gives a ~2 Hz output rate.
+#define FILTER_WINDOW_SIZE    50
+
+// Depth of the RawSample queue between sensorTask and filterTask.
+// At 100 Hz and a 10 ms filter budget, 20 slots gives 200 ms of slack.
+#define SENSOR_QUEUE_DEPTH    20
+
+// Interval at which telemetryTask pops and publishes one record (~2 Hz).
+#define TELEMETRY_PUBLISH_MS  500
+
+// Sync burst parameters — records per batch and inter-batch delay.
+#define SYNC_BATCH_SIZE       20
+#define SYNC_BATCH_DELAY_MS   100
+
+// -----------------------------------------------------------------------------
+// WiFi credentials
+// TODO: Replace these with NVS reads once NVS storage is implemented.
+//       Never commit real credentials — override via a local untracked header
+//       or a PlatformIO build_flags -D override.
+// -----------------------------------------------------------------------------
+#define WIFI_SSID             "your-ssid"
+#define WIFI_PASSWORD         "your-password"
+
+// -----------------------------------------------------------------------------
+// MQTT
+// MQTT_BROKER_IP: IP of the Raspberry Pi (or dev machine) running the
+//                 docker-compose gateway stack on port 1883.
+// MQTT_CLIENT_ID: Must be unique per node if you add more nodes.
+// TODO: Load broker IP and client ID from NVS in a later phase.
+// -----------------------------------------------------------------------------
+#define MQTT_BROKER_IP        "192.168.1.100"
 #define MQTT_PORT             1883
-// #define MQTT_BROKER_IP     "192.168.1.x"   // set at runtime or via NVS
-// #define MQTT_TOPIC_TELEMETRY "sensor/node01/telemetry"
-// #define MQTT_TOPIC_ESTOP     "sensor/node01/estop"
+#define MQTT_CLIENT_ID        "sensor-node01"
+#define MQTT_TOPIC_TELEMETRY  "sensor/node01/telemetry"
+#define MQTT_TOPIC_ESTOP      "sensor/node01/estop"
+#define MQTT_KEEPALIVE_S      15    // PubSubClient keepalive interval in seconds
+
+// Outbound publish queue: MqttMessage items enqueued by telemetryTask/syncTask
+// and drained by connectionTask. 40 slots × ~390 bytes each ≈ 15 KB.
+#define MQTT_PUBLISH_QUEUE_DEPTH  40
+#define MQTT_PAYLOAD_SIZE         320   // bytes — fits one ArduinoJson telemetry record

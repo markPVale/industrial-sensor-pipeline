@@ -4,12 +4,33 @@ import { useEffect, useRef, useState } from "react";
 import mqtt, { MqttClient } from "mqtt";
 
 // ---------------------------------------------------------------------------
-// Types — mirrors TelemetryRecord from firmware
+// Status flag bit positions — must match firmware/include/types.h and
+// docs/telemetry-schema.md exactly.
+// ---------------------------------------------------------------------------
+export const FLAG_ACCEL_CLIPPED  = 0x01;
+export const FLAG_GYRO_CLIPPED   = 0x02;
+export const FLAG_INTERLOCK_OPEN = 0x04;  // E-Stop / safety interlock
+export const FLAG_ANOMALY        = 0x08;
+
+// Convenience alias used by TelemetryDisplay
+export const FLAG_ESTOP = FLAG_INTERLOCK_OPEN;
+
+// ---------------------------------------------------------------------------
+// Types — mirrors TelemetryRecord from firmware + docs/telemetry-schema.md
 // ---------------------------------------------------------------------------
 export interface TelemetryRecord {
-  timestamp:     number;   // ms epoch (edge-side)
-  vibration_rms: number;   // g
-  flags:         number;   // bitmask
+  boot:  number;   // boot cycle counter (from NVS)
+  seq:   number;   // per-boot sequence counter
+  ts:    number;   // epoch ms (edge-side timestamp)
+  ax:    number;   // m/s² Kalman-filtered accel X
+  ay:    number;   // m/s² Kalman-filtered accel Y
+  az:    number;   // m/s² Kalman-filtered accel Z
+  gx:    number;   // rad/s Kalman-filtered gyro X
+  gy:    number;   // rad/s Kalman-filtered gyro Y
+  gz:    number;   // rad/s Kalman-filtered gyro Z
+  flags: number;   // bitmask — see FLAG_* constants above
+  // Client-derived: not transmitted by firmware; computed on receipt
+  vibration_rms: number;  // m/s², sqrt(ax² + ay² + az²)
 }
 
 export interface EstopEvent {
@@ -18,15 +39,12 @@ export interface EstopEvent {
   reason:    string;
 }
 
-export const FLAG_ESTOP   = 0b00000001;
-export const FLAG_ANOMALY = 0b00000010;
-
 export interface TelemetryState {
-  latest:       TelemetryRecord | null;
-  history:      TelemetryRecord[];   // last N records for charting
-  estopEvent:   EstopEvent | null;
-  connected:    boolean;
-  nodeId:       string;
+  latest:     TelemetryRecord | null;
+  history:    TelemetryRecord[];   // last N records for charting
+  estopEvent: EstopEvent | null;
+  connected:  boolean;
+  nodeId:     string;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,9 +90,14 @@ export function useMqttTelemetry(nodeId: string = "node01"): TelemetryState {
       }
 
       if (topic.endsWith("/telemetry")) {
-        const record = data as TelemetryRecord;
+        const raw = data as Omit<TelemetryRecord, "vibration_rms">;
+        const record: TelemetryRecord = {
+          ...raw,
+          // Derive vibration_rms client-side — not transmitted by firmware
+          vibration_rms: Math.sqrt(raw.ax ** 2 + raw.ay ** 2 + raw.az ** 2),
+        };
         setLatest(record);
-        setHistory((prev) => [...prev.slice(-(HISTORY_LENGTH - 1)), record]);
+        setHistory((prev: TelemetryRecord[]) => [...prev.slice(-(HISTORY_LENGTH - 1)), record]);
       } else if (topic.endsWith("/estop")) {
         setEstopEvent(data as EstopEvent);
       }

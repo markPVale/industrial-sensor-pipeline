@@ -89,7 +89,7 @@ export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: strin
           <tr>
             <td style={{ color: "var(--muted)", paddingBottom: "0.4rem" }}>Vibration RMS</td>
             <td style={{ textAlign: "right", color: "var(--text)" }}>
-              {latest ? `${latest.vibration_rms.toFixed(4)} g` : "—"}
+              {latest ? `${latest.vibration_rms.toFixed(4)} m/s²` : "—"}
             </td>
           </tr>
           <tr>
@@ -102,7 +102,7 @@ export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: strin
             <td style={{ color: "var(--muted)" }}>Last seen</td>
             <td style={{ textAlign: "right", color: "var(--text)" }}>
               {latest
-                ? new Date(latest.timestamp).toLocaleTimeString()
+                ? new Date(latest.ts).toLocaleTimeString()
                 : "—"}
             </td>
           </tr>

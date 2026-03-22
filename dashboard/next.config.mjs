@@ -1,6 +1,5 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
+/** @type {import('next').NextConfig} */
+const nextConfig = {
   // Required to allow mqtt.js (a Node.js library) to be bundled
   // for browser use. Next.js will polyfill the missing Node modules.
   webpack: (config, { isServer }) => {
