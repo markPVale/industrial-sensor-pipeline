@@ -82,6 +82,19 @@ static EventGroupHandle_t    g_mqttEvents  = nullptr;
 static constexpr EventBits_t kBitReconnect = BIT0;
 
 // -----------------------------------------------------------------------------
+// Safety interlock
+//
+// safetyISR fires on GPIO 10 falling edge (optical loop opens) and sets
+// kBitInterlock in g_safetyEvents. safetyTask blocks on that bit and handles
+// the latch + MQTT publish. g_interlockActive is the persistent latch: once
+// true, filterTask stamps STATUS_INTERLOCK_OPEN on every subsequent record
+// until the node reboots.
+// -----------------------------------------------------------------------------
+static EventGroupHandle_t    g_safetyEvents   = nullptr;
+static constexpr EventBits_t kBitInterlock    = BIT0;
+static std::atomic<bool>     g_interlockActive{false};
+
+// -----------------------------------------------------------------------------
 // Shared globals
 // -----------------------------------------------------------------------------
 static Adafruit_MPU6050 g_mpu;
@@ -128,11 +141,13 @@ static void buildPayload(const TelemetryRecord& rec, char* buf, size_t len) {
 // -----------------------------------------------------------------------------
 static void initPSRAM();
 static void initMPU6050();
+static void IRAM_ATTR safetyISR();
 static void connectionTask(void* pvParams);
 static void sensorTask(void* pvParams);
 static void filterTask(void* pvParams);
 static void telemetryTask(void* pvParams);
 static void syncTask(void* pvParams);
+static void safetyTask(void* pvParams);
 
 // =============================================================================
 // setup()
@@ -211,17 +226,23 @@ void setup() {
                          MQTT_CLIENT_ID, MQTT_KEEPALIVE_S);
 
     // -------------------------------------------------------------------------
-    // TODO: Safety interlock ISR
-    // pinMode(PIN_SAFETY_INTERLOCK, INPUT_PULLUP);
-    // attachInterrupt(digitalPinToInterrupt(PIN_SAFETY_INTERLOCK),
-    //                 safetyISR, FALLING);
+    // Safety interlock — EventGroup + GPIO interrupt
     // -------------------------------------------------------------------------
+    g_safetyEvents = xEventGroupCreate();
+    if (g_safetyEvents == nullptr) {
+        Serial.println("[EventGroup] FATAL — could not create safety event group.");
+        while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+    pinMode(PIN_SAFETY_INTERLOCK, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(PIN_SAFETY_INTERLOCK), safetyISR, FALLING);
+    Serial.printf("[Safety] Interlock armed on GPIO %d.\n", PIN_SAFETY_INTERLOCK);
 
     // -------------------------------------------------------------------------
     // FreeRTOS tasks
     //   Core 1: sensorTask + filterTask — time-sensitive sensor pipeline
     //   Core 0: connectionTask + telemetryTask + syncTask — network I/O
     // -------------------------------------------------------------------------
+    xTaskCreatePinnedToCore(safetyTask,     "SafetyTask",    2048, nullptr, 6, nullptr, 0);
     xTaskCreatePinnedToCore(connectionTask, "ConnTask",      8192, nullptr, 4, nullptr, 0);
     xTaskCreatePinnedToCore(sensorTask,     "SensorTask",    4096, nullptr, 5, nullptr, 1);
     xTaskCreatePinnedToCore(filterTask,     "FilterTask",    8192, nullptr, 5, nullptr, 1);
@@ -362,6 +383,9 @@ static void filterTask(void* pvParams) {
             if (rms > kAnomalyRmsThreshold) {
                 accumulated_flags |= STATUS_ANOMALY;
             }
+            if (g_interlockActive.load()) {
+                accumulated_flags |= STATUS_INTERLOCK_OPEN;
+            }
 
             TelemetryRecord rec{};
             rec.boot_id      = kBootId;
@@ -478,6 +502,54 @@ static void syncTask(void* pvParams) {
             setState(NodeState::NORMAL);
             Serial.println("[State] SYNCING → NORMAL (buffer drained)");
         }
+    }
+}
+
+// =============================================================================
+// safetyISR — IRAM_ATTR, hardware interrupt context
+//
+// Fires on GPIO 10 falling edge (optical loop opens → pin pulled low).
+// Must complete in microseconds: no heap allocation, no blocking calls,
+// no non-IRAM functions. Only ISR-safe FreeRTOS APIs permitted.
+// =============================================================================
+static void IRAM_ATTR safetyISR() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xEventGroupSetBitsFromISR(g_safetyEvents, kBitInterlock,
+                              &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// =============================================================================
+// safetyTask — Core 0, Priority 6 (highest task in the system)
+//
+// Blocks on kBitInterlock. When the ISR fires:
+//   1. Latches g_interlockActive — filterTask stamps STATUS_INTERLOCK_OPEN on
+//      all subsequent TelemetryRecords until reboot.
+//   2. Enqueues an E-Stop JSON event for connectionTask to publish.
+//
+// The latch is intentional: interlock trips are not self-clearing. A reboot
+// (or explicit reset mechanism added later) is required to clear the state.
+// =============================================================================
+static void safetyTask(void* pvParams) {
+    char payload[MQTT_PAYLOAD_SIZE];
+
+    for (;;) {
+        xEventGroupWaitBits(g_safetyEvents, kBitInterlock,
+                            pdTRUE,    // clear bit on exit
+                            pdFALSE,   // any bit sufficient
+                            portMAX_DELAY);
+
+        g_interlockActive.store(true);
+
+        snprintf(payload, sizeof(payload),
+                 "{\"ts\":%llu,\"triggered\":1,\"reason\":\"interlock\"}",
+                 (unsigned long long)millis());
+
+        if (!mqttEnqueue(MQTT_TOPIC_ESTOP, payload)) {
+            Serial.println("[Safety] WARN — publish queue full, E-Stop event dropped.");
+        }
+
+        Serial.println("[Safety] INTERLOCK OPEN — E-Stop published.");
     }
 }
 

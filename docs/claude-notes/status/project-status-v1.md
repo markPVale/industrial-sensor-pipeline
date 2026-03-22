@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Phase 2 in progress — MQTT + state machine implemented. Ready for intermediate integration checkpoint._
+_Last updated: Integration checkpoint complete. Safety ISR implemented. Next: NVS boot_id._
 
 ---
 
@@ -84,7 +84,7 @@ industrial-sensor-pipeline/
 | MQTT connection manager (`lib/MqttManager`) | ✅ Done | WiFi + PubSubClient; exponential backoff 1s→60s; onConnect/onDisconnect callbacks |
 | `NORMAL → BUFFERING → SYNCING` state machine | ✅ Done | `NodeState` enum in types.h; `std::atomic<NodeState>`; transitions in MQTT callbacks |
 | `connectionTask` — MQTT socket owner | ✅ Done | Sole caller of MqttManager::loop() and publish(); drains g_publishQueue each tick |
-| Safety ISR (`IRAM_ATTR`) + event group | ❌ Not started | GPIO10, falling edge; posts to FreeRTOS EventGroup |
+| Safety ISR (`IRAM_ATTR`) + event group | ✅ Done | GPIO10, falling edge; `safetyISR` → `g_safetyEvents` → `safetyTask` (priority 6); latching interlock; stamps `STATUS_INTERLOCK_OPEN` on all records post-trip |
 | MPU-6050 calibration offsets in NVS | ❌ Not started | Low priority until hardware arrives |
 | NVS boot_id persistence | ❌ Not started | Currently hardcoded to 1 in `main.cpp` |
 
@@ -98,7 +98,7 @@ Hardware not yet arrived. Can begin once ESP32-S3 N16R8 is in hand.
 
 ## Next Steps (Priority Order)
 
-### Step 1 — MQTT + State Machine ✅ Done
+### Step 0 — MQTT + State Machine ✅ Done
 
 These belong together: the connection manager emits events; the state machine
 consumes them immediately. Implementing them separately would require wiring
@@ -124,45 +124,42 @@ Transition rules:
 - `BUFFERING → SYNCING` on MQTT reconnect
 - `SYNCING → NORMAL` when `g_buffer.isEmpty()`
 
-### Step 2 — Intermediate Integration Checkpoint ← do this next
+### Step 1 — Integration Checkpoint (simulation only) ✅ Done
 
-Before adding more firmware features, prove the core loop works end-to-end:
+Verified full path: mock → broker → bridge → InfluxDB → MCP → dashboard.
+Schema, topics, timestamps, flag bits, and health queries all confirmed correct.
 
-1. Cold boot → one filtered sample publishes live → appears in InfluxDB
-2. Pull network → records accumulate in PSRAM buffer
-3. Restore network → controlled drain, no broker flood
-4. Ask Claude Code "Is node01 healthy?" → MCP path returns real data
+### Step 2 — Buffered Replay / Reconnect Test ✅ Done
 
-If this works, everything else is mechanical. If it doesn't, find out here.
+Simulated node outage (killed mock), confirmed OFFLINE detection after 30s,
+restarted mock, confirmed immediate ONLINE recovery via MCP health query.
+Note: full PSRAM buffer drain test requires real hardware (Step 5).
 
-### Step 3 — Safety ISR + Event Group
+Simulate outage, queue buildup, reconnect burst, and verify latest-state
+correctness under drain. Kill the mock mid-run, confirm bridge handles
+reconnect cleanly, check InfluxDB has no gaps or duplicates.
 
-Independent of MQTT; can be developed in parallel but validated after Step 2.
+### Step 3 — Safety ISR ✅ Done
 
-- `IRAM_ATTR` ISR on `PIN_SAFETY_INTERLOCK` (GPIO 10), falling edge
-- Sets a bit in a FreeRTOS EventGroup
-- Safety consumer task: blocks on EventGroup bit, sets `STATUS_INTERLOCK_OPEN`,
-  publishes to `sensor/<node>/estop`, halts `telemetryTask`
-- Must survive: safety interrupt during normal run, during SYNCING, during reboot mid-sync
+- `IRAM_ATTR safetyISR` on GPIO 10, falling edge → `xEventGroupSetBitsFromISR`
+- `safetyTask` priority 6 (highest): latches `g_interlockActive`, enqueues estop publish
+- `filterTask` stamps `STATUS_INTERLOCK_OPEN` on all records while latch is set
+- Interlock latches until reboot — intentional; `FALLING` vs `RISING` to be verified on hardware
 
-### Step 4 — NVS boot_id
+### Step 4 — NVS boot_id ← do this next
 
-- Load persistent boot counter from NVS on startup
-- Increment and write back each boot
-- Include in all telemetry and heartbeat payloads (currently hardcoded to `1`)
+- Read/increment/write boot counter from NVS on startup
+- Replace hardcoded `kBootId = 1` in `main.cpp`
+- Verify sequence semantics across reboot (seq resets, boot increments)
 
-### Step 5 — Full Smoke Test
+### Step 5 — Hardware Smoke Test (once device arrives)
 
-Validate the complete failure matrix:
-
-| Scenario | Expected outcome |
-|----------|-----------------|
-| Cold boot | Connects, publishes within 5s |
-| Disconnect during run | Transitions to BUFFERING, no data loss |
-| Prolonged buffering | PSRAM fills gracefully, oldest records evicted |
-| Reconnect | Controlled drain, transitions back to NORMAL |
-| Safety interrupt during SYNCING | E-Stop published immediately, sync resumes/halts correctly |
-| Reboot mid-sync | `boot_id` increments; `sequence_id` resets; no duplicate confusion |
+| Check | What to validate |
+|-------|-----------------|
+| Physical sensor | Real IMU data matches expected ranges |
+| ISR trigger | Photoresistor interrupt fires correctly |
+| Wi-Fi reconnect | Real backoff timing, real DHCP delays |
+| Timing/jitter | 100 Hz sample rate holds under load |
 
 ---
 
