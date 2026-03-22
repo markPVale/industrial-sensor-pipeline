@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -61,8 +62,9 @@ static constexpr float kAnomalyRmsThreshold = 9.81f;
 // Gyro threshold left at 0 (disabled) until noise profile is measured.
 static constexpr float kAccelSpikeThreshold = 4.905f;
 
-// Boot ID — load from NVS and increment each boot (NVS phase deferred).
-static constexpr uint32_t kBootId = 1;
+// Boot ID — loaded from NVS in initBootId(), incremented each boot.
+// Initialised to 0; set before any task uses it.
+static uint32_t g_bootId = 0;
 
 // -----------------------------------------------------------------------------
 // State machine
@@ -139,6 +141,7 @@ static void buildPayload(const TelemetryRecord& rec, char* buf, size_t len) {
 // -----------------------------------------------------------------------------
 // Forward declarations
 // -----------------------------------------------------------------------------
+static void initBootId();
 static void initPSRAM();
 static void initMPU6050();
 static void IRAM_ATTR safetyISR();
@@ -157,6 +160,7 @@ void setup() {
     delay(1000);
     Serial.println("\n=== Industrial Sensor Node — Boot ===");
 
+    initBootId();
     initPSRAM();
 
     Wire.begin(PIN_SDA, PIN_SCL);
@@ -388,7 +392,7 @@ static void filterTask(void* pvParams) {
             }
 
             TelemetryRecord rec{};
-            rec.boot_id      = kBootId;
+            rec.boot_id      = g_bootId;
             rec.sequence_id  = sequence_id++;
             rec.timestamp_ms = sample.timestamp_ms;
             rec.accel_x      = filtered_ax;
@@ -551,6 +555,30 @@ static void safetyTask(void* pvParams) {
 
         Serial.println("[Safety] INTERLOCK OPEN — E-Stop published.");
     }
+}
+
+// =============================================================================
+// initBootId()
+//
+// Reads the boot counter from NVS namespace "sensor", increments it, writes
+// it back, and stores it in g_bootId.
+//
+// First boot (key absent): getUInt returns the default 0, so g_bootId = 1.
+// Subsequent boots: counter increments monotonically.
+// NVS erase / corruption: falls back to 0 + 1 = 1 and resumes from there.
+//
+// g_bootId is used by filterTask to stamp every TelemetryRecord. Combined
+// with sequence_id (per-boot counter), (boot_id, seq) uniquely identifies
+// every record across reboots.
+// =============================================================================
+static void initBootId() {
+    Preferences prefs;
+    prefs.begin("sensor", false);   // namespace "sensor", read-write
+    const uint32_t prev = prefs.getUInt("boot_id", 0);
+    g_bootId = prev + 1;
+    prefs.putUInt("boot_id", g_bootId);
+    prefs.end();
+    Serial.printf("[NVS] boot_id = %u (previous = %u)\n", g_bootId, prev);
 }
 
 // =============================================================================
