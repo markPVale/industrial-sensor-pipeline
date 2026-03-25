@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Integration checkpoint complete. Safety ISR implemented. Next: NVS boot_id._
+_Last updated: Phase 2 firmware complete. NVS boot_id done. Next: hardware smoke test (Step 5) — blocked on hardware arrival._
 
 ---
 
@@ -72,7 +72,7 @@ industrial-sensor-pipeline/
 - Python deps not installed: `cd gateway/bridge && pip3 install paho-mqtt influxdb-client`
 - Dashboard deps not installed: `cd dashboard && npm install`
 
-### Phase 2 — Firmware Logic 🔄 In Progress
+### Phase 2 — Firmware Logic ✅ Complete (except MPU-6050 calibration — hardware-blocked)
 
 | Task | Status | Notes |
 |------|--------|-------|
@@ -85,8 +85,8 @@ industrial-sensor-pipeline/
 | `NORMAL → BUFFERING → SYNCING` state machine | ✅ Done | `NodeState` enum in types.h; `std::atomic<NodeState>`; transitions in MQTT callbacks |
 | `connectionTask` — MQTT socket owner | ✅ Done | Sole caller of MqttManager::loop() and publish(); drains g_publishQueue each tick |
 | Safety ISR (`IRAM_ATTR`) + event group | ✅ Done | GPIO10, falling edge; `safetyISR` → `g_safetyEvents` → `safetyTask` (priority 6); latching interlock; stamps `STATUS_INTERLOCK_OPEN` on all records post-trip |
-| MPU-6050 calibration offsets in NVS | ❌ Not started | Low priority until hardware arrives |
-| NVS boot_id persistence | ❌ Not started | Currently hardcoded to 1 in `main.cpp` |
+| MPU-6050 calibration offsets in NVS | ❌ Not started | Low priority until hardware arrives — TODO at `main.cpp:621` |
+| NVS boot_id persistence | ✅ Done | `initBootId()` in `main.cpp`; reads/increments/writes NVS key "boot_id" on every boot |
 
 ### Phase 3 — Hardware Integration ⏳ Blocked
 
@@ -146,13 +146,13 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 - `filterTask` stamps `STATUS_INTERLOCK_OPEN` on all records while latch is set
 - Interlock latches until reboot — intentional; `FALLING` vs `RISING` to be verified on hardware
 
-### Step 4 — NVS boot_id ← do this next
+### Step 4 — NVS boot_id ✅ Done
 
 - Read/increment/write boot counter from NVS on startup
-- Replace hardcoded `kBootId = 1` in `main.cpp`
-- Verify sequence semantics across reboot (seq resets, boot increments)
+- Replaced hardcoded `kBootId = 1` — see `initBootId()` in `main.cpp`
+- Verify sequence semantics across reboot (seq resets, boot increments) — needs real hardware
 
-### Step 5 — Hardware Smoke Test (once device arrives)
+### Step 5 — Hardware Smoke Test ← NEXT (once device arrives)
 
 | Check | What to validate |
 |-------|-----------------|
