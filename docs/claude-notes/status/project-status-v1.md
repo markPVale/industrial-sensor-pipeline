@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Phase 2 firmware complete. NVS boot_id done. Next: hardware smoke test (Step 5) — blocked on hardware arrival._
+_Last updated: Hardware arrived. Step 5 smoke test in progress. Phase A (controller bring-up) and Phase B (I2C detection) complete. Phase C (raw sensor data) is next._
 
 ---
 
@@ -88,9 +88,22 @@ industrial-sensor-pipeline/
 | MPU-6050 calibration offsets in NVS | ❌ Not started | Low priority until hardware arrives — TODO at `main.cpp:621` |
 | NVS boot_id persistence | ✅ Done | `initBootId()` in `main.cpp`; reads/increments/writes NVS key "boot_id" on every boot |
 
-### Phase 3 — Hardware Integration ⏳ Blocked
+### Phase 3 — Hardware Integration ▶ In Progress
 
-Hardware not yet arrived. Can begin once ESP32-S3 N16R8 is in hand.
+Hardware arrived. ESP32-S3 DevKitC-1 in hand. Step 5 smoke test underway.
+
+**Bring-up phases:**
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| A | Controller bring-up (serial output, USB CDC) | ✅ Done |
+| B | I2C detection — MPU-6050 found at 0x68 | ✅ Done |
+| C | Raw sensor data (accelerometer + gyroscope reads) | ▶ Ready |
+| D | Integration (wire into firmware tasks) | ⏳ Not started |
+
+**Notes:**
+- ESP32-S3 native USB CDC required `ARDUINO_USB_MODE=1` + `ARDUINO_USB_CDC_ON_BOOT=1` build flags to route `Serial` to USB port
+- I2C on GPIO 8 (SDA) / GPIO 9 (SCL); MPU-6050 AD0 pulled low → address 0x68
 
 ### Phases 4 & 5 — HIL Testing, Pi Deployment, Docs ❌ Not Started
 
@@ -152,14 +165,16 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 - Replaced hardcoded `kBootId = 1` — see `initBootId()` in `main.cpp`
 - Verify sequence semantics across reboot (seq resets, boot increments) — needs real hardware
 
-### Step 5 — Hardware Smoke Test ← NEXT (once device arrives)
+### Step 5 — Hardware Smoke Test ▶ In Progress
 
-| Check | What to validate |
-|-------|-----------------|
-| Physical sensor | Real IMU data matches expected ranges |
-| ISR trigger | Photoresistor interrupt fires correctly |
-| Wi-Fi reconnect | Real backoff timing, real DHCP delays |
-| Timing/jitter | 100 Hz sample rate holds under load |
+| Check | What to validate | Status |
+|-------|-----------------|--------|
+| Controller bring-up | Serial output, USB CDC | ✅ Done |
+| Physical sensor | MPU-6050 detected at 0x68 | ✅ Done |
+| Physical sensor | Real IMU data matches expected ranges | ▶ Next |
+| ISR trigger | Photoresistor interrupt fires correctly | ⏳ Pending |
+| Wi-Fi reconnect | Real backoff timing, real DHCP delays | ⏳ Pending |
+| Timing/jitter | 100 Hz sample rate holds under load | ⏳ Pending |
 
 ---
 
@@ -185,3 +200,13 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 | Grafana | 3001 |
 | Next.js | 3000 |
 | MCP Server | 3002 (Pi deployment only) |
+
+---
+
+## Development Environment
+
+| Tool | Path |
+|------|------|
+| PlatformIO default projects | `/Users/markvale/Documents/PlatformIO/Projects` |
+| Python venv (bridge) | `gateway/bridge/.venv` (Python 3.12) |
+| MCP server dist | `mcp-server/dist/index.js` (rebuild with `npm run build` after editing `src/index.ts`) |
