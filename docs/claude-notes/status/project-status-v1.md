@@ -105,6 +105,13 @@ Hardware arrived. ESP32-S3 DevKitC-1 in hand. Step 5 smoke test underway.
 - ESP32-S3 native USB CDC required `ARDUINO_USB_MODE=1` + `ARDUINO_USB_CDC_ON_BOOT=1` build flags to route `Serial` to USB port
 - I2C on GPIO 8 (SDA) / GPIO 9 (SCL); MPU-6050 AD0 pulled low → address 0x68
 
+**Phase C sketch** (`esp32-bringup/src/main.cpp`):
+- No library dependencies — raw Wire calls only; single-file, single-loop
+- `initMPU()` — clears sleep bit in `PWR_MGMT_1`; returns false if I2C ack fails; `setup()` halts with error message on failure
+- `readAccel()` — reads 6 bytes from `ACCEL_XOUT_H`; reconstructs three signed 16-bit values; converts to m/s² using default ±2g scale factor (÷ 16384 × 9.81)
+- `loop()` — prints ax/ay/az every 200ms; prints error line on read failure
+- Gravity test guide printed to serial at boot: lay flat first to confirm which axis reads ~+9.81, then use that to anchor tilt and flip tests
+
 ### Phases 4 & 5 — HIL Testing, Pi Deployment, Docs ❌ Not Started
 
 ---
