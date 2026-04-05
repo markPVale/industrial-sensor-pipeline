@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Hardware arrived. Step 5 smoke test in progress. Phase A (controller bring-up) and Phase B (I2C detection) complete. Phase C (raw sensor data) is next._
+_Last updated: Step 5 smoke test in progress. Phases A–D complete. Phase E (Wi-Fi validation) is next._
 
 ---
 
@@ -98,8 +98,10 @@ Hardware arrived. ESP32-S3 DevKitC-1 in hand. Step 5 smoke test underway.
 |-------|-------------|--------|
 | A | Controller bring-up (serial output, USB CDC) | ✅ Done |
 | B | I2C detection — MPU-6050 found at 0x68 | ✅ Done |
-| C | Raw sensor data (accelerometer + gyroscope reads) | ▶ Ready |
-| D | Integration (wire into firmware tasks) | ⏳ Not started |
+| C | Raw sensor validation — calibration loads, telemetry pipeline running | ✅ Done |
+| D | NVS / boot_id persistence — monotonic counter verified across reboots | ✅ Done |
+| E | Wi-Fi validation — connect to real AP, MQTT broker reachable | 🔄 Next |
+| F | Full integration — state machine, buffer, sync end-to-end | 🔄 Partially booting |
 
 **Notes:**
 - ESP32-S3 native USB CDC required `ARDUINO_USB_MODE=1` + `ARDUINO_USB_CDC_ON_BOOT=1` build flags to route `Serial` to USB port
@@ -178,9 +180,11 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 |-------|-----------------|--------|
 | Controller bring-up | Serial output, USB CDC | ✅ Done |
 | Physical sensor | MPU-6050 detected at 0x68 | ✅ Done |
-| Physical sensor | Real IMU data matches expected ranges | ▶ Next |
+| Raw sensor validation | Calibration loads from NVS defaults; telemetry pipeline running | ✅ Done |
+| NVS boot_id | Monotonic counter increments correctly across reboots | ✅ Done |
+| Wi-Fi + MQTT | Connect to real AP; broker reachable; `[State] → NORMAL` printed | 🔄 Next |
+| Full integration | State machine transitions, buffer fill/drain, sync burst | 🔄 Partially booting |
 | ISR trigger | Photoresistor interrupt fires correctly | ⏳ Pending |
-| Wi-Fi reconnect | Real backoff timing, real DHCP delays | ⏳ Pending |
 | Timing/jitter | 100 Hz sample rate holds under load | ⏳ Pending |
 
 ---

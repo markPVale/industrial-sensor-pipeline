@@ -67,6 +67,20 @@ static constexpr float kAccelSpikeThreshold = 4.905f;
 static uint32_t g_bootId = 0;
 
 // -----------------------------------------------------------------------------
+// Accelerometer calibration — loaded from NVS in loadCalibration().
+// Correction: corrected = (raw - offset) * scale
+// Defaults are the values measured during 6-point bench calibration.
+// NVS keys (namespace "sensor"): cal_ax_off, cal_ax_scl, etc.
+// -----------------------------------------------------------------------------
+struct CalibrationData {
+    float ax_offset =  0.591f;  float ax_scale = 0.9961f;
+    float ay_offset = -0.501f;  float ay_scale = 0.9930f;
+    float az_offset = -1.436f;  float az_scale = 0.9866f;
+};
+static CalibrationData g_cal;
+static void loadCalibration();  // defined below initMPU6050()
+
+// -----------------------------------------------------------------------------
 // State machine
 //
 // g_nodeState is the single source of truth for NORMAL/BUFFERING/SYNCING.
@@ -310,9 +324,9 @@ static void sensorTask(void* pvParams) {
 
         RawSample sample{};
         sample.timestamp_ms = (uint64_t)millis();
-        sample.accel_x      = accel_event.acceleration.x;
-        sample.accel_y      = accel_event.acceleration.y;
-        sample.accel_z      = accel_event.acceleration.z;
+        sample.accel_x = (accel_event.acceleration.x - g_cal.ax_offset) * g_cal.ax_scale;
+        sample.accel_y = (accel_event.acceleration.y - g_cal.ay_offset) * g_cal.ay_scale;
+        sample.accel_z = (accel_event.acceleration.z - g_cal.az_offset) * g_cal.az_scale;
         sample.gyro_x       = gyro_event.gyro.x;
         sample.gyro_y       = gyro_event.gyro.y;
         sample.gyro_z       = gyro_event.gyro.z;
@@ -617,5 +631,27 @@ static void initMPU6050() {
 
     Serial.println("[MPU6050] OK — initialised.");
 
-    // TODO: Load calibration offsets from NVS and apply to sensor.
+    loadCalibration();
+}
+
+// =============================================================================
+// loadCalibration — reads per-axis offset/scale from NVS; falls back to the
+// bench-measured defaults baked into CalibrationData if keys are absent.
+// =============================================================================
+static void loadCalibration() {
+    Preferences prefs;
+    prefs.begin("sensor", true);  // read-only
+
+    g_cal.ax_offset = prefs.getFloat("cal_ax_off", g_cal.ax_offset);
+    g_cal.ax_scale  = prefs.getFloat("cal_ax_scl",  g_cal.ax_scale);
+    g_cal.ay_offset = prefs.getFloat("cal_ay_off", g_cal.ay_offset);
+    g_cal.ay_scale  = prefs.getFloat("cal_ay_scl",  g_cal.ay_scale);
+    g_cal.az_offset = prefs.getFloat("cal_az_off", g_cal.az_offset);
+    g_cal.az_scale  = prefs.getFloat("cal_az_scl",  g_cal.az_scale);
+
+    prefs.end();
+
+    Serial.printf("[Cal] ax: off=%.4f scl=%.4f\n", g_cal.ax_offset, g_cal.ax_scale);
+    Serial.printf("[Cal] ay: off=%.4f scl=%.4f\n", g_cal.ay_offset, g_cal.ay_scale);
+    Serial.printf("[Cal] az: off=%.4f scl=%.4f\n", g_cal.az_offset, g_cal.az_scale);
 }

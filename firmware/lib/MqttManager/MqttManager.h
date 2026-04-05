@@ -78,7 +78,7 @@ public:
     // MUST be called from the same task as loop().
     bool publish(const char* topic, const char* payload, bool retained = false);
 
-    bool isConnected() const { return _mqttClient.connected(); }
+    bool isConnected() { return _mqttClient.connected(); }
 
 private:
     // Block up to kWifiTimeoutMs for WiFi association.
