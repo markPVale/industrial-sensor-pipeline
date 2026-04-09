@@ -12,3 +12,6 @@ dashboard/.next/
 # Misc
 .DS_Store
 *.log
+
+# Credentials — never commit
+firmware/secrets.ini
