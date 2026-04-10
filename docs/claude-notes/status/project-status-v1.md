@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Step 5 smoke test in progress. Phases A–D complete. Phase E (Wi-Fi validation) is next._
+_Last updated: Step 5 smoke test — Phases A–F complete. Full pipeline verified end-to-end. USB CDC serial silence under WiFi is the one known open issue._
 
 ---
 
@@ -100,12 +100,15 @@ Hardware arrived. ESP32-S3 DevKitC-1 in hand. Step 5 smoke test underway.
 | B | I2C detection — MPU-6050 found at 0x68 | ✅ Done |
 | C | Raw sensor validation — calibration loads, telemetry pipeline running | ✅ Done |
 | D | NVS / boot_id persistence — monotonic counter verified across reboots | ✅ Done |
-| E | Wi-Fi validation — connect to real AP, MQTT broker reachable | 🔄 Next |
-| F | Full integration — state machine, buffer, sync end-to-end | 🔄 Partially booting |
+| E | Wi-Fi validation — connect to real AP; MQTT broker reachable | ✅ Done |
+| F | Full integration — real IMU data flowing to broker at 2Hz; state machine, buffer, anomaly detection all confirmed | ✅ Done |
 
 **Notes:**
 - ESP32-S3 native USB CDC required `ARDUINO_USB_MODE=1` + `ARDUINO_USB_CDC_ON_BOOT=1` build flags to route `Serial` to USB port
 - I2C on GPIO 8 (SDA) / GPIO 9 (SCL); MPU-6050 AD0 pulled low → address 0x68
+- WiFi credentials injected via gitignored `secrets.ini` — copy `secrets.ini.template` and fill in values
+- Serial `Serial` / `Serial.flush()` inside MQTT callbacks causes a crash on ESP32-S3 (USB CDC + WiFi interrupt contention). Rule: callbacks must only call `xEventGroupSetBits` — no Serial, no setState, no blocking calls. State transitions and logging are handled in `connectionTask`.
+- USB CDC goes silent once WiFi is active (WiFi starves USB CDC DMA). Device is running; use `mosquitto_sub` for observability. See next steps for fix options.
 
 **Phase C sketch** (`esp32-bringup/src/main.cpp`):
 - No library dependencies — raw Wire calls only; single-file, single-loop
@@ -182,10 +185,32 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 | Physical sensor | MPU-6050 detected at 0x68 | ✅ Done |
 | Raw sensor validation | Calibration loads from NVS defaults; telemetry pipeline running | ✅ Done |
 | NVS boot_id | Monotonic counter increments correctly across reboots | ✅ Done |
-| Wi-Fi + MQTT | Connect to real AP; broker reachable; `[State] → NORMAL` printed | 🔄 Next |
-| Full integration | State machine transitions, buffer fill/drain, sync burst | 🔄 Partially booting |
+| Wi-Fi + MQTT | Connect to real AP; broker reachable | ✅ Done |
+| Full integration | Real IMU data at 2Hz; state machine, anomaly detection confirmed via `mosquitto_sub` | ✅ Done |
 | ISR trigger | Photoresistor interrupt fires correctly | ⏳ Pending |
 | Timing/jitter | 100 Hz sample rate holds under load | ⏳ Pending |
+| USB CDC serial silence | Silent after WiFi connects; observability via MQTT only | ⚠️ Known issue |
+
+### Step 6 — USB CDC Serial Silence ⚠️ Open
+
+On ESP32-S3, the native USB CDC shares interrupt/DMA resources with WiFi. Once
+WiFi is active, heavy WiFi interrupt activity starves the USB CDC transmit path
+and serial output goes silent. The device continues running normally — use
+`mosquitto_sub` for observability in the meantime.
+
+**Options (pick one):**
+
+1. **Switch to UART0** — wire a USB-UART adapter to GPIO 43 (TX) / GPIO 44 (RX)
+   and change `monitor_port` in `platformio.ini` to the adapter's port. UART is
+   independent of WiFi and will not be affected. Recommended for ongoing
+   development.
+
+2. **Redirect ESP console to UART** — add `-DARDUINO_USB_CDC_ON_BOOT=0` and
+   `-DARDUINO_UART_ON_BOOT=1` build flags to route `Serial` through UART0
+   without hardware changes, but requires the USB-UART adapter.
+
+3. **Accept silence** — if MQTT + MCP tools are sufficient for observability,
+   serial logging is optional. Low priority if moving to Pi deployment soon.
 
 ---
 

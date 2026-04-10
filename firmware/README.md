@@ -21,22 +21,32 @@ firmware/
 └── lib/                # Custom drivers added here as the project grows
 ```
 
-## Building
+## Credentials Setup
+
+WiFi and MQTT credentials are injected at build time via a gitignored `secrets.ini`:
 
 ```bash
-pio run -e esp32s3-n16r8
+cp secrets.ini.template secrets.ini
+# Edit secrets.ini and fill in WIFI_SSID, WIFI_PASSWORD, MQTT_BROKER_IP
 ```
 
-## Flashing
+## Common PlatformIO Commands
 
 ```bash
-pio run -e esp32s3-n16r8 --target upload
-```
+# Build only
+pio run
 
-## Serial Monitor
+# Build + flash
+pio run --target upload
 
-```bash
-pio device monitor --filter esp32_exception_decoder
+# Build + flash + open serial monitor
+pio run --target upload --target monitor
+
+# Open serial monitor only (device already flashed)
+pio device monitor
+
+# Clean build artifacts and rebuild from scratch
+pio run --target clean && pio run --target upload --target monitor
 ```
 
 ## Key Configuration Notes

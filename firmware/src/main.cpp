@@ -93,9 +93,16 @@ static std::atomic<NodeState> g_nodeState{NodeState::NORMAL};
 static NodeState getState() { return g_nodeState.load(); }
 static void      setState(NodeState s) { g_nodeState.store(s); }
 
-// EventGroup bit set by the onConnect callback to unblock syncTask.
-static EventGroupHandle_t    g_mqttEvents  = nullptr;
-static constexpr EventBits_t kBitReconnect = BIT0;
+// EventGroup bits for MQTT connection events.
+// kBitConnected / kBitDisconnected are edge notifications set by callbacks,
+// consumed and cleared by connectionTask each loop iteration.
+// kBitReconnect is set by connectionTask to unblock syncTask on reconnect.
+// Disconnect takes precedence: if both are set before connectionTask runs,
+// the connect bit is discarded (bounce — net state is disconnected).
+static EventGroupHandle_t    g_mqttEvents     = nullptr;
+static constexpr EventBits_t kBitReconnect    = BIT0;  // connectionTask -> syncTask
+static constexpr EventBits_t kBitConnected    = BIT1;  // onConnect    -> connectionTask
+static constexpr EventBits_t kBitDisconnected = BIT2;  // onDisconnect -> connectionTask
 
 // -----------------------------------------------------------------------------
 // Safety interlock
@@ -222,21 +229,11 @@ void setup() {
     // MQTT connection manager — wire state machine callbacks before tasks start
     // -------------------------------------------------------------------------
     g_mqttManager.onConnect([]() {
-        const NodeState prev = getState();
-        if (prev == NodeState::BUFFERING) {
-            setState(NodeState::SYNCING);
-            xEventGroupSetBits(g_mqttEvents, kBitReconnect);
-            Serial.printf("[State] BUFFERING → SYNCING (%u records in buffer)\n",
-                          g_buffer.available());
-        } else {
-            setState(NodeState::NORMAL);
-            Serial.println("[State] → NORMAL (initial connect)");
-        }
+        xEventGroupSetBits(g_mqttEvents, kBitConnected);
     });
 
     g_mqttManager.onDisconnect([]() {
-        setState(NodeState::BUFFERING);
-        Serial.println("[State] → BUFFERING");
+        xEventGroupSetBits(g_mqttEvents, kBitDisconnected);
     });
 
     g_mqttManager.begin(WIFI_SSID, WIFI_PASSWORD,
@@ -294,12 +291,36 @@ static void connectionTask(void* pvParams) {
         // Drive WiFi + MQTT connection state machine
         g_mqttManager.loop();
 
+        // ---------------------------------------------------------------------
+        // Consume connection event bits (edge notifications from callbacks).
+        // Disconnect takes precedence: if both bits are set (bounce), discard
+        // the stale connect and handle disconnect only.
+        // ---------------------------------------------------------------------
+        const EventBits_t bits = xEventGroupGetBits(g_mqttEvents);
+
+        if (bits & kBitDisconnected) {
+            xEventGroupClearBits(g_mqttEvents, kBitDisconnected | kBitConnected);
+            setState(NodeState::BUFFERING);
+            Serial.println("[State] -> BUFFERING");
+        } else if (bits & kBitConnected) {
+            xEventGroupClearBits(g_mqttEvents, kBitConnected);
+            const NodeState prev = getState();
+            if (prev == NodeState::BUFFERING) {
+                setState(NodeState::SYNCING);
+                xEventGroupSetBits(g_mqttEvents, kBitReconnect);
+                Serial.printf("[State] BUFFERING -> SYNCING (%u records)\n",
+                              g_buffer.available());
+            } else {
+                setState(NodeState::NORMAL);
+                Serial.println("[State] -> NORMAL");
+            }
+        }
+
         // Drain the publish queue — only while connected
         while (g_mqttManager.isConnected() &&
                xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE) {
             if (!g_mqttManager.publish(msg.topic, msg.payload, msg.retained)) {
                 Serial.println("[ConnTask] WARN — publish failed mid-drain.");
-                // Record is lost here; buffer is the real durability guarantee
             }
         }
 

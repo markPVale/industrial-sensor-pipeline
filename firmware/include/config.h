@@ -56,8 +56,12 @@
 //       Never commit real credentials — override via a local untracked header
 //       or a PlatformIO build_flags -D override.
 // -----------------------------------------------------------------------------
+#ifndef WIFI_SSID
 #define WIFI_SSID             "your-ssid"
+#endif
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD         "your-password"
+#endif
 
 // -----------------------------------------------------------------------------
 // MQTT
@@ -66,7 +70,9 @@
 // MQTT_CLIENT_ID: Must be unique per node if you add more nodes.
 // TODO: Load broker IP and client ID from NVS in a later phase.
 // -----------------------------------------------------------------------------
+#ifndef MQTT_BROKER_IP
 #define MQTT_BROKER_IP        "192.168.1.100"
+#endif
 #define MQTT_PORT             1883
 #define MQTT_CLIENT_ID        "sensor-node01"
 #define MQTT_TOPIC_TELEMETRY  "sensor/node01/telemetry"
