@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Step 5 smoke test — Phases A–F complete. Full pipeline verified end-to-end. USB CDC serial silence under WiFi is the one known open issue._
+_Last updated: Full pipeline verified end-to-end on real hardware. ESP32 → MQTT → Bridge → InfluxDB confirmed. Known open issues: USB CDC silence under WiFi, firmware timestamps are uptime not epoch._
 
 ---
 
@@ -187,6 +187,7 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 | NVS boot_id | Monotonic counter increments correctly across reboots | ✅ Done |
 | Wi-Fi + MQTT | Connect to real AP; broker reachable | ✅ Done |
 | Full integration | Real IMU data at 2Hz; state machine, anomaly detection confirmed via `mosquitto_sub` | ✅ Done |
+| Bridge → InfluxDB | Data landing in `sensors` bucket; confirmed via bridge DEBUG logs | ✅ Done |
 | ISR trigger | Photoresistor interrupt fires correctly | ⏳ Pending |
 | Timing/jitter | 100 Hz sample rate holds under load | ⏳ Pending |
 | USB CDC serial silence | Silent after WiFi connects; observability via MQTT only | ⚠️ Known issue |
@@ -223,6 +224,8 @@ and serial output goes silent. The device continues running normally — use
 | Buffer overflow policy | Evict oldest (keep newest data) | `BufferManager.h` |
 | Buffer thread-safety | FreeRTOS mutex; NOT ISR-safe by design | `BufferManager.h` |
 | MCP transport | stdio (laptop); swap to SSE for Pi remote access | `mcp-server-architecture.md` |
+| MQTT callbacks | Set event bits only — no Serial, no setState, no blocking calls. Serial.flush() inside a callback causes a crash on ESP32-S3 (USB CDC + WiFi interrupt contention). State transitions handled in connectionTask. | `main.cpp` |
+| InfluxDB timestamps | Bridge uses broker-arrival time. Firmware `ts` field is `millis()` since boot (not Unix epoch) — not suitable as a DB timestamp until NTP is added. | `mqtt_to_influx.py` |
 
 ---
 
