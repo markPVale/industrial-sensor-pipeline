@@ -86,9 +86,8 @@ def write_telemetry(node_id: str, payload: dict) -> None:
         .field("sequence_id",  int(payload.get("seq",  0)))
         .field("flags",        flags)
     )
-    # Prefer edge-side timestamp ("ts") over broker-arrival time.
-    if "ts" in payload:
-        point = point.time(int(payload["ts"]), WritePrecision.MS)
+    # Note: firmware "ts" is millis() since boot, not Unix epoch.
+    # Use broker-arrival time (InfluxDB default) until NTP is added to firmware.
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
     log.debug("Written telemetry for %s: rms=%.4f m/s² flags=0x%02x seq=%d",
