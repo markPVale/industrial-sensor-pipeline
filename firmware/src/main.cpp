@@ -552,6 +552,8 @@ static void syncTask(void* pvParams) {
 // no non-IRAM functions. Only ISR-safe FreeRTOS APIs permitted.
 // =============================================================================
 static void IRAM_ATTR safetyISR() {
+    // If already latched, ignore all subsequent edges — no debounce needed.
+    if (g_interlockActive.load()) return;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xEventGroupSetBitsFromISR(g_safetyEvents, kBitInterlock,
                               &xHigherPriorityTaskWoken);
