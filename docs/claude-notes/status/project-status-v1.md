@@ -188,7 +188,7 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 | Wi-Fi + MQTT | Connect to real AP; broker reachable | ✅ Done |
 | Full integration | Real IMU data at 2Hz; state machine, anomaly detection confirmed via `mosquitto_sub` | ✅ Done |
 | Bridge → InfluxDB | Data landing in `sensors` bucket; confirmed via bridge DEBUG logs | ✅ Done |
-| ISR trigger | Photoresistor interrupt fires correctly | ⏳ Pending |
+| ISR trigger | Photoresistor interrupt fires correctly; flags 8→12 on trigger, latch holds, clears on reboot | ✅ Done |
 | Timing/jitter | 100 Hz sample rate holds under load | ⏳ Pending |
 | USB CDC serial silence | Silent after WiFi connects; observability via MQTT only | ⚠️ Known issue |
 
@@ -226,6 +226,7 @@ and serial output goes silent. The device continues running normally — use
 | MCP transport | stdio (laptop); swap to SSE for Pi remote access | `mcp-server-architecture.md` |
 | MQTT callbacks | Set event bits only — no Serial, no setState, no blocking calls. Serial.flush() inside a callback causes a crash on ESP32-S3 (USB CDC + WiFi interrupt contention). State transitions handled in connectionTask. | `main.cpp` |
 | InfluxDB timestamps | Bridge uses broker-arrival time. Firmware `ts` field is `millis()` since boot (not Unix epoch) — not suitable as a DB timestamp until NTP is added. | `mqtt_to_influx.py` |
+| ISR debounce | safetyISR checks `g_interlockActive` at entry and returns immediately if already latched. LDR signal is noisy on transition; without this guard, a single cover event produced 15+ estop publishes. | `main.cpp` |
 
 ---
 
