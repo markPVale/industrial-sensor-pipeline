@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Full pipeline verified end-to-end on real hardware. ESP32 → MQTT → Bridge → InfluxDB confirmed. Known open issues: USB CDC silence under WiFi, firmware timestamps are uptime not epoch._
+_Last updated: ISR trigger verified on hardware. Safety interlock chain confirmed end-to-end. Step 5 one item from complete (timing/jitter). Known open issues: USB CDC silence under WiFi, firmware timestamps are uptime not epoch, anomaly threshold fires at rest._
 
 ---
 
@@ -50,6 +50,41 @@ industrial-sensor-pipeline/
         └── status/
             └── project-status-v1.md   ← this file
 ```
+
+---
+
+## System Architecture
+
+```
+ESP32-S3 N16R8
+  └── MPU-6050 (I2C, SDA=8, SCL=9)
+  └── Photoresistor safety interlock (GPIO 10)
+        │
+        │ MQTT over WiFi (QoS 1)
+        ▼
+Mosquitto Broker (Docker, :1883 / :9001 WS)
+        │
+        ▼
+Python Bridge (paho-mqtt → influxdb-client)
+        │
+        ▼
+InfluxDB 2.7 (Docker, :8086) — `sensors` bucket
+        │
+        ├──▶ Grafana (:3001) — dashboards
+        ├──▶ Next.js Dashboard (:3000) — live MQTT WebSocket
+        └──▶ MCP Server (stdio) — Claude Code tools
+```
+
+### FreeRTOS Task Architecture
+
+| Task | Core | Priority | Role |
+|------|------|----------|------|
+| `safetyTask` | 0 | 6 | ISR handler — latches interlock, publishes estop |
+| `sensorTask` | 1 | 5 | 100 Hz MPU-6050 sampling via `vTaskDelayUntil` |
+| `filterTask` | 1 | 5 | 6× Kalman filters, rolling RMS, anomaly detection |
+| `connectionTask` | 0 | 4 | Sole MQTT socket owner; drains publish queue |
+| `telemetryTask` | 0 | 3 | Pops buffer, publishes at 2 Hz |
+| `syncTask` | 0 | 3 | Burst-drains PSRAM buffer on reconnect |
 
 ---
 
@@ -212,6 +247,21 @@ and serial output goes silent. The device continues running normally — use
 
 3. **Accept silence** — if MQTT + MCP tools are sufficient for observability,
    serial logging is optional. Low priority if moving to Pi deployment soon.
+
+---
+
+## Open Issues (Priority Order)
+
+1. **Timing/jitter** — last remaining Step 5 item; 100 Hz sample rate under load not yet measured
+2. **Anomaly threshold** — `kAnomalyRmsThreshold = 9.81f` fires at rest from gravity (az ≈ 10.2 m/s²); needs tuning upward
+3. **USB CDC silence** — goes silent once WiFi active; `mosquitto_sub` is primary observability; three fix options in Step 6
+4. **NTP sync** — firmware `ts` is `millis()` since boot, not Unix epoch; bridge uses broker-arrival time as workaround
+5. **MPU-6050 NVS calibration save** — current offsets are hardcoded bench defaults; NVS write path not implemented
+6. **Grafana dashboards** — stack is running but dashboards not validated against real data
+
+## What's Next
+
+Finish Step 5 (timing/jitter test), then tune the anomaly threshold — it's the most visible active bug, firing on every record at rest. After that: Phase 4 HIL stress testing and Pi deployment.
 
 ---
 
