@@ -249,8 +249,11 @@ void setup() {
         while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     pinMode(PIN_SAFETY_INTERLOCK, INPUT_PULLUP);
+    delay(20);  // allow pin to settle before arming interrupt (prevents boot false trigger)
     attachInterrupt(digitalPinToInterrupt(PIN_SAFETY_INTERLOCK), safetyISR, FALLING);
-    Serial.printf("[Safety] Interlock armed on GPIO %d.\n", PIN_SAFETY_INTERLOCK);
+    Serial.printf("[Safety] Interlock armed on GPIO %d (pin=%s).\n",
+                  PIN_SAFETY_INTERLOCK,
+                  digitalRead(PIN_SAFETY_INTERLOCK) == LOW ? "LOW — interlock open" : "HIGH — OK");
 
     // -------------------------------------------------------------------------
     // FreeRTOS tasks
@@ -552,8 +555,9 @@ static void syncTask(void* pvParams) {
 // no non-IRAM functions. Only ISR-safe FreeRTOS APIs permitted.
 // =============================================================================
 static void IRAM_ATTR safetyISR() {
-    // If already latched, ignore all subsequent edges — no debounce needed.
-    if (g_interlockActive.load()) return;
+    // Atomically set latch — exchange returns previous value.
+    // If it was already true, this is a bounce; return immediately.
+    if (g_interlockActive.exchange(true)) return;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xEventGroupSetBitsFromISR(g_safetyEvents, kBitInterlock,
                               &xHigherPriorityTaskWoken);
