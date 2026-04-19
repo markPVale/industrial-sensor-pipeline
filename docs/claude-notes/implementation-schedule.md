@@ -68,14 +68,29 @@ Hardware verification checklist: see `docs/claude-notes/platformio-init.md`.
 
 ---
 
-## Phase 4: Lab & HIL Stress-Testing
+## Phase 4: Pi Deployment & Stress-Testing
 
-| Task | Status |
-|------|--------|
-| Deploy gateway stack to Raspberry Pi 5 | ❌ Not started |
-| Chaos Injection Panel in Dashboard (kill MQTT, simulate drift) | ❌ Not started |
-| Record "Unplug Demo": disconnect → buffer → reconnect → burst-sync | ❌ Not started |
-| MCP Server deployed to Pi, Claude Code connected over network | ❌ Not started |
+| # | Task | Status |
+|---|------|--------|
+| 1 | Deploy gateway stack to Raspberry Pi 5 | ❌ Not started |
+| 2 | NTP sync — Pi + firmware time alignment | ❌ Not started |
+| 3 | End-to-End Integrity Check | ❌ Not started |
+| 4 | Grafana dashboard validation (real timestamps) | ❌ Not started |
+| 5 | MCP Server deployed to Pi, Claude Code connected over network | ❌ Not started |
+| 6 | Record "Unplug Demo": disconnect → buffer → reconnect → burst-sync | ❌ Not started |
+| 7 | Chaos Injection Panel (stretch) | ❌ Not started |
+
+### Step 3 — End-to-End Integrity Check
+
+Acceptance gate before Grafana validation. Proves the pipeline preserves ordering, time, and meaning from firmware → DB.
+
+**Sequence integrity:** `seq_id` is strictly increasing with no gaps or duplicates. Resets to 0 only when `boot_id` increments.
+
+**Timestamp correctness:** timestamps are monotonic and real-time aligned after NTP sync. No drift, no backward jumps.
+
+**Data fidelity:** values and flags are unchanged end-to-end. Records sent == records stored, including anomaly-flagged records.
+
+---
 
 For Pi deployment: `docker compose up -d` on the Pi uses the same `docker-compose.yml`. MCP server transport swap: `StdioServerTransport` → `SSEServerTransport` — see `docs/claude-notes/mcp-server-architecture.md`.
 
