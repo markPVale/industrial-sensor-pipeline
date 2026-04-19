@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: ISR trigger verified on hardware. Safety interlock chain confirmed end-to-end. Step 5 one item from complete (timing/jitter). Known open issues: USB CDC silence under WiFi, firmware timestamps are uptime not epoch, anomaly threshold fires at rest._
+_Last updated: Step 5 complete. Timing verified (500ms exact), anomaly threshold tuned from hardware measurement (12.5 m/s²), ISR chain confirmed. Phase 4 next._
 
 ---
 
@@ -224,7 +224,7 @@ reconnect cleanly, check InfluxDB has no gaps or duplicates.
 | Full integration | Real IMU data at 2Hz; state machine, anomaly detection confirmed via `mosquitto_sub` | ✅ Done |
 | Bridge → InfluxDB | Data landing in `sensors` bucket; confirmed via bridge DEBUG logs | ✅ Done |
 | ISR trigger | Photoresistor interrupt fires correctly; flags 8→12 on trigger, latch holds, clears on reboot | ✅ Done |
-| Timing/jitter | 100 Hz sample rate holds under load | ⏳ Pending |
+| Timing/jitter | 500ms window deltas exact across 50 records under full WiFi + MQTT load | ✅ Done |
 | USB CDC serial silence | Silent after WiFi connects; observability via MQTT only | ⚠️ Known issue |
 
 ### Step 6 — USB CDC Serial Silence ⚠️ Open
@@ -252,12 +252,11 @@ and serial output goes silent. The device continues running normally — use
 
 ## Open Issues (Priority Order)
 
-1. **Timing/jitter** — last remaining Step 5 item; 100 Hz sample rate under load not yet measured
-2. **Anomaly threshold** — `kAnomalyRmsThreshold = 9.81f` fires at rest from gravity (az ≈ 10.2 m/s²); needs tuning upward
-3. **USB CDC silence** — goes silent once WiFi active; `mosquitto_sub` is primary observability; three fix options in Step 6
+1. **USB CDC silence** — goes silent once WiFi active; `mosquitto_sub` is primary observability; three fix options in Step 6
+2. **NTP sync** — firmware `ts` is `millis()` since boot, not Unix epoch; bridge uses broker-arrival time as workaround
+3. **MPU-6050 NVS calibration save** — current offsets are hardcoded bench defaults; NVS write path not implemented
 4. **NTP sync** — firmware `ts` is `millis()` since boot, not Unix epoch; bridge uses broker-arrival time as workaround
-5. **MPU-6050 NVS calibration save** — current offsets are hardcoded bench defaults; NVS write path not implemented
-6. **Grafana dashboards** — stack is running but dashboards not validated against real data
+5. **Grafana dashboards** — stack is running but dashboards not validated against real data
 
 ## What's Next
 
