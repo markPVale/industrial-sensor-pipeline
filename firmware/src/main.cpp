@@ -55,8 +55,9 @@ static constexpr float kAccelClipThreshold  = 78.48f;
 static constexpr float kGyroClipThreshold   =  8.727f;
 
 // Anomaly: RMS of accel magnitude over FILTER_WINDOW_SIZE samples (m/s²).
-// ~1g midpoint between normal (0.30g) and anomaly (1.80g). Tune on hardware.
-static constexpr float kAnomalyRmsThreshold = 9.81f;
+// At-rest RMS measured on hardware: 10.24–10.27 m/s² (gravity + calibration offset).
+// Threshold set 2.2 m/s² (0.22g) above at-rest ceiling to suppress false positives.
+static constexpr float kAnomalyRmsThreshold = 12.5f;
 
 // Spike rejection: 0.5g in m/s² for accel axes.
 // Gyro threshold left at 0 (disabled) until noise profile is measured.
