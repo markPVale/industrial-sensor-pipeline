@@ -68,6 +68,20 @@ docker compose down -v        # stop + wipe volumes
 
 ---
 
+## Bridge Observability
+
+The Python bridge (`mqtt_to_influx.py`) logs at INFO by default. Telemetry writes use `log.debug()` — intentionally silent during steady-state operation (2 records/second = 7200 log lines/hour). Estop writes log at WARNING, which is appropriate for exceptional events.
+
+**To verify InfluxDB is receiving data**, use `gateway/bridge/query_influx.sh`:
+
+```bash
+bash gateway/bridge/query_influx.sh
+```
+
+This queries the last 5 minutes of the `sensors` bucket and returns raw CSV. Non-empty output confirms the pipeline is writing correctly. Use this instead of enabling DEBUG logging for routine verification.
+
+---
+
 ## Next Steps
 
 - [ ] Add Grafana provisioning files (`grafana/provisioning/`) to auto-configure InfluxDB datasource and default dashboards
