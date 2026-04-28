@@ -9,6 +9,8 @@
 #include <Adafruit_Sensor.h>
 #include <math.h>
 #include <atomic>
+#include <time.h>
+#include <sys/time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -117,6 +119,22 @@ static constexpr EventBits_t kBitDisconnected = BIT2;  // onDisconnect -> connec
 static EventGroupHandle_t    g_safetyEvents   = nullptr;
 static constexpr EventBits_t kBitInterlock    = BIT0;
 static std::atomic<bool>     g_interlockActive{false};
+
+// -----------------------------------------------------------------------------
+// NTP time sync
+//
+// After WiFi connects, connectionTask polls until the system clock is set by
+// NTP. Once synced, g_ntpEpochMs + (millis() - g_millisAtSync) gives UTC ms.
+// sensorTask uses this for record timestamps; falls back to millis() until
+// synced so the pipeline keeps running during the brief pre-sync window.
+// -----------------------------------------------------------------------------
+static std::atomic<bool>     g_ntpSynced{false};
+static std::atomic<uint64_t> g_ntpEpochMs{0};
+static std::atomic<uint32_t> g_millisAtSync{0};
+
+static uint64_t getEpochMs() {
+    return g_ntpEpochMs.load() + ((uint64_t)millis() - g_millisAtSync.load());
+}
 
 // -----------------------------------------------------------------------------
 // Shared globals
@@ -241,6 +259,9 @@ void setup() {
                          MQTT_BROKER_IP, MQTT_PORT,
                          MQTT_CLIENT_ID, MQTT_KEEPALIVE_S);
 
+    // NTP — sync to UTC on WiFi connect. No offset, no DST.
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
     // -------------------------------------------------------------------------
     // Safety interlock — EventGroup + GPIO interrupt
     // -------------------------------------------------------------------------
@@ -320,6 +341,20 @@ static void connectionTask(void* pvParams) {
             }
         }
 
+        // NTP sync poll — runs until synced, then becomes a no-op
+        if (!g_ntpSynced.load()) {
+            struct timeval tv;
+            gettimeofday(&tv, nullptr);
+            if (tv.tv_sec > 1700000000L) {  // sanity: must be post-2023
+                g_ntpEpochMs.store((uint64_t)tv.tv_sec * 1000ULL
+                                   + (uint64_t)(tv.tv_usec / 1000));
+                g_millisAtSync.store((uint32_t)millis());
+                g_ntpSynced.store(true);
+                Serial.printf("[NTP] Synced — epoch %llu ms\n",
+                              (unsigned long long)g_ntpEpochMs.load());
+            }
+        }
+
         // Drain the publish queue — only while connected
         while (g_mqttManager.isConnected() &&
                xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE) {
@@ -348,7 +383,7 @@ static void sensorTask(void* pvParams) {
         g_mpu.getEvent(&accel_event, &gyro_event, &temp_event);
 
         RawSample sample{};
-        sample.timestamp_ms = (uint64_t)millis();
+        sample.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
         sample.accel_x = (accel_event.acceleration.x - g_cal.ax_offset) * g_cal.ax_scale;
         sample.accel_y = (accel_event.acceleration.y - g_cal.ay_offset) * g_cal.ay_scale;
         sample.accel_z = (accel_event.acceleration.z - g_cal.az_offset) * g_cal.az_scale;
