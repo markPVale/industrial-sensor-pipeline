@@ -72,8 +72,8 @@ Hardware verification checklist: see `docs/claude-notes/platformio-init.md`.
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | Deploy gateway stack to Raspberry Pi 5 | ❌ Not started |
-| 2 | NTP sync — Pi + firmware time alignment | ❌ Not started |
+| 1 | Deploy gateway stack to Raspberry Pi 5 | ✅ Done |
+| 2 | NTP sync — Pi + firmware time alignment | ✅ Done |
 | 3 | End-to-End Integrity Check | ❌ Not started |
 | 4 | Grafana dashboard validation (real timestamps) | ❌ Not started |
 | 5 | MCP Server deployed to Pi, Claude Code connected over network | ❌ Not started |

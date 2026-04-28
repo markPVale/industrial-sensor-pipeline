@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Step 5 complete. Timing verified (500ms exact), anomaly threshold tuned from hardware measurement (12.5 m/s²), ISR chain confirmed. Phase 4 next._
+_Last updated: Phase 4 Steps 1–2 complete. Gateway stack deployed on Pi. NTP sync verified — firmware timestamps are real UTC epoch ms landing correctly in InfluxDB._
 
 ---
 
@@ -253,7 +253,6 @@ and serial output goes silent. The device continues running normally — use
 ## Open Issues (Priority Order)
 
 1. **USB CDC silence** — goes silent once WiFi active; `mosquitto_sub` is primary observability; three fix options in Step 6
-2. **NTP sync** — firmware `ts` is `millis()` since boot, not Unix epoch; bridge uses broker-arrival time as workaround
 3. **MPU-6050 NVS calibration save** — current offsets are hardcoded bench defaults; NVS write path not implemented
 4. **NTP sync** — firmware `ts` is `millis()` since boot, not Unix epoch; bridge uses broker-arrival time as workaround
 5. **Grafana dashboards** — stack is running but dashboards not validated against real data
