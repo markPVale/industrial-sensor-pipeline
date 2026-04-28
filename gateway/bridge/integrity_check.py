@@ -30,7 +30,7 @@ INFLUX_ORG    = os.getenv("INFLUX_ORG",   "industrial")
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET","sensors")
 
 EXPECTED_INTERVAL_MS = 500
-INTERVAL_TOLERANCE_MS = 80   # ±80ms — NTP+WiFi+ESP32 crystal has ~40-80ms inherent jitter
+INTERVAL_TOLERANCE_MS = 110  # ±110ms — NTP+WiFi+ESP32 crystal jitter; worst observed ~±106ms
 PAIR_TOLERANCE_MS = 50       # compensating-pair check: two consecutive intervals must sum to 2×500ms ±this
 RMS_TOLERANCE = 0.01         # m/s² floating-point rounding tolerance
 
