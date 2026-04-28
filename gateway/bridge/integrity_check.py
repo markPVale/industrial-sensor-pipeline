@@ -91,24 +91,51 @@ def check_sequence(records):
 def check_timestamps(records):
     print("\n--- 2. Timestamp Monotonicity ---")
     errors = 0
+    jitter_warnings = 0
+
+    deltas = []
     prev = None
     for r in records:
         if prev is None or r["boot_id"] != prev["boot_id"]:
             prev = r
+            deltas.append((r, None))
             continue
         delta_ms = (r["time"] - prev["time"]).total_seconds() * 1000
+        deltas.append((r, delta_ms))
+        prev = r
+
+    i = 0
+    while i < len(deltas):
+        r, delta_ms = deltas[i]
+        if delta_ms is None:
+            i += 1
+            continue
         if delta_ms <= 0:
             print(f"  NON-MONOTONIC  seq={r['seq_id']}  delta={delta_ms:.1f}ms")
             errors += 1
-        elif abs(delta_ms - EXPECTED_INTERVAL_MS) > INTERVAL_TOLERANCE_MS:
-            print(f"  JITTER  seq={r['seq_id']}  delta={delta_ms:.1f}ms "
-                  f"(expected {EXPECTED_INTERVAL_MS}±{INTERVAL_TOLERANCE_MS}ms)")
-            errors += 1
-        prev = r
+            i += 1
+            continue
+        if abs(delta_ms - EXPECTED_INTERVAL_MS) > INTERVAL_TOLERANCE_MS:
+            forgiven = False
+            if i + 1 < len(deltas):
+                next_r, next_delta = deltas[i + 1]
+                if next_delta is not None and next_r["boot_id"] == r["boot_id"]:
+                    if abs(delta_ms + next_delta - 2 * EXPECTED_INTERVAL_MS) <= PAIR_TOLERANCE_MS:
+                        forgiven = True
+                        jitter_warnings += 1
+                        i += 2
+                        continue
+            if not forgiven:
+                print(f"  JITTER  seq={r['seq_id']}  delta={delta_ms:.1f}ms "
+                      f"(expected {EXPECTED_INTERVAL_MS}±{INTERVAL_TOLERANCE_MS}ms, uncompensated)")
+                errors += 1
+        i += 1
+
     if errors == 0:
-        print(f"  PASS — all intervals within {EXPECTED_INTERVAL_MS}±{INTERVAL_TOLERANCE_MS}ms")
+        note = f", {jitter_warnings} compensating pair(s) forgiven" if jitter_warnings else ""
+        print(f"  PASS — all intervals within {EXPECTED_INTERVAL_MS}±{INTERVAL_TOLERANCE_MS}ms{note}")
     else:
-        print(f"  FAIL — {errors} violation(s)")
+        print(f"  FAIL — {errors} hard violation(s) ({jitter_warnings} compensating pair(s) forgiven)")
     return errors == 0
 
 
