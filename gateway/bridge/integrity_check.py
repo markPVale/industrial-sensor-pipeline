@@ -117,6 +117,7 @@ def check_timestamps(records):
             continue
         if abs(delta_ms - EXPECTED_INTERVAL_MS) > INTERVAL_TOLERANCE_MS:
             forgiven = False
+            # Check forward: next interval compensates this one.
             if i + 1 < len(deltas):
                 next_r, next_delta = deltas[i + 1]
                 if next_delta is not None and next_r["boot_id"] == r["boot_id"]:
@@ -125,6 +126,15 @@ def check_timestamps(records):
                         jitter_warnings += 1
                         i += 2
                         continue
+            # Check backward: previous interval already compensates this one.
+            # Handles the case where prev was within ±INTERVAL_TOLERANCE_MS but the
+            # pair sum still lands near 2×EXPECTED (e.g. 608ms+351ms=959ms).
+            if not forgiven and i > 0:
+                prev_r, prev_delta = deltas[i - 1]
+                if prev_delta is not None and prev_r["boot_id"] == r["boot_id"]:
+                    if abs(prev_delta + delta_ms - 2 * EXPECTED_INTERVAL_MS) <= PAIR_TOLERANCE_MS:
+                        forgiven = True
+                        jitter_warnings += 1
             if not forgiven:
                 print(f"  JITTER  seq={r['seq_id']}  delta={delta_ms:.1f}ms "
                       f"(expected {EXPECTED_INTERVAL_MS}±{INTERVAL_TOLERANCE_MS}ms, uncompensated)")
