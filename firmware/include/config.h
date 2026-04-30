@@ -39,6 +39,11 @@
 // TelemetryRecord. At SAMPLE_RATE_HZ=100 this gives a ~2 Hz output rate.
 #define FILTER_WINDOW_SIZE    50
 
+// Consecutive all-zero accel reads from MPU-6050 before a sensor fault record
+// is emitted. At 100 Hz, 5 consecutive zeros = 50ms — long enough to be a real
+// I2C dropout, short enough to catch it quickly.
+#define SENSOR_FAULT_THRESHOLD  5
+
 // Depth of the RawSample queue between sensorTask and filterTask.
 // At 100 Hz and a 10 ms filter budget, 20 slots gives 200 ms of slack.
 #define SENSOR_QUEUE_DEPTH    20

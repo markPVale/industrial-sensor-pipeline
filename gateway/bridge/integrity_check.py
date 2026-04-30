@@ -33,6 +33,7 @@ EXPECTED_INTERVAL_MS = 500
 INTERVAL_TOLERANCE_MS = 110  # ±110ms — NTP+WiFi+ESP32 crystal jitter; worst observed ~±106ms
 PAIR_TOLERANCE_MS = 50       # compensating-pair check: two consecutive intervals must sum to 2×500ms ±this
 RMS_TOLERANCE = 0.01         # m/s² floating-point rounding tolerance
+STATUS_SENSOR_FAULT = 0x10   # matches firmware types.h
 
 
 def query(client, minutes):
@@ -81,10 +82,13 @@ def check_sequence(records):
                       f"seq did not reset to 0 (got {r['seq_id']})")
                 errors += 1
         prev = r
+    fault_count = sum(1 for r in records if r["flags"] & STATUS_SENSOR_FAULT)
+    normal_count = len(records) - fault_count
+    note = f" ({fault_count} fault record(s) included)" if fault_count else ""
     if errors == 0:
-        print(f"  PASS — {len(records)} records, no gaps or duplicates")
+        print(f"  PASS — {normal_count} telemetry + {fault_count} fault records, no gaps or duplicates{note}")
     else:
-        print(f"  FAIL — {errors} violation(s)")
+        print(f"  FAIL — {errors} violation(s){note}")
     return errors == 0
 
 
@@ -93,9 +97,13 @@ def check_timestamps(records):
     errors = 0
     jitter_warnings = 0
 
+    # Exclude fault records from interval checks — their timing is intentionally
+    # irregular (emitted on dropout, not on the 500ms sensor window boundary).
+    normal = [r for r in records if not (r["flags"] & STATUS_SENSOR_FAULT)]
+
     deltas = []
     prev = None
-    for r in records:
+    for r in normal:
         if prev is None or r["boot_id"] != prev["boot_id"]:
             prev = r
             deltas.append((r, None))
@@ -152,7 +160,8 @@ def check_timestamps(records):
 def check_fidelity(records):
     print("\n--- 3. Data Fidelity ---")
     errors = 0
-    for r in records:
+    normal = [r for r in records if not (r["flags"] & STATUS_SENSOR_FAULT)]
+    for r in normal:
         expected_rms = math.sqrt(r["ax"]**2 + r["ay"]**2 + r["az"]**2)
         diff = abs(r["rms"] - expected_rms)
         if diff > RMS_TOLERANCE:
@@ -160,10 +169,22 @@ def check_fidelity(records):
                   f"stored={r['rms']:.6f}  computed={expected_rms:.6f}  diff={diff:.6f}")
             errors += 1
     if errors == 0:
-        print(f"  PASS — {len(records)} records, vibration_rms matches recomputed values")
+        print(f"  PASS — {len(normal)} records, vibration_rms matches recomputed values")
     else:
         print(f"  FAIL — {errors} violation(s)")
     return errors == 0
+
+
+def check_sensor_faults(records):
+    print("\n--- 4. Sensor Faults ---")
+    faults = [r for r in records if r["flags"] & STATUS_SENSOR_FAULT]
+    if not faults:
+        print("  PASS — no sensor fault records")
+    else:
+        for f in faults:
+            print(f"  FAULT  boot={f['boot_id']}  seq={f['seq_id']}  time={f['time']}")
+        print(f"  {len(faults)} fault record(s) — review sensor/wiring if count is high")
+    return True
 
 
 def main():
@@ -183,9 +204,10 @@ def main():
     boots = sorted(set(r["boot_id"] for r in records))
     print(f"Found {len(records)} records across boot_id(s): {boots}")
 
-    seq_ok  = check_sequence(records)
-    time_ok = check_timestamps(records)
-    fid_ok  = check_fidelity(records)
+    seq_ok   = check_sequence(records)
+    time_ok  = check_timestamps(records)
+    fid_ok   = check_fidelity(records)
+    check_sensor_faults(records)
 
     print("\n--- Summary ---")
     print(f"  Sequence integrity:     {'PASS' if seq_ok  else 'FAIL'}")

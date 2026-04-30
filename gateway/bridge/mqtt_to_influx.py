@@ -38,6 +38,8 @@ INFLUX_BUCKET = os.getenv("INFLUX_BUCKET","sensors")
 TOPIC_TELEMETRY = "sensor/+/telemetry"
 TOPIC_ESTOP     = "sensor/+/estop"
 
+STATUS_SENSOR_FAULT = 0x10
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -54,6 +56,22 @@ influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_OR
 write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
 
+def write_sensor_fault(node_id: str, payload: dict) -> None:
+    """Write a sensor fault record (I2C dropout) to the sensor_faults measurement."""
+    point = (
+        Point("sensor_faults")
+        .tag("node_id", node_id)
+        .field("boot_id",     int(payload.get("boot", 0)))
+        .field("sequence_id", int(payload.get("seq",  0)))
+        .field("reason",      "i2c_dropout")
+    )
+    ts = int(payload.get("ts", 0))
+    if ts > 1_000_000_000_000:
+        point = point.time(ts, WritePrecision.MS)
+    write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    log.warning("Sensor fault written for node %s seq=%d", node_id, payload.get("seq", -1))
+
+
 def write_telemetry(node_id: str, payload: dict) -> None:
     """
     Write a telemetry record to InfluxDB.
@@ -61,7 +79,12 @@ def write_telemetry(node_id: str, payload: dict) -> None:
     Payload shape follows docs/telemetry-schema.md.
     vibration_rms is not transmitted by firmware — it is derived here as
     sqrt(ax² + ay² + az²) for use by Grafana panels and MCP queries.
+    Records with STATUS_SENSOR_FAULT are routed to sensor_faults instead.
     """
+    if int(payload.get("flags", 0)) & STATUS_SENSOR_FAULT:
+        write_sensor_fault(node_id, payload)
+        return
+
     ax = float(payload.get("ax", 0.0))
     ay = float(payload.get("ay", 0.0))
     az = float(payload.get("az", 0.0))

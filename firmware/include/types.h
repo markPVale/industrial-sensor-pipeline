@@ -19,6 +19,7 @@
 #define STATUS_GYRO_CLIPPED   0x02  // gyro hit range limit
 #define STATUS_INTERLOCK_OPEN 0x04  // safety interlock was open at sample time
 #define STATUS_ANOMALY        0x08  // anomaly detection flagged this record
+#define STATUS_SENSOR_FAULT   0x10  // I2C dropout — consecutive zero reads from MPU-6050
 
 // -----------------------------------------------------------------------------
 // TelemetryRecord

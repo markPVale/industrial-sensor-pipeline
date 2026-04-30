@@ -69,6 +69,11 @@ static constexpr float kAccelSpikeThreshold = 4.905f;
 // Initialised to 0; set before any task uses it.
 static uint32_t g_bootId = 0;
 
+// Sequence ID — monotonic counter shared by filterTask (normal records) and
+// sensorTask (fault records). Global so fault records stay in sequence with
+// normal telemetry. Resets to 0 each boot.
+static std::atomic<uint32_t> g_sequenceId{0};
+
 // -----------------------------------------------------------------------------
 // Accelerometer calibration — loaded from NVS in loadCalibration().
 // Correction: corrected = (raw - offset) * scale
@@ -373,14 +378,59 @@ static void connectionTask(void* pvParams) {
 // Samples the MPU-6050 at exactly SAMPLE_RATE_HZ using vTaskDelayUntil.
 // Posts RawSamples to g_sensorQueue for filterTask to consume.
 // Drops samples (not blocks) if the queue is full to preserve timing.
+
+// sensorTask (line 377)
+//   - Calls g_mpu.getEvent() — no return value checked, no guard against failure
+//   - Applies calibration offsets/scale to raw accel values
+//   - Detects clipping (flags STATUS_ACCEL_CLIPPED / STATUS_GYRO_CLIPPED)
+//   - Pushes RawSample onto g_sensorQueue — drops if queue full, but no validation of the values themselves
+
+//   filterTask (line 422)
+//   - Pops RawSample from queue
+//   - Runs 6 Kalman filters (one per axis) — has NaN/Inf guard internallyYea 
+//   - Accumulates rolling RMS over 50 samples
+//   - Every 50 samples emits one TelemetryRecord to g_buffer
+//   - Sets STATUS_ANOMALY if RMS > threshold, STATUS_INTERLOCK_OPEN if latch is active
+//   - No check for whether the 50 raw samples feeding the window were valid
+
+//   The gap: getEvent() can silently return zeros on I2C dropout. Those zeros flow through calibration, through Kalman, into the RMS window, and ultimately into a TelemetryRecord — flagged only as STATUS_OK with near-zero RMS
+//    values. Nothing in the current pipeline detects or flags this.
+
+//   The natural insertion point for the guard is in sensorTask right after getEvent() (line 383), before the sample enters the queue.
 // =============================================================================
 static void sensorTask(void* pvParams) {
     const TickType_t period   = pdMS_TO_TICKS(1000 / SAMPLE_RATE_HZ);
     TickType_t       lastWake = xTaskGetTickCount();
+    uint8_t          consecutiveZeroReads = 0;
 
     for (;;) {
         sensors_event_t accel_event, gyro_event, temp_event;
         g_mpu.getEvent(&accel_event, &gyro_event, &temp_event);
+
+        // I2C dropout detection: all raw accel axes exactly zero indicates the
+        // MPU-6050 returned no data. After SENSOR_FAULT_THRESHOLD consecutive
+        // zero reads, emit a fault record directly to g_buffer (bypassing the
+        // filter window) and skip the sample.
+        const bool allZero = (accel_event.acceleration.x == 0.0f &&
+                              accel_event.acceleration.y == 0.0f &&
+                              accel_event.acceleration.z == 0.0f);
+        if (allZero) {
+            if (++consecutiveZeroReads >= SENSOR_FAULT_THRESHOLD) {
+                consecutiveZeroReads = 0;
+                TelemetryRecord fault{};
+                fault.boot_id      = g_bootId;
+                fault.sequence_id  = g_sequenceId.fetch_add(1);
+                fault.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
+                fault.status_flags = STATUS_SENSOR_FAULT;
+                if (!g_buffer.push(fault)) {
+                    Serial.println("[SensorTask] WARN — buffer not initialised, fault record lost.");
+                }
+                Serial.printf("[SensorTask] WARN — sensor fault, seq=%u\n", fault.sequence_id);
+            }
+            vTaskDelayUntil(&lastWake, period);
+            continue;
+        }
+        consecutiveZeroReads = 0;
 
         RawSample sample{};
         sample.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
@@ -434,7 +484,6 @@ static void filterTask(void* pvParams) {
     float filtered_gx = 0.0f, filtered_gy = 0.0f, filtered_gz = 0.0f;
 
     uint8_t  accumulated_flags = STATUS_OK;
-    uint32_t sequence_id       = 0;
 
     RawSample sample;
 
@@ -467,7 +516,7 @@ static void filterTask(void* pvParams) {
 
             TelemetryRecord rec{};
             rec.boot_id      = g_bootId;
-            rec.sequence_id  = sequence_id++;
+            rec.sequence_id  = g_sequenceId.fetch_add(1);
             rec.timestamp_ms = sample.timestamp_ms;
             rec.accel_x      = filtered_ax;
             rec.accel_y      = filtered_ay;
