@@ -1,6 +1,6 @@
 # Project Status — v1
 
-_Last updated: Phase 4 Steps 1–2 complete. Gateway stack deployed on Pi. NTP sync verified — firmware timestamps are real UTC epoch ms landing correctly in InfluxDB._
+_Last updated: Phase 4 Steps 1–4 complete. Grafana dashboard validated against real data. Next: MCP server on Pi (Step 5)._
 
 ---
 
@@ -152,7 +152,30 @@ Hardware arrived. ESP32-S3 DevKitC-1 in hand. Step 5 smoke test underway.
 - `loop()` — prints ax/ay/az every 200ms; prints error line on read failure
 - Gravity test guide printed to serial at boot: lay flat first to confirm which axis reads ~+9.81, then use that to anchor tilt and flip tests
 
-### Phases 4 & 5 — HIL Testing, Pi Deployment, Docs ❌ Not Started
+### Phase 4 — HIL Testing & Pi Deployment ▶ In Progress
+
+| Step | Status | Notes |
+|------|--------|-------|
+| Step 1: Pi deployment | ✅ Done | Gateway stack running on Pi; ESP32 publishing to Pi broker |
+| Step 2: NTP sync | ✅ Done | Firmware timestamps are real UTC epoch ms; bridge falls back to broker-arrival time pre-sync |
+| Step 3: End-to-end integrity check | ✅ Done | `integrity_check.py` — sequence, timestamp monotonicity, data fidelity, sensor fault classification; compensating-pair jitter logic (±110ms tolerance) |
+| Step 4: Grafana dashboard validation | ✅ Done | 5-panel dashboard: vibration_rms, ax/ay/az, gx/gy/gz, status flags, sensor faults |
+| Step 5: MCP server on Pi, Claude Code over network | ❌ Not started | |
+| Step 6: Unplug demo | ❌ Not started | |
+
+### Phase 5 — Docs ❌ Not Started
+
+---
+
+## Sensor Fault Detection ✅ Complete (Phase 4 addition)
+
+I2C dropout guard implemented across all three layers:
+
+| Layer | Change |
+|-------|--------|
+| `firmware/src/main.cpp` | sensorTask counts consecutive all-zero accel reads; after `SENSOR_FAULT_THRESHOLD=5` (50ms at 100Hz), emits `TelemetryRecord` with `STATUS_SENSOR_FAULT=0x10` directly to BufferManager, bypassing filterTask. `g_sequenceId` shared atomically between sensorTask and filterTask so fault records share the same sequence space. |
+| `gateway/bridge/mqtt_to_influx.py` | Routes `STATUS_SENSOR_FAULT` records to `sensor_faults` measurement instead of `vibration`. |
+| `gateway/bridge/integrity_check.py` | Check 4 reports fault records. Checks 1–3 exclude fault records from sequence/timestamp/fidelity validation. |
 
 ---
 
@@ -253,13 +276,12 @@ and serial output goes silent. The device continues running normally — use
 ## Open Issues (Priority Order)
 
 1. **USB CDC silence** — goes silent once WiFi active; `mosquitto_sub` is primary observability; three fix options in Step 6
-3. **MPU-6050 NVS calibration save** — current offsets are hardcoded bench defaults; NVS write path not implemented
-4. **NTP sync** — firmware `ts` is `millis()` since boot, not Unix epoch; bridge uses broker-arrival time as workaround
-5. **Grafana dashboards** — stack is running but dashboards not validated against real data
+2. **MPU-6050 NVS calibration save** — current offsets are hardcoded bench defaults; NVS write path not implemented
+3. **Grafana dashboards** — stack is running but dashboards not validated against real data
 
 ## What's Next
 
-Finish Step 5 (timing/jitter test), then tune the anomaly threshold — it's the most visible active bug, firing on every record at rest. After that: Phase 4 HIL stress testing and Pi deployment.
+Step 5 — MCP server deployed to Pi, Claude Code connected over network.
 
 ---
 
@@ -273,7 +295,7 @@ Finish Step 5 (timing/jitter test), then tune the anomaly threshold — it's the
 | Buffer thread-safety | FreeRTOS mutex; NOT ISR-safe by design | `BufferManager.h` |
 | MCP transport | stdio (laptop); swap to SSE for Pi remote access | `mcp-server-architecture.md` |
 | MQTT callbacks | Set event bits only — no Serial, no setState, no blocking calls. Serial.flush() inside a callback causes a crash on ESP32-S3 (USB CDC + WiFi interrupt contention). State transitions handled in connectionTask. | `main.cpp` |
-| InfluxDB timestamps | Bridge uses broker-arrival time. Firmware `ts` field is `millis()` since boot (not Unix epoch) — not suitable as a DB timestamp until NTP is added. | `mqtt_to_influx.py` |
+| InfluxDB timestamps | Firmware sends real UTC epoch ms (NTP-synced). Bridge uses firmware `ts` when `ts > 1_000_000_000_000`; falls back to broker-arrival time during pre-NTP-sync window. | `mqtt_to_influx.py` |
 | ISR debounce | safetyISR checks `g_interlockActive` at entry and returns immediately if already latched. LDR signal is noisy on transition; without this guard, a single cover event produced 15+ estop publishes. | `main.cpp` |
 
 ---
