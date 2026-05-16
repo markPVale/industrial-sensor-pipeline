@@ -16,3 +16,4 @@ dashboard/.next/
 # Credentials — never commit
 firmware/secrets.ini
 docs/claude-notes/
+firmware/.pio/
