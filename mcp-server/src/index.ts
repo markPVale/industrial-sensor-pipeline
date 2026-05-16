@@ -57,8 +57,6 @@ async function runFlux(query: string): Promise<Record<string, unknown>[]> {
       complete: resolve,
     });
   });
-  console.error(`[runFlux] ${rows.length} rows returned`);
-  if (rows.length > 0) console.error(`[runFlux] first row keys: ${Object.keys(rows[0]).join(", ")}`);
   return rows;
 }
 
