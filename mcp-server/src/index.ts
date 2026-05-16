@@ -319,7 +319,6 @@ async function main() {
   if (transportMode === "sse") {
     const port = parseInt(process.env.MCP_PORT ?? "3002");
     const app  = express();
-    app.use(express.json());
 
     const transports = new Map<string, SSEServerTransport>();
 
