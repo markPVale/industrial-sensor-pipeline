@@ -280,7 +280,7 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PIN_SAFETY_INTERLOCK), safetyISR, FALLING);
     Serial.printf("[Safety] Interlock armed on GPIO %d (pin=%s).\n",
                   PIN_SAFETY_INTERLOCK,
-                  digitalRead(PIN_SAFETY_INTERLOCK) == LOW ? "LOW — interlock open" : "HIGH — OK");
+                  digitalRead(PIN_SAFETY_INTERLOCK) == LOW ? "LOW — interlock open" : "HIGH — OK");©
 
     // -------------------------------------------------------------------------
     // FreeRTOS tasks
@@ -387,7 +387,7 @@ static void connectionTask(void* pvParams) {
 
 //   filterTask (line 422)
 //   - Pops RawSample from queue
-//   - Runs 6 Kalman filters (one per axis) — has NaN/Inf guard internallyYea 
+//   - Runs 6 Kalman filters (one per axis) — has NaN/Inf guard internallyYea
 //   - Accumulates rolling RMS over 50 samples
 //   - Every 50 samples emits one TelemetryRecord to g_buffer
 //   - Sets STATUS_ANOMALY if RMS > threshold, STATUS_INTERLOCK_OPEN if latch is active

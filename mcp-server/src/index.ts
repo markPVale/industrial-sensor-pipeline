@@ -2,19 +2,22 @@
  * sensor-mcp-server
  *
  * Exposes physical sensor telemetry from InfluxDB to LLM clients (Claude Code,
- * etc.) via the Model Context Protocol. Runs on the Raspberry Pi alongside the
- * gateway stack, or locally pointing at a remote InfluxDB instance.
+ * etc.) via the Model Context Protocol.
  *
- * Transport: stdio (Claude Code spawns this process directly, or use SSH)
- * To run on the Pi and expose over the network, swap StdioServerTransport for
- * SSEServerTransport — see docs/claude-notes/mcp-server-architecture.md.
+ * Transport:
+ *   stdio (default) — Claude Code spawns this process directly, local dev
+ *   sse             — HTTP SSE server for network access from Pi
+ *                     Set TRANSPORT=sse and optionally MCP_PORT=3002
  *
  * Usage:
- *   INFLUX_URL=http://raspberrypi.local:8086 npm run dev
+ *   npm run dev                                      # local stdio
+ *   TRANSPORT=sse MCP_PORT=3002 node dist/index.js   # Pi network mode
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -57,6 +60,16 @@ async function runFlux(query: string): Promise<Record<string, unknown>[]> {
   return rows;
 }
 
+/**
+ * Convert long-format Flux rows (one row per field) into wide-format records
+ * (one record per timestamp) by grouping on _time.
+ * Avoids the pivot operator which returns 0 rows with some influxdb-client versions.
+ */
+function toISOString(t: unknown): string {
+  if (t instanceof Date) return t.toISOString();
+  return String(t);
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -71,6 +84,12 @@ async function getLatestTelemetry(nodeId: string) {
       |> range(start: -1h)
       |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> filter(fn: (r) =>
+        exists r.ax and exists r.ay and exists r.az and
+        exists r.gx and exists r.gy and exists r.gz and
+        exists r.boot_id and exists r.sequence_id and
+        exists r.flags and exists r.vibration_rms
+      )
       |> sort(columns: ["_time"], desc: true)
       |> limit(n: 1)
   `;
@@ -84,7 +103,7 @@ async function getLatestTelemetry(nodeId: string) {
   const flags = r["flags"] as number;
   return {
     node_id:              nodeId,
-    timestamp:            r["_time"],
+    timestamp:            toISOString(r["_time"]),
     vibration_rms_mps2:   r["vibration_rms"],
     ax: r["ax"], ay: r["ay"], az: r["az"],
     gx: r["gx"], gy: r["gy"], gz: r["gz"],
@@ -108,6 +127,7 @@ async function getSensorHealth(nodeId: string) {
       |> range(start: -5m)
       |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> filter(fn: (r) => exists r.flags and exists r.vibration_rms)
       |> sort(columns: ["_time"], desc: true)
       |> limit(n: 1)
   `;
@@ -125,7 +145,7 @@ async function getSensorHealth(nodeId: string) {
   const r     = rows[0];
   const flags = r["flags"] as number;
   const rms   = r["vibration_rms"] as number;
-  const age   = Math.round((Date.now() - new Date(r["_time"] as string).getTime()) / 1000);
+  const age   = Math.round((Date.now() - new Date(toISOString(r["_time"])).getTime()) / 1000);
 
   return {
     node_id:              nodeId,
@@ -155,6 +175,10 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
       |> range(start: -${windowMinutes}m)
       |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> filter(fn: (r) =>
+        exists r.flags and exists r.vibration_rms and
+        exists r.ax and exists r.ay and exists r.az
+      )
       |> filter(fn: (r) => r.flags > 0)
       |> sort(columns: ["_time"], desc: true)
   `;
@@ -174,7 +198,7 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
   const events = rows.map((r) => {
     const flags = r["flags"] as number;
     return {
-      timestamp:           r["_time"],
+      timestamp:           toISOString(r["_time"]),
       vibration_rms_mps2:  r["vibration_rms"],
       ax: r["ax"], ay: r["ay"], az: r["az"],
       flags,
@@ -288,9 +312,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Entry point
 // ---------------------------------------------------------------------------
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  // MCP servers communicate over stdio — do not write to stdout after this point.
+  const transportMode = process.env.TRANSPORT ?? "stdio";
+
+  if (transportMode === "sse") {
+    const port = parseInt(process.env.MCP_PORT ?? "3002");
+    const app  = express();
+    app.use(express.json());
+
+    const transports = new Map<string, SSEServerTransport>();
+
+    app.get("/sse", async (_req, res) => {
+      const transport = new SSEServerTransport("/messages", res);
+      transports.set(transport.sessionId, transport);
+      res.on("close", () => transports.delete(transport.sessionId));
+      await server.connect(transport);
+    });
+
+    app.post("/messages", async (req, res) => {
+      const sessionId = req.query.sessionId as string;
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        res.status(400).json({ error: "Unknown sessionId" });
+        return;
+      }
+      await transport.handlePostMessage(req, res);
+    });
+
+    app.listen(port, () => {
+      console.error(`MCP SSE server listening on http://0.0.0.0:${port}`);
+    });
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    // stdio mode — do not write to stdout after this point.
+  }
 }
 
 main().catch((err) => {
