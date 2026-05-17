@@ -15,6 +15,7 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/event_groups.h>
+#include <driver/gpio.h>
 
 #include "config.h"
 #include "types.h"
@@ -68,6 +69,11 @@ static constexpr float kAccelSpikeThreshold = 4.905f;
 // Boot ID — loaded from NVS in initBootId(), incremented each boot.
 // Initialised to 0; set before any task uses it.
 static uint32_t g_bootId = 0;
+
+// Fault-reboot counter stored in RTC memory — survives esp_restart() but
+// resets to 0 on power cycle. Prevents infinite reboot loops when the sensor
+// is unrecoverably damaged. Reset to 0 on successful fault recovery.
+RTC_DATA_ATTR static uint8_t g_faultRebootCount = 0;
 
 // Sequence ID — monotonic counter shared by filterTask (normal records) and
 // sensorTask (fault records). Global so fault records stay in sequence with
@@ -209,6 +215,7 @@ void setup() {
     initPSRAM();
 
     Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setTimeOut(10);  // I2C read timeout: 10ms — fail fast on dropout, return zeros
     initMPU6050();
 
     // -------------------------------------------------------------------------
@@ -280,7 +287,7 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PIN_SAFETY_INTERLOCK), safetyISR, FALLING);
     Serial.printf("[Safety] Interlock armed on GPIO %d (pin=%s).\n",
                   PIN_SAFETY_INTERLOCK,
-                  digitalRead(PIN_SAFETY_INTERLOCK) == LOW ? "LOW — interlock open" : "HIGH — OK");©
+                  digitalRead(PIN_SAFETY_INTERLOCK) == LOW ? "LOW — interlock open" : "HIGH — OK");
 
     // -------------------------------------------------------------------------
     // FreeRTOS tasks
@@ -379,58 +386,170 @@ static void connectionTask(void* pvParams) {
 // Posts RawSamples to g_sensorQueue for filterTask to consume.
 // Drops samples (not blocks) if the queue is full to preserve timing.
 
-// sensorTask (line 377)
-//   - Calls g_mpu.getEvent() — no return value checked, no guard against failure
-//   - Applies calibration offsets/scale to raw accel values
-//   - Detects clipping (flags STATUS_ACCEL_CLIPPED / STATUS_GYRO_CLIPPED)
-//   - Pushes RawSample onto g_sensorQueue — drops if queue full, but no validation of the values themselves
-
-//   filterTask (line 422)
-//   - Pops RawSample from queue
-//   - Runs 6 Kalman filters (one per axis) — has NaN/Inf guard internallyYea
-//   - Accumulates rolling RMS over 50 samples
-//   - Every 50 samples emits one TelemetryRecord to g_buffer
-//   - Sets STATUS_ANOMALY if RMS > threshold, STATUS_INTERLOCK_OPEN if latch is active
-//   - No check for whether the 50 raw samples feeding the window were valid
-
-//   The gap: getEvent() can silently return zeros on I2C dropout. Those zeros flow through calibration, through Kalman, into the RMS window, and ultimately into a TelemetryRecord — flagged only as STATUS_OK with near-zero RMS
-//    values. Nothing in the current pipeline detects or flags this.
-
-//   The natural insertion point for the guard is in sensorTask right after getEvent() (line 383), before the sample enters the queue.
 // =============================================================================
+// Read the WHO_AM_I register (0x75) — expected response is 0x68.
+// Proves actual I2C data transfer, unlike an address-only ACK probe.
+// Wire.setTimeOut(10) bounds this to 10ms on failure.
+// Last WHO_AM_I value read from the MPU. Set by isMpuHealthy().
+// 0xFF = endTransmission failed; 0xFE = requestFrom failed; otherwise actual chip ID.
+static uint8_t g_lastWhoAmI = 0xFF;
+
+static bool isMpuHealthy(bool logResult = false) {
+    Wire.beginTransmission(0x68);
+    Wire.write(0x75);  // WHO_AM_I register
+    if (Wire.endTransmission() != 0) {
+        g_lastWhoAmI = 0xFF;
+        return false;
+    }
+    if (Wire.requestFrom(static_cast<uint8_t>(0x68), static_cast<uint8_t>(1)) != 1) {
+        g_lastWhoAmI = 0xFE;
+        return false;
+    }
+    g_lastWhoAmI = Wire.read();
+    if (logResult) {
+        Serial.printf("[MPU] WHO_AM_I=0x%02X\n", g_lastWhoAmI);
+    }
+    // Accept genuine MPU-6050 (0x68) and common pin-compatible clones.
+    return g_lastWhoAmI == 0x68 || g_lastWhoAmI == 0x70 || g_lastWhoAmI == 0x71;
+}
+
+// Attempt to unstick a frozen I2C bus after an SDA disconnect mid-transaction.
+//
+// Wire.end() releases the I2C peripheral's GPIO mux hold so gpio_set_level()
+// can actually drive SCL. 9 clock pulses clock out whatever byte the MPU was
+// stuck on; the STOP condition returns the bus to idle. Wire.begin() reclaims
+// the pins. Called periodically while faulted (SENSOR_FAULT_RECOVERY_INTERVAL_MS)
+// to retry after SDA reconnects.
+static void recoverI2cBus() {
+    Serial.println("[I2C] Bus recovery — clocking 9 SCL pulses.");
+
+    // Wire.end() first so the I2C peripheral releases its signal-mux hold on the
+    // pins. Without this, gpio_set_level() writes to the GPIO output register but
+    // the peripheral's mux output takes precedence and SCL doesn't move.
+    Wire.end();
+
+    gpio_set_direction((gpio_num_t)PIN_SCL, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)PIN_SDA, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_level((gpio_num_t)PIN_SDA, 1);
+
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level((gpio_num_t)PIN_SCL, 0);
+        delayMicroseconds(5);   // ~100 kHz
+        gpio_set_level((gpio_num_t)PIN_SCL, 1);
+        delayMicroseconds(5);
+    }
+
+    // STOP condition: SDA rises while SCL is high
+    gpio_set_level((gpio_num_t)PIN_SDA, 0);
+    delayMicroseconds(5);
+    gpio_set_level((gpio_num_t)PIN_SCL, 1);
+    delayMicroseconds(5);
+    gpio_set_level((gpio_num_t)PIN_SDA, 1);
+    delayMicroseconds(5);
+
+    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setTimeOut(10);
+}
+
+// Re-initialise MPU-6050 to a known configuration after a fault clears.
+// Handles edge cases where the sensor internally reset, its state machine
+// got confused, or noise during reconnect corrupted its config registers.
+// Returns true if the sensor responds and accepts configuration.
+static bool reinitMpu() {
+    if (!g_mpu.begin()) return false;
+    g_mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    g_mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    g_mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    return true;
+}
+
 static void sensorTask(void* pvParams) {
     const TickType_t period   = pdMS_TO_TICKS(1000 / SAMPLE_RATE_HZ);
     TickType_t       lastWake = xTaskGetTickCount();
-    uint8_t          consecutiveZeroReads = 0;
+    uint8_t          consecutiveFailures = 0;
+    bool             inFaultState        = false;
+    uint32_t         faultEnteredMs      = 0;  // millis() when fault state was entered
+    uint32_t         lastRecoveryMs      = 0;  // millis() of last recoverI2cBus() call
 
     for (;;) {
-        sensors_event_t accel_event, gyro_event, temp_event;
-        g_mpu.getEvent(&accel_event, &gyro_event, &temp_event);
+        if (!isMpuHealthy()) {
+            if (++consecutiveFailures >= SENSOR_FAULT_THRESHOLD) {
+                consecutiveFailures = 0;
 
-        // I2C dropout detection: all raw accel axes exactly zero indicates the
-        // MPU-6050 returned no data. After SENSOR_FAULT_THRESHOLD consecutive
-        // zero reads, emit a fault record directly to g_buffer (bypassing the
-        // filter window) and skip the sample.
-        const bool allZero = (accel_event.acceleration.x == 0.0f &&
-                              accel_event.acceleration.y == 0.0f &&
-                              accel_event.acceleration.z == 0.0f);
-        if (allZero) {
-            if (++consecutiveZeroReads >= SENSOR_FAULT_THRESHOLD) {
-                consecutiveZeroReads = 0;
+                const uint32_t now = millis();
+
+                if (!inFaultState) {
+                    // Fault state entry. First recoverI2cBus() is deferred to
+                    // SENSOR_FAULT_RECOVERY_INTERVAL_MS — calling Wire.begin()
+                    // immediately while SDA is absent degrades the Wire peripheral
+                    // and blocks all subsequent recovery in the same session.
+                    inFaultState   = true;
+                    faultEnteredMs = now;
+                    lastRecoveryMs = now;
+                    Serial.printf("[SensorTask] FAULT — entering fault state at t=%u "
+                                  "(fault reboots this session: %u/%u)\n",
+                                  now, g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
+                } else {
+                    // Periodic bus recovery attempt while faulted.
+                    if (now - lastRecoveryMs >= SENSOR_FAULT_RECOVERY_INTERVAL_MS) {
+                        lastRecoveryMs = now;
+                        Serial.printf("[SensorTask] FAULT — retry recovery at t=%u\n", now);
+                        recoverI2cBus();
+                    }
+                    // Hard reboot as last resort — Wire.begin() on a broken bus
+                    // degrades the peripheral; a soft reset gives a clean Wire state.
+                    // Guarded by g_faultRebootCount to prevent infinite reboot loops.
+                    if (now - faultEnteredMs >= SENSOR_FAULT_REBOOT_MS) {
+                        if (g_faultRebootCount < SENSOR_FAULT_MAX_REBOOTS) {
+                            g_faultRebootCount++;
+                            Serial.printf("[SensorTask] FAULT — rebooting (attempt %u/%u)\n",
+                                          g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
+                            vTaskDelay(pdMS_TO_TICKS(200));  // allow log to flush
+                            esp_restart();
+                        } else {
+                            Serial.printf("[SensorTask] FAULT — max reboots (%u) reached; "
+                                          "staying in fault state until power-cycled.\n",
+                                          SENSOR_FAULT_MAX_REBOOTS);
+                            // Reset timer so this message prints once per 30s, not every 50ms.
+                            faultEnteredMs = now;
+                        }
+                    }
+                }
+
                 TelemetryRecord fault{};
                 fault.boot_id      = g_bootId;
                 fault.sequence_id  = g_sequenceId.fetch_add(1);
                 fault.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
                 fault.status_flags = STATUS_SENSOR_FAULT;
+                fault.accel_x      = (float)g_lastWhoAmI;  // 0xFF=no ACK, 0xFE=no byte, else chip ID
                 if (!g_buffer.push(fault)) {
-                    Serial.println("[SensorTask] WARN — buffer not initialised, fault record lost.");
+                    Serial.println("[SensorTask] WARN — buffer full, fault record lost.");
                 }
-                Serial.printf("[SensorTask] WARN — sensor fault, seq=%u\n", fault.sequence_id);
+                Serial.printf("[SensorTask] WARN — sensor fault seq=%u\n", fault.sequence_id);
             }
             vTaskDelayUntil(&lastWake, period);
             continue;
         }
-        consecutiveZeroReads = 0;
+
+        // WHO_AM_I passed — if recovering from a fault, reinitialise the MPU
+        // to a known config before resuming sampling.
+        if (inFaultState) {
+            isMpuHealthy(true);  // log WHO_AM_I value on recovery
+            if (!reinitMpu()) {
+                // WHO_AM_I passed but full init failed — treat as still faulted
+                vTaskDelayUntil(&lastWake, period);
+                continue;
+            }
+            Serial.printf("[SensorTask] INFO — MPU-6050 recovered after %u ms. "
+                          "Resetting fault reboot counter.\n",
+                          millis() - faultEnteredMs);
+            g_faultRebootCount = 0;
+            inFaultState = false;
+        }
+        consecutiveFailures = 0;
+
+        sensors_event_t accel_event, gyro_event, temp_event;
+        g_mpu.getEvent(&accel_event, &gyro_event, &temp_event);
 
         RawSample sample{};
         sample.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
@@ -730,6 +849,7 @@ static void initPSRAM() {
 // initMPU6050()
 // =============================================================================
 static void initMPU6050() {
+    isMpuHealthy(true);  // log WHO_AM_I value before full init
     if (!g_mpu.begin()) {
         Serial.println("[MPU6050] ERROR — sensor not found on I2C bus.");
         Serial.printf("          SDA=%d  SCL=%d — verify wiring.\n",

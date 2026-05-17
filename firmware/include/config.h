@@ -44,6 +44,23 @@
 // I2C dropout, short enough to catch it quickly.
 #define SENSOR_FAULT_THRESHOLD  5
 
+// I2C fault recovery interval (milliseconds).
+// recoverI2cBus() is first called 3s after fault entry, then every 3s.
+// The 3s deferral avoids calling Wire.begin() while SDA is still absent,
+// which corrupts the Wire peripheral and blocks all subsequent recovery.
+#define SENSOR_FAULT_RECOVERY_INTERVAL_MS   3000
+
+// Hard reboot after this many ms of continuous sensor fault.
+// Wire.begin() on a broken bus corrupts the Wire peripheral; a soft reset
+// reinitialises it from a clean hardware state. 30s allows multiple recovery
+// attempts before giving up. boot_id increments on restart — visible in telemetry.
+#define SENSOR_FAULT_REBOOT_MS             30000
+
+// Maximum fault-triggered reboots per power-on session (tracked in RTC memory).
+// After this many resets the node stays in fault state permanently until power-cycled.
+// Prevents infinite reboot loops when the MPU is unrecoverably damaged.
+#define SENSOR_FAULT_MAX_REBOOTS           3
+
 // Depth of the RawSample queue between sensorTask and filterTask.
 // At 100 Hz and a 10 ms filter budget, 20 slots gives 200 ms of slack.
 #define SENSOR_QUEUE_DEPTH    20
