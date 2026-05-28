@@ -134,17 +134,21 @@ static std::atomic<bool>     g_interlockActive{false};
 // -----------------------------------------------------------------------------
 // NTP time sync
 //
-// After WiFi connects, connectionTask polls until the system clock is set by
-// NTP. Once synced, g_ntpEpochMs + (millis() - g_millisAtSync) gives UTC ms.
-// sensorTask uses this for record timestamps; falls back to millis() until
-// synced so the pipeline keeps running during the brief pre-sync window.
+// configTime() in setup() starts the ESP-IDF SNTP client, which syncs
+// automatically and re-syncs periodically in the background. We read the
+// system clock directly via gettimeofday() — no manual state needed.
+//
+// Pre-sync fallback: tv_sec is near 0 until SNTP sets the clock. The guard
+// tv_sec > 1700000000 (~Nov 2023) distinguishes a real UTC time from the
+// default post-boot value, and falls back to millis() in that window.
 // -----------------------------------------------------------------------------
-static std::atomic<bool>     g_ntpSynced{false};
-static std::atomic<uint64_t> g_ntpEpochMs{0};
-static std::atomic<uint32_t> g_millisAtSync{0};
-
 static uint64_t getEpochMs() {
-    return g_ntpEpochMs.load() + ((uint64_t)millis() - g_millisAtSync.load());
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    if (tv.tv_sec > 1700000000L) {
+        return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000);
+    }
+    return (uint64_t)millis();
 }
 
 // -----------------------------------------------------------------------------
@@ -353,20 +357,6 @@ static void connectionTask(void* pvParams) {
             }
         }
 
-        // NTP sync poll — runs until synced, then becomes a no-op
-        if (!g_ntpSynced.load()) {
-            struct timeval tv;
-            gettimeofday(&tv, nullptr);
-            if (tv.tv_sec > 1700000000L) {  // sanity: must be post-2023
-                g_ntpEpochMs.store((uint64_t)tv.tv_sec * 1000ULL
-                                   + (uint64_t)(tv.tv_usec / 1000));
-                g_millisAtSync.store((uint32_t)millis());
-                g_ntpSynced.store(true);
-                Serial.printf("[NTP] Synced — epoch %llu ms\n",
-                              (unsigned long long)g_ntpEpochMs.load());
-            }
-        }
-
         // Drain the publish queue — only while connected
         while (g_mqttManager.isConnected() &&
                xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE) {
@@ -468,91 +458,126 @@ static void sensorTask(void* pvParams) {
     TickType_t       lastWake = xTaskGetTickCount();
     uint8_t          consecutiveFailures = 0;
     bool             inFaultState        = false;
-    uint32_t         faultEnteredMs      = 0;  // millis() when fault state was entered
-    uint32_t         lastRecoveryMs      = 0;  // millis() of last recoverI2cBus() call
+    uint32_t         faultEnteredMs      = 0;
+    uint32_t         lastRecoveryMs      = 0;
+    uint32_t         lastFaultEmitMs     = 0;
+    uint32_t         recoveredAtMs       = 0;  // millis() when fault last cleared
 
     for (;;) {
-        if (!isMpuHealthy()) {
-            if (++consecutiveFailures >= SENSOR_FAULT_THRESHOLD) {
-                consecutiveFailures = 0;
+        // ---- FAULT STATE: slow poll, rate-limited emission ----
+        if (inFaultState) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            const uint32_t now = millis();
 
-                const uint32_t now = millis();
-
-                if (!inFaultState) {
-                    // Fault state entry. First recoverI2cBus() is deferred to
-                    // SENSOR_FAULT_RECOVERY_INTERVAL_MS — calling Wire.begin()
-                    // immediately while SDA is absent degrades the Wire peripheral
-                    // and blocks all subsequent recovery in the same session.
-                    inFaultState   = true;
-                    faultEnteredMs = now;
+            if (isMpuHealthy()) {
+                Serial.printf("[MPU] WHO_AM_I=0x%02X — bus recovered, reinitialising.\n",
+                              g_lastWhoAmI);
+                if (reinitMpu()) {
+                    Serial.printf("[SensorTask] INFO — fault cleared after %u ms. "
+                                  "Reboot counter held until 10s sustained operation.\n",
+                                  now - faultEnteredMs);
+                    inFaultState  = false;
+                    recoveredAtMs = now;
+                    lastWake      = xTaskGetTickCount();  // resync vTaskDelayUntil
+                    continue;
+                }
+                // WHO_AM_I passed but reinit failed — stay faulted, retry next cycle
+            } else {
+                // Bus still unhealthy: periodic recovery attempt
+                if (now - lastRecoveryMs >= SENSOR_FAULT_RECOVERY_INTERVAL_MS) {
                     lastRecoveryMs = now;
-                    Serial.printf("[SensorTask] FAULT — entering fault state at t=%u "
-                                  "(fault reboots this session: %u/%u)\n",
-                                  now, g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
-                } else {
-                    // Periodic bus recovery attempt while faulted.
-                    if (now - lastRecoveryMs >= SENSOR_FAULT_RECOVERY_INTERVAL_MS) {
-                        lastRecoveryMs = now;
-                        Serial.printf("[SensorTask] FAULT — retry recovery at t=%u\n", now);
-                        recoverI2cBus();
-                    }
-                    // Hard reboot as last resort — Wire.begin() on a broken bus
-                    // degrades the peripheral; a soft reset gives a clean Wire state.
-                    // Guarded by g_faultRebootCount to prevent infinite reboot loops.
-                    if (now - faultEnteredMs >= SENSOR_FAULT_REBOOT_MS) {
-                        if (g_faultRebootCount < SENSOR_FAULT_MAX_REBOOTS) {
-                            g_faultRebootCount++;
-                            Serial.printf("[SensorTask] FAULT — rebooting (attempt %u/%u)\n",
-                                          g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
-                            vTaskDelay(pdMS_TO_TICKS(200));  // allow log to flush
-                            esp_restart();
-                        } else {
-                            Serial.printf("[SensorTask] FAULT — max reboots (%u) reached; "
-                                          "staying in fault state until power-cycled.\n",
-                                          SENSOR_FAULT_MAX_REBOOTS);
-                            // Reset timer so this message prints once per 30s, not every 50ms.
-                            faultEnteredMs = now;
-                        }
-                    }
+                    Serial.printf("[SensorTask] FAULT — bus recovery attempt at t=%u\n", now);
+                    recoverI2cBus();
                 }
 
+                // Last-resort reboot — gives a clean Wire + MPU reset via initMPU6050().
+                // Counter is NOT reset until 10s of sustained healthy operation so a
+                // brief recovery that immediately re-faults doesn't burn a reboot slot.
+                if (now - faultEnteredMs >= SENSOR_FAULT_REBOOT_MS) {
+                    if (g_faultRebootCount < SENSOR_FAULT_MAX_REBOOTS) {
+                        g_faultRebootCount++;
+                        Serial.printf("[SensorTask] FAULT — rebooting (attempt %u/%u)\n",
+                                      g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        esp_restart();
+                    } else {
+                        // Max reboots exhausted — emit once per 30s, wait for power-cycle.
+                        Serial.println("[SensorTask] FAULT — sensor unavailable, "
+                                       "power-cycle required.");
+                        faultEnteredMs = now;
+                    }
+                }
+            }
+
+            // Rate-limited fault record — one per SENSOR_FAULT_EMIT_INTERVAL_MS.
+            if (now - lastFaultEmitMs >= SENSOR_FAULT_EMIT_INTERVAL_MS) {
+                lastFaultEmitMs = now;
+                const uint8_t faultFlag =
+                    (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
+                        ? STATUS_SENSOR_UNAVAILABLE
+                        : STATUS_DEGRADED_REBOOT_REQUIRED;
                 TelemetryRecord fault{};
                 fault.boot_id      = g_bootId;
                 fault.sequence_id  = g_sequenceId.fetch_add(1);
-                fault.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
-                fault.status_flags = STATUS_SENSOR_FAULT;
-                fault.accel_x      = (float)g_lastWhoAmI;  // 0xFF=no ACK, 0xFE=no byte, else chip ID
+                fault.timestamp_ms = getEpochMs();
+                fault.status_flags = faultFlag;
+                fault.accel_x      = (float)g_lastWhoAmI;
                 if (!g_buffer.push(fault)) {
                     Serial.println("[SensorTask] WARN — buffer full, fault record lost.");
                 }
-                Serial.printf("[SensorTask] WARN — sensor fault seq=%u\n", fault.sequence_id);
+                Serial.printf("[SensorTask] WARN — sensor fault seq=%u flags=0x%02X\n",
+                              fault.sequence_id, faultFlag);
+            }
+            continue;
+        }
+
+        // ---- NORMAL OPERATION: 100 Hz ----
+
+        if (!isMpuHealthy()) {
+            if (++consecutiveFailures >= SENSOR_FAULT_THRESHOLD) {
+                consecutiveFailures = 0;
+                const uint32_t now = millis();
+                inFaultState    = true;
+                faultEnteredMs  = now;
+                lastRecoveryMs  = now;   // first recovery deferred to RECOVERY_INTERVAL_MS
+                lastFaultEmitMs = now;   // emit first fault record immediately
+                recoveredAtMs   = 0;
+                Serial.printf("[SensorTask] FAULT — entering fault state at t=%u "
+                              "(reboots this session: %u/%u)\n",
+                              now, g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
+                // Emit one record immediately rather than waiting for the 500ms slow-poll.
+                const uint8_t faultFlag = (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
+                    ? STATUS_SENSOR_UNAVAILABLE : STATUS_DEGRADED_REBOOT_REQUIRED;
+                TelemetryRecord fault{};
+                fault.boot_id      = g_bootId;
+                fault.sequence_id  = g_sequenceId.fetch_add(1);
+                fault.timestamp_ms = getEpochMs();
+                fault.status_flags = faultFlag;
+                fault.accel_x      = (float)g_lastWhoAmI;
+                g_buffer.push(fault);
             }
             vTaskDelayUntil(&lastWake, period);
             continue;
         }
 
-        // WHO_AM_I passed — if recovering from a fault, reinitialise the MPU
-        // to a known config before resuming sampling.
-        if (inFaultState) {
-            isMpuHealthy(true);  // log WHO_AM_I value on recovery
-            if (!reinitMpu()) {
-                // WHO_AM_I passed but full init failed — treat as still faulted
-                vTaskDelayUntil(&lastWake, period);
-                continue;
-            }
-            Serial.printf("[SensorTask] INFO — MPU-6050 recovered after %u ms. "
-                          "Resetting fault reboot counter.\n",
-                          millis() - faultEnteredMs);
-            g_faultRebootCount = 0;
-            inFaultState = false;
-        }
+        // Healthy sample received. Reset failure counter.
         consecutiveFailures = 0;
+
+        // After fault recovery, wait for 10s of sustained healthy operation before
+        // clearing the reboot counter. This prevents a brief WHO_AM_I pass followed
+        // by an immediate re-fault from resetting the counter and restarting the loop.
+        if (recoveredAtMs != 0 && (millis() - recoveredAtMs) >= 10000) {
+            Serial.printf("[SensorTask] INFO — 10s sustained recovery; "
+                          "reboot counter cleared (was %u).\n", g_faultRebootCount);
+            g_faultRebootCount = 0;
+            recoveredAtMs = 0;
+        }
 
         sensors_event_t accel_event, gyro_event, temp_event;
         g_mpu.getEvent(&accel_event, &gyro_event, &temp_event);
 
         RawSample sample{};
-        sample.timestamp_ms = g_ntpSynced.load() ? getEpochMs() : (uint64_t)millis();
+        sample.timestamp_ms = getEpochMs();
         sample.accel_x = (accel_event.acceleration.x - g_cal.ax_offset) * g_cal.ax_scale;
         sample.accel_y = (accel_event.acceleration.y - g_cal.ay_offset) * g_cal.ay_scale;
         sample.accel_z = (accel_event.acceleration.z - g_cal.az_offset) * g_cal.az_scale;
@@ -849,6 +874,18 @@ static void initPSRAM() {
 // initMPU6050()
 // =============================================================================
 static void initMPU6050() {
+    // Unconditional hardware reset before g_mpu.begin().
+    // If SDA was disconnected mid-transaction and recoverI2cBus() clocked SCL
+    // pulses without a visible STOP, the MPU's I2C state machine can be left in
+    // limbo. It survives esp_restart() (still powered). A write to PWR_MGMT_1
+    // DEVICE_RESET bit clears all internal registers and returns the slave to
+    // idle, letting the subsequent g_mpu.begin() start from a known state.
+    Wire.beginTransmission(0x68);
+    Wire.write(0x6B);   // PWR_MGMT_1
+    Wire.write(0x80);   // DEVICE_RESET
+    Wire.endTransmission();
+    delay(100);         // datasheet: 100ms for reset to complete
+
     isMpuHealthy(true);  // log WHO_AM_I value before full init
     if (!g_mpu.begin()) {
         Serial.println("[MPU6050] ERROR — sensor not found on I2C bus.");
