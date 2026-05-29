@@ -28,10 +28,13 @@ import { InfluxDB } from "@influxdata/influxdb-client";
 // Status flag bit masks — must match firmware/include/types.h and
 // docs/telemetry-schema.md exactly.
 // ---------------------------------------------------------------------------
-const FLAG_ACCEL_CLIPPED  = 0x01;
-const FLAG_GYRO_CLIPPED   = 0x02;
-const FLAG_INTERLOCK_OPEN = 0x04;  // E-Stop / safety interlock
-const FLAG_ANOMALY        = 0x08;
+const FLAG_ACCEL_CLIPPED             = 0x01;
+const FLAG_GYRO_CLIPPED              = 0x02;
+const FLAG_INTERLOCK_OPEN            = 0x04;  // E-Stop / safety interlock
+const FLAG_ANOMALY                   = 0x08;
+const FLAG_SENSOR_FAULT              = 0x10;  // I2C dropout (legacy — use degraded/unavailable)
+const FLAG_DEGRADED_REBOOT_REQUIRED  = 0x20;  // I2C fault; auto-reboot pending
+const FLAG_SENSOR_UNAVAILABLE        = 0x40;  // I2C fault; max reboots exhausted
 
 // ---------------------------------------------------------------------------
 // Configuration — override via environment variables
@@ -102,18 +105,21 @@ async function getLatestTelemetry(nodeId: string) {
   const r     = rows[0];
   const flags = r["flags"] as number;
   return {
-    node_id:              nodeId,
-    timestamp:            toISOString(r["_time"]),
-    vibration_rms_mps2:   r["vibration_rms"],
+    node_id:                        nodeId,
+    timestamp:                      toISOString(r["_time"]),
+    vibration_rms_mps2:             r["vibration_rms"],
     ax: r["ax"], ay: r["ay"], az: r["az"],
     gx: r["gx"], gy: r["gy"], gz: r["gz"],
-    boot_id:              r["boot_id"],
-    sequence_id:          r["sequence_id"],
+    boot_id:                        r["boot_id"],
+    sequence_id:                    r["sequence_id"],
     flags,
-    flag_accel_clipped:   (flags & FLAG_ACCEL_CLIPPED)  !== 0,
-    flag_gyro_clipped:    (flags & FLAG_GYRO_CLIPPED)   !== 0,
-    flag_interlock_open:  (flags & FLAG_INTERLOCK_OPEN) !== 0,
-    flag_anomaly:         (flags & FLAG_ANOMALY)        !== 0,
+    flag_accel_clipped:             (flags & FLAG_ACCEL_CLIPPED)            !== 0,
+    flag_gyro_clipped:              (flags & FLAG_GYRO_CLIPPED)             !== 0,
+    flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
+    flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
+    flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
+    flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
+    flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
   };
 }
 
@@ -148,20 +154,26 @@ async function getSensorHealth(nodeId: string) {
   const age   = Math.round((Date.now() - new Date(toISOString(r["_time"])).getTime()) / 1000);
 
   return {
-    node_id:              nodeId,
-    is_online:            age < 30,
-    last_seen_seconds_ago: age,
-    vibration_rms_mps2:   rms,
-    flag_interlock_open:  (flags & FLAG_INTERLOCK_OPEN) !== 0,
-    flag_anomaly:         (flags & FLAG_ANOMALY)        !== 0,
-    health_summary:       buildHealthSummary(age, flags, rms),
+    node_id:                        nodeId,
+    is_online:                      age < 30,
+    last_seen_seconds_ago:          age,
+    vibration_rms_mps2:             rms,
+    flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
+    flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
+    flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
+    flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
+    flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+    health_summary:                 buildHealthSummary(age, flags, rms),
   };
 }
 
 function buildHealthSummary(ageSeconds: number, flags: number, rms: number): string {
-  if (ageSeconds >= 30)              return "OFFLINE — no recent telemetry.";
-  if (flags & FLAG_INTERLOCK_OPEN)   return "CRITICAL — E-Stop / safety interlock is active.";
-  if (flags & FLAG_ANOMALY)          return `WARNING — Anomaly detected. Vibration RMS: ${rms.toFixed(4)} m/s²`;
+  if (ageSeconds >= 30)                      return "OFFLINE — no recent telemetry.";
+  if (flags & FLAG_INTERLOCK_OPEN)           return "CRITICAL — E-Stop / safety interlock is active.";
+  if (flags & FLAG_SENSOR_UNAVAILABLE)       return "CRITICAL — Sensor unavailable. Max auto-reboots exhausted. Power-cycle required.";
+  if (flags & FLAG_DEGRADED_REBOOT_REQUIRED) return "DEGRADED — I2C fault detected. Auto-reboot pending.";
+  if (flags & FLAG_SENSOR_FAULT)             return "DEGRADED — I2C sensor fault (legacy flag).";
+  if (flags & FLAG_ANOMALY)                  return `WARNING — Anomaly detected. Vibration RMS: ${rms.toFixed(4)} m/s²`;
   return `OK — Normal operation. Vibration RMS: ${rms.toFixed(4)} m/s²`;
 }
 
@@ -198,12 +210,15 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
   const events = rows.map((r) => {
     const flags = r["flags"] as number;
     return {
-      timestamp:           toISOString(r["_time"]),
-      vibration_rms_mps2:  r["vibration_rms"],
+      timestamp:                      toISOString(r["_time"]),
+      vibration_rms_mps2:             r["vibration_rms"],
       ax: r["ax"], ay: r["ay"], az: r["az"],
       flags,
-      flag_interlock_open: (flags & FLAG_INTERLOCK_OPEN) !== 0,
-      flag_anomaly:        (flags & FLAG_ANOMALY)        !== 0,
+      flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
+      flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
+      flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
+      flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
+      flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
     };
   });
 

@@ -19,7 +19,9 @@
 #define STATUS_GYRO_CLIPPED   0x02  // gyro hit range limit
 #define STATUS_INTERLOCK_OPEN 0x04  // safety interlock was open at sample time
 #define STATUS_ANOMALY        0x08  // anomaly detection flagged this record
-#define STATUS_SENSOR_FAULT   0x10  // I2C dropout — consecutive zero reads from MPU-6050
+#define STATUS_SENSOR_FAULT              0x10  // I2C dropout — WHO_AM_I probe failed
+#define STATUS_DEGRADED_REBOOT_REQUIRED  0x20  // I2C fault; auto-reboot pending (reboots remain)
+#define STATUS_SENSOR_UNAVAILABLE        0x40  // I2C fault; max reboots exhausted, power-cycle required
 
 // -----------------------------------------------------------------------------
 // TelemetryRecord
