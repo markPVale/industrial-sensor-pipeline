@@ -4,6 +4,8 @@ An end-to-end industrial vibration monitoring system built on an ESP32-S3 microc
 
 ## Architecture
 
+See [`docs/architecture.md`](docs/architecture.md) for full system, store-and-forward state machine, and I2C fault escalation diagrams.
+
 ```
 ESP32-S3 N16R8
   └── MPU-6050 (I2C, SDA=8, SCL=9)       100Hz sampling, 6-axis IMU
