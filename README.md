@@ -75,6 +75,8 @@ The firmware runs six FreeRTOS tasks across two cores:
 
 **State machine:** `NodeState` (NORMAL → BUFFERING → SYNCING) is a single `std::atomic<NodeState>` — no scattered boolean flags.
 
+**I2C fault recovery:** `sensorTask` probes the MPU-6050 via WHO_AM_I on every sample. After 5 consecutive failures it enters a fault state: periodic 9-pulse SCL bus recovery attempts every 3s, escalating to a full software reboot after 30s. Auto-reboots are capped at 3 per power-on session (tracked in NVS); after the third reboot the node transitions to `STATUS_SENSOR_UNAVAILABLE` and holds that state until SDA is reconnected or the node is power-cycled.
+
 ## Getting Started
 
 ### Gateway (Raspberry Pi)
@@ -104,11 +106,13 @@ cd firmware && pio run --target upload
 
 ```bash
 cd mcp-server && npm install && npm run build
-TRANSPORT=sse INFLUX_URL=http://localhost:8086 \
+TRANSPORT=sse MCP_PORT=3002 INFLUX_URL=http://localhost:8086 \
   INFLUX_TOKEN=dev-token-change-in-production \
   INFLUX_ORG=industrial INFLUX_BUCKET=sensors \
-  node dist/index.js
+  nohup node dist/index.js > ~/mcp-server.log 2>&1 &
 ```
+
+Verify: `curl -s http://sensor-gateway.local:3002/sse` — should return an SSE endpoint event.
 
 ### Integrity Check
 
@@ -143,7 +147,9 @@ Each record published to `sensor/<node_id>/telemetry`:
 | `STATUS_GYRO_CLIPPED` | `0x02` | Gyro hit ±500°/s range limit |
 | `STATUS_INTERLOCK_OPEN` | `0x04` | Safety interlock was open at sample time |
 | `STATUS_ANOMALY` | `0x08` | Vibration RMS exceeded threshold |
-| `STATUS_SENSOR_FAULT` | `0x10` | I2C dropout — consecutive zero reads from MPU-6050 |
+| `STATUS_SENSOR_FAULT` | `0x10` | I2C dropout — WHO_AM_I probe failed (legacy) |
+| `STATUS_DEGRADED_REBOOT_REQUIRED` | `0x20` | I2C fault; auto-reboot pending (reboots remaining) |
+| `STATUS_SENSOR_UNAVAILABLE` | `0x40` | I2C fault; max reboots exhausted, power-cycle required |
 
 ## Port Reference
 
