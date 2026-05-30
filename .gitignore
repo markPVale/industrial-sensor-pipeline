@@ -15,5 +15,10 @@ dashboard/.next/
 
 # Credentials — never commit
 firmware/secrets.ini
+
+# Personal / portfolio notes — not part of the public repo
 docs/claude-notes/
+docs/portfolio.md
+docs/demo-shot-list.md
 firmware/.pio/
+
