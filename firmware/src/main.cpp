@@ -70,10 +70,11 @@ static constexpr float kAccelSpikeThreshold = 4.905f;
 // Initialised to 0; set before any task uses it.
 static uint32_t g_bootId = 0;
 
-// Fault-reboot counter stored in RTC memory — survives esp_restart() but
-// resets to 0 on power cycle. Prevents infinite reboot loops when the sensor
-// is unrecoverably damaged. Reset to 0 on successful fault recovery.
-RTC_DATA_ATTR static uint8_t g_faultRebootCount = 0;
+// Fault-reboot counter — loaded from NVS on boot, written only on state
+// transitions (before fault reboot, after sustained recovery, on power-on clear).
+// NVS key: "sensor"/"fault_reboots". Cleared on power-on reset so the counter
+// is per-power-on-session, matching the original RTC_DATA_ATTR intent.
+static uint8_t g_faultRebootCount = 0;
 
 // Sequence ID — monotonic counter shared by filterTask (normal records) and
 // sensorTask (fault records). Global so fault records stay in sequence with
@@ -197,6 +198,7 @@ static void buildPayload(const TelemetryRecord& rec, char* buf, size_t len) {
 // Forward declarations
 // -----------------------------------------------------------------------------
 static void initBootId();
+static void initFaultRebootCount();
 static void initPSRAM();
 static void initMPU6050();
 static void IRAM_ATTR safetyISR();
@@ -216,6 +218,7 @@ void setup() {
     Serial.println("\n=== Industrial Sensor Node — Boot ===");
 
     initBootId();
+    initFaultRebootCount();
     initPSRAM();
 
     Wire.begin(PIN_SDA, PIN_SCL);
@@ -496,6 +499,12 @@ static void sensorTask(void* pvParams) {
                 if (now - faultEnteredMs >= SENSOR_FAULT_REBOOT_MS) {
                     if (g_faultRebootCount < SENSOR_FAULT_MAX_REBOOTS) {
                         g_faultRebootCount++;
+                        {
+                            Preferences prefs;
+                            prefs.begin("sensor", false);
+                            prefs.putUChar("fault_reboots", g_faultRebootCount);
+                            prefs.end();
+                        }
                         Serial.printf("[SensorTask] FAULT — rebooting (attempt %u/%u)\n",
                                       g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
                         vTaskDelay(pdMS_TO_TICKS(200));
@@ -570,6 +579,12 @@ static void sensorTask(void* pvParams) {
             Serial.printf("[SensorTask] INFO — 10s sustained recovery; "
                           "reboot counter cleared (was %u).\n", g_faultRebootCount);
             g_faultRebootCount = 0;
+            {
+                Preferences prefs;
+                prefs.begin("sensor", false);
+                prefs.putUChar("fault_reboots", 0);
+                prefs.end();
+            }
             recoveredAtMs = 0;
         }
 
@@ -849,6 +864,31 @@ static void initBootId() {
     prefs.putUInt("boot_id", g_bootId);
     prefs.end();
     Serial.printf("[NVS] boot_id = %u (previous = %u)\n", g_bootId, prev);
+}
+
+// =============================================================================
+// initFaultRebootCount()
+//
+// Loads the fault-reboot counter from NVS. On a power-on reset the counter is
+// cleared to 0 (fresh session). On a software reset (esp_restart()) the stored
+// value is kept so the counter accumulates across fault-triggered reboots.
+//
+// Written only on state transitions — before fault reboot, after sustained
+// recovery, and here on power-on clear. Never written per fault record.
+// =============================================================================
+static void initFaultRebootCount() {
+    Preferences prefs;
+    prefs.begin("sensor", false);
+    if (esp_reset_reason() == ESP_RST_POWERON) {
+        prefs.putUChar("fault_reboots", 0);
+        g_faultRebootCount = 0;
+        Serial.println("[NVS] fault_reboots cleared (power-on reset).");
+    } else {
+        g_faultRebootCount = prefs.getUChar("fault_reboots", 0);
+        Serial.printf("[NVS] fault_reboots = %u (software reset).\n",
+                      g_faultRebootCount);
+    }
+    prefs.end();
 }
 
 // =============================================================================
