@@ -71,14 +71,21 @@ reboot. Restart manually, or add to `gateway/docker-compose.yml` as a service.
 
 ## Claude Code Configuration
 
-Project `.mcp.json` points Claude Code at the Pi SSE endpoint:
+`.mcp.json` is gitignored (contains your Pi's local IP). Copy the template and
+fill in your Pi's IP address — use the IP directly, not `sensor-gateway.local`,
+as mDNS hostnames are not reliably resolved by Claude Code:
+
+```bash
+cp .mcp.json.template .mcp.json
+# Edit .mcp.json and replace <PI_IP> with your Pi's IP (e.g. 192.168.1.189)
+```
 
 ```json
 {
   "mcpServers": {
     "sensor": {
       "type": "sse",
-      "url": "http://sensor-gateway.local:3002/sse"
+      "url": "http://<PI_IP>:3002/sse"
     }
   }
 }

@@ -15,6 +15,7 @@ dashboard/.next/
 
 # Credentials — never commit
 firmware/secrets.ini
+.mcp.json
 
 # Personal / portfolio notes — not part of the public repo
 docs/claude-notes/

@@ -2,7 +2,7 @@
   "mcpServers": {
     "sensor": {
       "type": "sse",
-      "url": "http://192.168.1.189:3002/sse"
+      "url": "http://<PI_IP>:3002/sse"
     }
   }
 }
