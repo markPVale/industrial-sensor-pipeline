@@ -231,97 +231,105 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Server
+// MCP Server factory — one instance per SSE connection.
+// The SDK's Server can only be connected to one transport at a time; reusing
+// a global instance crashes on the second connection (e.g. Claude Code
+// reconnecting after /mcp). Creating a fresh instance per connection avoids
+// the "Already connected to a transport" error.
 // ---------------------------------------------------------------------------
-const server = new Server(
-  { name: "sensor-mcp-server", version: "0.1.0" },
-  { capabilities: { tools: {} } },
-);
+function createServer(): Server {
+  const server = new Server(
+    { name: "sensor-mcp-server", version: "0.1.0" },
+    { capabilities: { tools: {} } },
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name:        "get_latest_telemetry",
-      description: "Returns the most recent telemetry record for a sensor node, including vibration RMS, status flags, and timestamp.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          node_id: {
-            type:        "string",
-            description: "Sensor node ID (default: node01)",
-            default:     "node01",
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name:        "get_latest_telemetry",
+        description: "Returns the most recent telemetry record for a sensor node, including vibration RMS, status flags, and timestamp.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: {
+              type:        "string",
+              description: "Sensor node ID (default: node01)",
+              default:     "node01",
+            },
           },
         },
       },
-    },
-    {
-      name:        "get_sensor_health",
-      description: "Returns a health summary for a sensor node: online status, seconds since last message, current vibration RMS, and whether an anomaly or E-Stop is active.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          node_id: {
-            type:        "string",
-            description: "Sensor node ID (default: node01)",
-            default:     "node01",
+      {
+        name:        "get_sensor_health",
+        description: "Returns a health summary for a sensor node: online status, seconds since last message, current vibration RMS, and whether an anomaly or E-Stop is active.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: {
+              type:        "string",
+              description: "Sensor node ID (default: node01)",
+              default:     "node01",
+            },
           },
         },
       },
-    },
-    {
-      name:        "get_recent_anomalies",
-      description: "Returns all anomaly and E-Stop events detected within a lookback window for a sensor node.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          node_id: {
-            type:        "string",
-            description: "Sensor node ID (default: node01)",
-            default:     "node01",
-          },
-          window_minutes: {
-            type:        "number",
-            description: "How many minutes of history to search (default: 60)",
-            default:     60,
+      {
+        name:        "get_recent_anomalies",
+        description: "Returns all anomaly and E-Stop events detected within a lookback window for a sensor node.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            node_id: {
+              type:        "string",
+              description: "Sensor node ID (default: node01)",
+              default:     "node01",
+            },
+            window_minutes: {
+              type:        "number",
+              description: "How many minutes of history to search (default: 60)",
+              default:     60,
+            },
           },
         },
       },
-    },
-  ],
-}));
+    ],
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  const nodeId = (args?.node_id as string) ?? "node01";
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const nodeId = (args?.node_id as string) ?? "node01";
 
-  try {
-    let result: unknown;
+    try {
+      let result: unknown;
 
-    switch (name) {
-      case "get_latest_telemetry":
-        result = await getLatestTelemetry(nodeId);
-        break;
-      case "get_sensor_health":
-        result = await getSensorHealth(nodeId);
-        break;
-      case "get_recent_anomalies":
-        result = await getRecentAnomalies(nodeId, (args?.window_minutes as number) ?? 60);
-        break;
-      default:
-        throw new Error(`Unknown tool: ${name}`);
+      switch (name) {
+        case "get_latest_telemetry":
+          result = await getLatestTelemetry(nodeId);
+          break;
+        case "get_sensor_health":
+          result = await getSensorHealth(nodeId);
+          break;
+        case "get_recent_anomalies":
+          result = await getRecentAnomalies(nodeId, (args?.window_minutes as number) ?? 60);
+          break;
+        default:
+          throw new Error(`Unknown tool: ${name}`);
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `Error: ${message}` }],
+        isError: true,
+      };
     }
+  });
 
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-    };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      content: [{ type: "text", text: `Error: ${message}` }],
-      isError: true,
-    };
-  }
-});
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -339,7 +347,7 @@ async function main() {
       const transport = new SSEServerTransport("/messages", res);
       transports.set(transport.sessionId, transport);
       res.on("close", () => transports.delete(transport.sessionId));
-      await server.connect(transport);
+      await createServer().connect(transport);
     });
 
     app.post("/messages", async (req, res) => {
@@ -357,7 +365,7 @@ async function main() {
     });
   } else {
     const transport = new StdioServerTransport();
-    await server.connect(transport);
+    await createServer().connect(transport);
     // stdio mode — do not write to stdout after this point.
   }
 }
