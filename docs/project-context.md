@@ -42,7 +42,7 @@ In addition, the system exposes physical sensor telemetry to LLM clients (Claude
 ```
 ESP32-S3 (100Hz MPU-6050 sampling)
   → Kalman filter + RMS computation (on-device)
-  → MQTT publish QoS 1 @ ~2Hz  ──────────────────────────────────────┐
+  → MQTT publish QoS 0 @ ~2Hz  ──────────────────────────────────────┐
                                                                       ▼
                                                           Mosquitto (Pi :1883)
                                                                 ├── mqtt_to_influx bridge
@@ -89,7 +89,7 @@ The ESP32 runs a multi-tasking scheduler to ensure safety events cannot be block
 
 ## Resilience Engine (Store-and-Forward)
 A state machine governs telemetry behavior during failure:
-- **NORMAL:** Real-time streaming via MQTT QoS 1.
+- **NORMAL:** Real-time streaming via MQTT QoS 0.
 - **BUFFERING:** On disconnect, telemetry records are written to a **Circular Buffer in PSRAM**.
 - **SYNCING:** On reconnect, the system prioritizes real-time alerts while "bursting" historical data in rate-limited batches to the gateway.
 

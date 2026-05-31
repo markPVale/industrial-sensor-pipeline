@@ -43,7 +43,7 @@ graph LR
 Minimises data loss through network partitions — records buffer in PSRAM during
 outages and drain on reconnect. Not end-to-end guaranteed delivery: QoS 0 publish
 and a small in-memory queue between the buffer and the MQTT socket mean a
-connection drop mid-drain can lose up to one batch of records. All state is a
+a connection drop mid-drain can lose queued/in-flight records. All state is a
 single `std::atomic<NodeState>` — no scattered boolean flags.
 
 ```mermaid
