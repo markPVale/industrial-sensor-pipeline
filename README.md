@@ -73,7 +73,7 @@ The firmware runs six FreeRTOS tasks across two cores:
 | `telemetryTask` | 0 | 3 | Pops buffer, publishes at 2Hz |
 | `syncTask` | 0 | 3 | Burst-drains PSRAM buffer on reconnect |
 
-**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 44 bytes ≈ 2.1MB) during WiFi outages. On reconnect, `syncTask` drains them in batches of 20 with 100ms inter-batch delay.
+**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 44 bytes ≈ 2.1MB) during WiFi outages. On reconnect, `syncTask` drains them in batches of 20 with 100ms inter-batch delay. MQTT publishes use QoS 0 (PubSubClient default).
 
 **State machine:** `NodeState` (NORMAL → BUFFERING → SYNCING) is a single `std::atomic<NodeState>` — no scattered boolean flags.
 

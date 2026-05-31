@@ -1,6 +1,6 @@
 "use client";
 
-import { useMqttTelemetry, FLAG_ESTOP, FLAG_ANOMALY } from "@/hooks/useMqttTelemetry";
+import { useMqttTelemetry, FLAG_ESTOP, FLAG_ANOMALY, FLAG_SENSOR_FAULT, FLAG_DEGRADED_REBOOT_REQUIRED, FLAG_SENSOR_UNAVAILABLE } from "@/hooks/useMqttTelemetry";
 import HeartbeatIndicator from "./HeartbeatIndicator";
 
 // TODO: Replace with a charting library (e.g. Recharts, Chart.js) for Phase 2
@@ -35,16 +35,22 @@ function SparkLine({ values }: { values: number[] }) {
 export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: string }) {
   const { latest, history, estopEvent, connected } = useMqttTelemetry(nodeId);
 
-  const isEstop   = latest ? (latest.flags & FLAG_ESTOP)   !== 0 : false;
-  const isAnomaly = latest ? (latest.flags & FLAG_ANOMALY) !== 0 : false;
+  const isEstop       = latest ? (latest.flags & FLAG_ESTOP)                   !== 0 : false;
+  const isUnavailable = latest ? (latest.flags & FLAG_SENSOR_UNAVAILABLE)       !== 0 : false;
+  const isDegraded    = latest ? (latest.flags & (FLAG_DEGRADED_REBOOT_REQUIRED | FLAG_SENSOR_FAULT)) !== 0 : false;
+  const isAnomaly     = latest ? (latest.flags & FLAG_ANOMALY)                  !== 0 : false;
 
-  const statusColor = isEstop   ? "var(--red)"
-                    : isAnomaly ? "var(--yellow)"
-                    :             "var(--green)";
+  const statusColor = isEstop       ? "var(--red)"
+                    : isUnavailable ? "var(--red)"
+                    : isDegraded    ? "var(--yellow)"
+                    : isAnomaly     ? "var(--yellow)"
+                    :                 "var(--green)";
 
-  const statusLabel = isEstop   ? "E-STOP"
-                    : isAnomaly ? "ANOMALY"
-                    :             "NORMAL";
+  const statusLabel = isEstop       ? "E-STOP"
+                    : isUnavailable ? "SENSOR UNAVAILABLE"
+                    : isDegraded    ? "DEGRADED"
+                    : isAnomaly     ? "ANOMALY"
+                    :                 "NORMAL";
 
   const rmsValues = history.map((r) => r.vibration_rms);
 

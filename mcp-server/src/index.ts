@@ -77,11 +77,29 @@ function toISOString(t: unknown): string {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+const NODE_ID_RE = /^[a-zA-Z0-9_-]{1,32}$/;
+
+function validateNodeId(nodeId: string): void {
+  if (!NODE_ID_RE.test(nodeId)) {
+    throw new Error(`Invalid node_id "${nodeId}" — must match ${NODE_ID_RE}`);
+  }
+}
+
+function clampWindowMinutes(windowMinutes: number): number {
+  return Math.min(Math.max(Math.round(windowMinutes), 1), 1440); // 1 min – 24 h
+}
+
+// ---------------------------------------------------------------------------
+
 /**
  * get_latest_telemetry
  * Returns the single most recent vibration record for a node.
  */
 async function getLatestTelemetry(nodeId: string) {
+  validateNodeId(nodeId);
   const flux = `
     from(bucket: "${INFLUX_BUCKET}")
       |> range(start: -1h)
@@ -128,6 +146,7 @@ async function getLatestTelemetry(nodeId: string) {
  * Returns a human-readable health summary for a node.
  */
 async function getSensorHealth(nodeId: string) {
+  validateNodeId(nodeId);
   const flux = `
     from(bucket: "${INFLUX_BUCKET}")
       |> range(start: -5m)
@@ -182,9 +201,11 @@ function buildHealthSummary(ageSeconds: number, flags: number, rms: number): str
  * Returns all records within the window where an anomaly or E-Stop flag was set.
  */
 async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
+  validateNodeId(nodeId);
+  const window = clampWindowMinutes(windowMinutes);
   const flux = `
     from(bucket: "${INFLUX_BUCKET}")
-      |> range(start: -${windowMinutes}m)
+      |> range(start: -${window}m)
       |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> filter(fn: (r) =>

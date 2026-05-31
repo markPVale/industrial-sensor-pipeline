@@ -7,10 +7,13 @@ import mqtt, { MqttClient } from "mqtt";
 // Status flag bit positions — must match firmware/include/types.h and
 // docs/telemetry-schema.md exactly.
 // ---------------------------------------------------------------------------
-export const FLAG_ACCEL_CLIPPED  = 0x01;
-export const FLAG_GYRO_CLIPPED   = 0x02;
-export const FLAG_INTERLOCK_OPEN = 0x04;  // E-Stop / safety interlock
-export const FLAG_ANOMALY        = 0x08;
+export const FLAG_ACCEL_CLIPPED             = 0x01;
+export const FLAG_GYRO_CLIPPED              = 0x02;
+export const FLAG_INTERLOCK_OPEN            = 0x04;  // E-Stop / safety interlock
+export const FLAG_ANOMALY                   = 0x08;
+export const FLAG_SENSOR_FAULT              = 0x10;  // I2C dropout (legacy)
+export const FLAG_DEGRADED_REBOOT_REQUIRED  = 0x20;  // I2C fault; auto-reboot pending
+export const FLAG_SENSOR_UNAVAILABLE        = 0x40;  // I2C fault; max reboots exhausted
 
 // Convenience alias used by TelemetryDisplay
 export const FLAG_ESTOP = FLAG_INTERLOCK_OPEN;

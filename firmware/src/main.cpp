@@ -699,13 +699,14 @@ static void filterTask(void* pvParams) {
 // =============================================================================
 // telemetryTask — Core 0, Priority 3
 //
-// In NORMAL or SYNCING state: peeks the oldest record from g_buffer, serialises
-// it to JSON, and enqueues it for connectionTask to publish. Only pops the
-// record after a successful enqueue — if the publish queue is full the record
-// stays in g_buffer and will be retried next tick.
+// In NORMAL state only: peeks the oldest record from g_buffer, serialises it
+// to JSON, and enqueues it for connectionTask to publish. Only pops the record
+// after a successful enqueue — if the publish queue is full the record stays in
+// g_buffer and will be retried next tick.
 //
-// In BUFFERING state: does nothing. Records accumulate in PSRAM until syncTask
-// drains them on reconnect.
+// In BUFFERING state: does nothing — records accumulate in PSRAM.
+// In SYNCING state: does nothing — syncTask owns the buffer exclusively to
+// prevent a race where both tasks peek and publish the same record.
 // =============================================================================
 static void telemetryTask(void* pvParams) {
     char payload[MQTT_PAYLOAD_SIZE];
@@ -713,7 +714,7 @@ static void telemetryTask(void* pvParams) {
     for (;;) {
         const NodeState state = getState();
 
-        if (state == NodeState::NORMAL || state == NodeState::SYNCING) {
+        if (state == NodeState::NORMAL) {
             TelemetryRecord rec;
             if (g_buffer.peek(rec)) {
                 buildPayload(rec, payload, sizeof(payload));

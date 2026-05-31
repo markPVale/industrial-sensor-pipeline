@@ -38,7 +38,10 @@ INFLUX_BUCKET = os.getenv("INFLUX_BUCKET","sensors")
 TOPIC_TELEMETRY = "sensor/+/telemetry"
 TOPIC_ESTOP     = "sensor/+/estop"
 
-STATUS_SENSOR_FAULT = 0x10
+STATUS_SENSOR_FAULT             = 0x10
+STATUS_DEGRADED_REBOOT_REQUIRED = 0x20
+STATUS_SENSOR_UNAVAILABLE       = 0x40
+FAULT_FLAGS_MASK = STATUS_SENSOR_FAULT | STATUS_DEGRADED_REBOOT_REQUIRED | STATUS_SENSOR_UNAVAILABLE
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -81,7 +84,7 @@ def write_telemetry(node_id: str, payload: dict) -> None:
     sqrt(ax² + ay² + az²) for use by Grafana panels and MCP queries.
     Records with STATUS_SENSOR_FAULT are routed to sensor_faults instead.
     """
-    if int(payload.get("flags", 0)) & STATUS_SENSOR_FAULT:
+    if int(payload.get("flags", 0)) & FAULT_FLAGS_MASK:
         write_sensor_fault(node_id, payload)
         return
 
