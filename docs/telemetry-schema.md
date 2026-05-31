@@ -10,7 +10,7 @@ before the change is merged.
 ## Telemetry Message
 
 **MQTT topic:** `sensor/<node_id>/telemetry`
-**QoS:** 1
+**QoS:** 0 (PubSubClient default — not end-to-end guaranteed delivery)
 **Format:** UTF-8 JSON, single object per message
 
 ### Fields
@@ -58,8 +58,15 @@ Defined in `firmware/include/types.h`. All layers must use these exact bit posit
 | `STATUS_GYRO_CLIPPED` | `0x02` | 1 | One or more gyro axes hit the ±500 deg/s range limit |
 | `STATUS_INTERLOCK_OPEN` | `0x04` | 2 | Safety interlock was open at sample time (E-Stop condition) |
 | `STATUS_ANOMALY` | `0x08` | 3 | filterTask RMS exceeded anomaly threshold |
+| `STATUS_SENSOR_FAULT` | `0x10` | 4 | I2C dropout — WHO_AM_I probe failed (legacy; use 0x20/0x40) |
+| `STATUS_DEGRADED_REBOOT_REQUIRED` | `0x20` | 5 | I2C fault; auto-reboot pending (reboots remaining) |
+| `STATUS_SENSOR_UNAVAILABLE` | `0x40` | 6 | I2C fault; max reboots exhausted — power-cycle required |
 
 Multiple flags can be set simultaneously (bitmask).
+
+Records with flags `0x10`, `0x20`, or `0x40` are routed by the bridge to the
+`sensor_faults` InfluxDB measurement instead of `vibration`. The `ax` field in
+these records encodes the raw WHO_AM_I register byte (`0xFF` = bus not responding).
 
 ---
 
@@ -69,7 +76,7 @@ Published once when the safety ISR fires, in addition to setting `STATUS_INTERLO
 in the ongoing telemetry stream.
 
 **MQTT topic:** `sensor/<node_id>/estop`
-**QoS:** 1
+**QoS:** 0
 
 ```json
 {
@@ -106,6 +113,18 @@ task independently of the telemetry pipeline.
 
 `vibration_rms` is not transmitted by the firmware — it is derived in the bridge
 to provide a single-value anomaly signal for Grafana panels and MCP queries.
+
+### Fault records (`sensor_faults` measurement)
+
+Records with fault flags (`0x10 | 0x20 | 0x40`) are routed here instead of `vibration`.
+
+| InfluxDB field | Source | Notes |
+|----------------|--------|-------|
+| `boot_id` | payload `boot` | |
+| `sequence_id` | payload `seq` | |
+| `flags` | payload | original bitmask — distinguishes 0x10/0x20/0x40 |
+| `whoami_raw` | payload `ax` | WHO_AM_I register byte encoded by firmware (0xFF = bus not responding) |
+| `reason` | bridge | always `"i2c_dropout"` |
 
 ### Record time
 

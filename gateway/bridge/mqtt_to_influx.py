@@ -61,11 +61,15 @@ write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
 def write_sensor_fault(node_id: str, payload: dict) -> None:
     """Write a sensor fault record (I2C dropout) to the sensor_faults measurement."""
+    # whoami_raw: firmware encodes the raw WHO_AM_I register byte in ax during
+    # fault records (0xFF = bus not responding). Store under a clear name.
     point = (
         Point("sensor_faults")
         .tag("node_id", node_id)
         .field("boot_id",     int(payload.get("boot", 0)))
         .field("sequence_id", int(payload.get("seq",  0)))
+        .field("flags",       int(payload.get("flags", STATUS_SENSOR_FAULT)))
+        .field("whoami_raw",  int(float(payload.get("ax", 0xFF))))
         .field("reason",      "i2c_dropout")
     )
     ts = int(payload.get("ts", 0))

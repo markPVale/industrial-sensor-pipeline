@@ -147,19 +147,35 @@ async function getLatestTelemetry(nodeId: string) {
  */
 async function getSensorHealth(nodeId: string) {
   validateNodeId(nodeId);
-  const flux = `
-    from(bucket: "${INFLUX_BUCKET}")
-      |> range(start: -5m)
-      |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
-      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> filter(fn: (r) => exists r.flags and exists r.vibration_rms)
-      |> sort(columns: ["_time"], desc: true)
-      |> limit(n: 1)
-  `;
 
-  const rows = await runFlux(flux);
+  // Query both measurements in parallel — fault records (0x10/0x20/0x40) are
+  // routed to sensor_faults by the bridge and would be invisible to a
+  // vibration-only query, causing health to report stale "OK" then OFFLINE
+  // instead of DEGRADED or UNAVAILABLE during an I2C fault.
+  const [vibRows, faultRows] = await Promise.all([
+    runFlux(`
+      from(bucket: "${INFLUX_BUCKET}")
+        |> range(start: -5m)
+        |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
+        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> filter(fn: (r) => exists r.flags and exists r.vibration_rms)
+        |> sort(columns: ["_time"], desc: true)
+        |> limit(n: 1)
+    `),
+    runFlux(`
+      from(bucket: "${INFLUX_BUCKET}")
+        |> range(start: -5m)
+        |> filter(fn: (r) => r._measurement == "sensor_faults" and r.node_id == "${nodeId}")
+        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> sort(columns: ["_time"], desc: true)
+        |> limit(n: 1)
+    `),
+  ]);
 
-  if (rows.length === 0) {
+  const latestVib   = vibRows[0]   ?? null;
+  const latestFault = faultRows[0] ?? null;
+
+  if (!latestVib && !latestFault) {
     return {
       node_id:   nodeId,
       is_online: false,
@@ -167,11 +183,32 @@ async function getSensorHealth(nodeId: string) {
     };
   }
 
-  const r     = rows[0];
+  const vibTime   = latestVib   ? new Date(toISOString(latestVib["_time"])).getTime()   : 0;
+  const faultTime = latestFault ? new Date(toISOString(latestFault["_time"])).getTime() : 0;
+  const useFault  = faultTime > vibTime;
+
+  const age = Math.round((Date.now() - Math.max(vibTime, faultTime)) / 1000);
+
+  if (useFault) {
+    const r     = latestFault!;
+    // flags defaults to STATUS_SENSOR_FAULT for legacy records written before
+    // the flags field was added to sensor_faults.
+    const flags = (r["flags"] != null ? r["flags"] : FLAG_SENSOR_FAULT) as number;
+    return {
+      node_id:                        nodeId,
+      is_online:                      age < 30,
+      last_seen_seconds_ago:          age,
+      flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
+      flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
+      flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+      whoami_raw:                     r["whoami_raw"] ?? null,
+      health_summary:                 buildHealthSummary(age, flags, 0),
+    };
+  }
+
+  const r     = latestVib!;
   const flags = r["flags"] as number;
   const rms   = r["vibration_rms"] as number;
-  const age   = Math.round((Date.now() - new Date(toISOString(r["_time"])).getTime()) / 1000);
-
   return {
     node_id:                        nodeId,
     is_online:                      age < 30,
@@ -179,9 +216,9 @@ async function getSensorHealth(nodeId: string) {
     vibration_rms_mps2:             rms,
     flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
     flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
-    flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
-    flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-    flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+    flag_sensor_fault:              false,
+    flag_degraded_reboot_required:  false,
+    flag_sensor_unavailable:        false,
     health_summary:                 buildHealthSummary(age, flags, rms),
   };
 }

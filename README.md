@@ -11,7 +11,7 @@ ESP32-S3 N16R8
   └── MPU-6050 (I2C, SDA=8, SCL=9)       100Hz sampling, 6-axis IMU
   └── Photoresistor (GPIO 10)              Safety interlock ISR
         │
-        │ MQTT over WiFi (QoS 1)
+        │ MQTT over WiFi (QoS 0)
         ▼
 Mosquitto Broker (Docker, :1883 / :9001 WS)
         │
