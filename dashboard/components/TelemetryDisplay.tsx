@@ -137,7 +137,7 @@ export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: strin
           }}
         >
           <strong>E-STOP</strong> — {estopEvent.reason} @{" "}
-          {new Date(estopEvent.timestamp).toLocaleTimeString()}
+          {new Date(estopEvent.ts).toLocaleTimeString()}
         </div>
       )}
     </div>

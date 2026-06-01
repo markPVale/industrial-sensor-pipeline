@@ -31,15 +31,16 @@ export interface TelemetryRecord {
   gx:    number;   // rad/s Kalman-filtered gyro X
   gy:    number;   // rad/s Kalman-filtered gyro Y
   gz:    number;   // rad/s Kalman-filtered gyro Z
+  wrms?: number;   // m/s² rolling RMS over the firmware filter window
   flags: number;   // bitmask — see FLAG_* constants above
-  // Client-derived: not transmitted by firmware; computed on receipt
-  vibration_rms: number;  // m/s², sqrt(ax² + ay² + az²)
+  vibration_rms: number;  // m/s², firmware wrms when present; vector magnitude fallback
 }
 
 export interface EstopEvent {
-  timestamp: number;
-  triggered: number;
-  reason:    string;
+  ts:         number;
+  timestamp?: number;
+  triggered:  number;
+  reason:     string;
 }
 
 export interface TelemetryState {
@@ -94,15 +95,19 @@ export function useMqttTelemetry(nodeId: string = "node01"): TelemetryState {
 
       if (topic.endsWith("/telemetry")) {
         const raw = data as Omit<TelemetryRecord, "vibration_rms">;
+        const vectorMagnitude = Math.sqrt(raw.ax ** 2 + raw.ay ** 2 + raw.az ** 2);
         const record: TelemetryRecord = {
           ...raw,
-          // Derive vibration_rms client-side — not transmitted by firmware
-          vibration_rms: Math.sqrt(raw.ax ** 2 + raw.ay ** 2 + raw.az ** 2),
+          vibration_rms: raw.wrms ?? vectorMagnitude,
         };
         setLatest(record);
         setHistory((prev: TelemetryRecord[]) => [...prev.slice(-(HISTORY_LENGTH - 1)), record]);
       } else if (topic.endsWith("/estop")) {
-        setEstopEvent(data as EstopEvent);
+        const raw = data as EstopEvent;
+        setEstopEvent({
+          ...raw,
+          ts: raw.ts ?? raw.timestamp ?? Date.now(),
+        });
       }
     });
 

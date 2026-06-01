@@ -73,7 +73,7 @@ The firmware runs six FreeRTOS tasks across two cores:
 | `telemetryTask` | 0 | 3 | Pops buffer, publishes at 2Hz |
 | `syncTask` | 0 | 3 | Burst-drains PSRAM buffer on reconnect |
 
-**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 44 bytes ≈ 2.1MB) during WiFi outages. On reconnect, `syncTask` drains them in batches of 20 with 100ms inter-batch delay. MQTT publishes use QoS 0 (PubSubClient default).
+**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 48 bytes ≈ 2.4MB) during WiFi outages. On reconnect, `syncTask` drains them in batches of 20 with 100ms inter-batch delay. MQTT publishes use QoS 0 (PubSubClient default).
 
 **State machine:** `NodeState` (NORMAL → BUFFERING → SYNCING) is a single `std::atomic<NodeState>` — no scattered boolean flags.
 
@@ -138,7 +138,7 @@ Each record published to `sensor/<node_id>/telemetry`:
 }
 ```
 
-`vibration_rms` is derived in the bridge as `sqrt(ax² + ay² + az²)` and written to InfluxDB. See `docs/telemetry-schema.md` for flag bit definitions.
+`wrms` is computed in firmware over the 50-sample filter window and written to InfluxDB as `window_rms`. `vibration_rms` remains a bridge-derived accel vector magnitude for compatibility. See `docs/telemetry-schema.md` for flag bit definitions.
 
 ## Status Flags
 

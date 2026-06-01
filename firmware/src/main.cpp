@@ -180,17 +180,19 @@ static bool mqttEnqueue(const char* topic, const char* payload,
 //
 // Output example:
 //   {"boot":1,"seq":42,"ts":123456789,"ax":-9.8123,"ay":0.1234,"az":9.8765,
-//    "gx":0.0012,"gy":-0.0034,"gz":0.0056,"flags":0}
+//    "gx":0.0012,"gy":-0.0034,"gz":0.0056,"wrms":9.8123,"flags":0}
 // -----------------------------------------------------------------------------
 static void buildPayload(const TelemetryRecord& rec, char* buf, size_t len) {
     snprintf(buf, len,
         "{\"boot\":%u,\"seq\":%u,\"ts\":%llu,"
         "\"ax\":%.4f,\"ay\":%.4f,\"az\":%.4f,"
         "\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f,"
+        "\"wrms\":%.4f,"
         "\"flags\":%u}",
         rec.boot_id,      rec.sequence_id,  rec.timestamp_ms,
         rec.accel_x,      rec.accel_y,      rec.accel_z,
         rec.gyro_x,       rec.gyro_y,       rec.gyro_z,
+        rec.window_rms,
         rec.status_flags);
 }
 
@@ -242,13 +244,15 @@ void setup() {
     g_sensorQueue = xQueueCreate(SENSOR_QUEUE_DEPTH, sizeof(RawSample));
     if (g_sensorQueue == nullptr) {
         Serial.println("[Queue] FATAL — could not create sensor queue.");
-        while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        delay(200);
+        esp_restart();
     }
 
     g_publishQueue = xQueueCreate(MQTT_PUBLISH_QUEUE_DEPTH, sizeof(MqttMessage));
     if (g_publishQueue == nullptr) {
         Serial.println("[Queue] FATAL — could not create publish queue.");
-        while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        delay(200);
+        esp_restart();
     }
 
     Serial.printf("[Queue] OK — sensor depth %d, publish depth %d.\n",
@@ -260,7 +264,8 @@ void setup() {
     g_mqttEvents = xEventGroupCreate();
     if (g_mqttEvents == nullptr) {
         Serial.println("[EventGroup] FATAL — could not create mqtt event group.");
-        while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        delay(200);
+        esp_restart();
     }
 
     // -------------------------------------------------------------------------
@@ -287,7 +292,8 @@ void setup() {
     g_safetyEvents = xEventGroupCreate();
     if (g_safetyEvents == nullptr) {
         Serial.println("[EventGroup] FATAL — could not create safety event group.");
-        while (true) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        delay(200);
+        esp_restart();
     }
     pinMode(PIN_SAFETY_INTERLOCK, INPUT_PULLUP);
     delay(20);  // allow pin to settle before arming interrupt (prevents boot false trigger)
@@ -301,12 +307,36 @@ void setup() {
     //   Core 1: sensorTask + filterTask — time-sensitive sensor pipeline
     //   Core 0: connectionTask + telemetryTask + syncTask — network I/O
     // -------------------------------------------------------------------------
-    xTaskCreatePinnedToCore(safetyTask,     "SafetyTask",    2048, nullptr, 6, nullptr, 0);
-    xTaskCreatePinnedToCore(connectionTask, "ConnTask",      8192, nullptr, 4, nullptr, 0);
-    xTaskCreatePinnedToCore(sensorTask,     "SensorTask",    4096, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(filterTask,     "FilterTask",    8192, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(telemetryTask,  "TelemetryTask", 4096, nullptr, 3, nullptr, 0);
-    xTaskCreatePinnedToCore(syncTask,       "SyncTask",      4096, nullptr, 3, nullptr, 0);
+    if (xTaskCreatePinnedToCore(safetyTask,     "SafetyTask",    2048, nullptr, 6, nullptr, 0) != pdPASS) {
+        Serial.println("[Task] FATAL — could not create SafetyTask.");
+        delay(200);
+        esp_restart();
+    }
+    if (xTaskCreatePinnedToCore(connectionTask, "ConnTask",      8192, nullptr, 4, nullptr, 0) != pdPASS) {
+        Serial.println("[Task] FATAL — could not create ConnTask.");
+        delay(200);
+        esp_restart();
+    }
+    if (xTaskCreatePinnedToCore(sensorTask,     "SensorTask",    4096, nullptr, 5, nullptr, 1) != pdPASS) {
+        Serial.println("[Task] FATAL — could not create SensorTask.");
+        delay(200);
+        esp_restart();
+    }
+    if (xTaskCreatePinnedToCore(filterTask,     "FilterTask",    8192, nullptr, 5, nullptr, 1) != pdPASS) {
+        Serial.println("[Task] FATAL — could not create FilterTask.");
+        delay(200);
+        esp_restart();
+    }
+    if (xTaskCreatePinnedToCore(telemetryTask,  "TelemetryTask", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
+        Serial.println("[Task] FATAL — could not create TelemetryTask.");
+        delay(200);
+        esp_restart();
+    }
+    if (xTaskCreatePinnedToCore(syncTask,       "SyncTask",      4096, nullptr, 3, nullptr, 0) != pdPASS) {
+        Serial.println("[Task] FATAL — could not create SyncTask.");
+        delay(200);
+        esp_restart();
+    }
 
     Serial.println("Boot complete — FreeRTOS tasks running.");
 }
@@ -521,10 +551,13 @@ static void sensorTask(void* pvParams) {
             // Rate-limited fault record — one per SENSOR_FAULT_EMIT_INTERVAL_MS.
             if (now - lastFaultEmitMs >= SENSOR_FAULT_EMIT_INTERVAL_MS) {
                 lastFaultEmitMs = now;
-                const uint8_t faultFlag =
+                uint8_t faultFlag =
                     (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
                         ? STATUS_SENSOR_UNAVAILABLE
                         : STATUS_DEGRADED_REBOOT_REQUIRED;
+                if (g_interlockActive.load()) {
+                    faultFlag |= STATUS_INTERLOCK_OPEN;
+                }
                 TelemetryRecord fault{};
                 fault.boot_id      = g_bootId;
                 fault.sequence_id  = g_sequenceId.fetch_add(1);
@@ -555,8 +588,11 @@ static void sensorTask(void* pvParams) {
                               "(reboots this session: %u/%u)\n",
                               now, g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
                 // Emit one record immediately rather than waiting for the 500ms slow-poll.
-                const uint8_t faultFlag = (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
+                uint8_t faultFlag = (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
                     ? STATUS_SENSOR_UNAVAILABLE : STATUS_DEGRADED_REBOOT_REQUIRED;
+                if (g_interlockActive.load()) {
+                    faultFlag |= STATUS_INTERLOCK_OPEN;
+                }
                 TelemetryRecord fault{};
                 fault.boot_id      = g_bootId;
                 fault.sequence_id  = g_sequenceId.fetch_add(1);
@@ -676,13 +712,14 @@ static void filterTask(void* pvParams) {
             TelemetryRecord rec{};
             rec.boot_id      = g_bootId;
             rec.sequence_id  = g_sequenceId.fetch_add(1);
-            rec.timestamp_ms = sample.timestamp_ms;
+            rec.timestamp_ms = sample.timestamp_ms;  // window-end timestamp (last sample in window)
             rec.accel_x      = filtered_ax;
             rec.accel_y      = filtered_ay;
             rec.accel_z      = filtered_az;
             rec.gyro_x       = filtered_gx;
             rec.gyro_y       = filtered_gy;
             rec.gyro_z       = filtered_gz;
+            rec.window_rms   = rms;
             rec.status_flags = accumulated_flags;
 
             if (!g_buffer.push(rec)) {
@@ -833,7 +870,7 @@ static void safetyTask(void* pvParams) {
 
         snprintf(payload, sizeof(payload),
                  "{\"ts\":%llu,\"triggered\":1,\"reason\":\"interlock\"}",
-                 (unsigned long long)millis());
+                 (unsigned long long)getEpochMs());
 
         if (!mqttEnqueue(MQTT_TOPIC_ESTOP, payload)) {
             Serial.println("[Safety] WARN — publish queue full, E-Stop event dropped.");

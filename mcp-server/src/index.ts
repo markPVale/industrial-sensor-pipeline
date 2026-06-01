@@ -122,10 +122,13 @@ async function getLatestTelemetry(nodeId: string) {
 
   const r     = rows[0];
   const flags = r["flags"] as number;
+  const windowRms = (r["window_rms"] ?? r["vibration_rms"]) as number;
   return {
     node_id:                        nodeId,
     timestamp:                      toISOString(r["_time"]),
-    vibration_rms_mps2:             r["vibration_rms"],
+    vibration_rms_mps2:             windowRms,
+    window_rms_mps2:                windowRms,
+    vector_magnitude_mps2:          r["vibration_rms"],
     ax: r["ax"], ay: r["ay"], az: r["az"],
     gx: r["gx"], gy: r["gy"], gz: r["gz"],
     boot_id:                        r["boot_id"],
@@ -183,43 +186,33 @@ async function getSensorHealth(nodeId: string) {
     };
   }
 
-  const vibTime   = latestVib   ? new Date(toISOString(latestVib["_time"])).getTime()   : 0;
-  const faultTime = latestFault ? new Date(toISOString(latestFault["_time"])).getTime() : 0;
-  const useFault  = faultTime > vibTime;
+  const vibTime    = latestVib   ? new Date(toISOString(latestVib["_time"])).getTime()   : 0;
+  const faultTime  = latestFault ? new Date(toISOString(latestFault["_time"])).getTime() : 0;
+  const latestTime = Math.max(vibTime, faultTime);
+  const vibFlags   = latestVib ? latestVib["flags"] as number : 0;
+  const faultFlags = latestFault
+    ? (latestFault["flags"] != null ? latestFault["flags"] : FLAG_SENSOR_FAULT) as number
+    : 0;
+  const mergedFlags = vibFlags | faultFlags;
+  const rms = latestVib
+    ? (latestVib["window_rms"] ?? latestVib["vibration_rms"]) as number
+    : 0;
 
-  const age = Math.round((Date.now() - Math.max(vibTime, faultTime)) / 1000);
-
-  if (useFault) {
-    const r     = latestFault!;
-    // flags defaults to STATUS_SENSOR_FAULT for legacy records written before
-    // the flags field was added to sensor_faults.
-    const flags = (r["flags"] != null ? r["flags"] : FLAG_SENSOR_FAULT) as number;
-    return {
-      node_id:                        nodeId,
-      is_online:                      age < 30,
-      last_seen_seconds_ago:          age,
-      flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
-      flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-      flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
-      whoami_raw:                     r["whoami_raw"] ?? null,
-      health_summary:                 buildHealthSummary(age, flags, 0),
-    };
-  }
-
-  const r     = latestVib!;
-  const flags = r["flags"] as number;
-  const rms   = r["vibration_rms"] as number;
+  const age = Math.round((Date.now() - latestTime) / 1000);
   return {
     node_id:                        nodeId,
     is_online:                      age < 30,
     last_seen_seconds_ago:          age,
-    vibration_rms_mps2:             rms,
-    flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
-    flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
-    flag_sensor_fault:              false,
-    flag_degraded_reboot_required:  false,
-    flag_sensor_unavailable:        false,
-    health_summary:                 buildHealthSummary(age, flags, rms),
+    vibration_rms_mps2:             latestVib ? rms : null,
+    window_rms_mps2:                latestVib ? rms : null,
+    vector_magnitude_mps2:          latestVib ? latestVib["vibration_rms"] : null,
+    flag_interlock_open:            (mergedFlags & FLAG_INTERLOCK_OPEN)           !== 0,
+    flag_anomaly:                   (mergedFlags & FLAG_ANOMALY)                  !== 0,
+    flag_sensor_fault:              (mergedFlags & FLAG_SENSOR_FAULT)             !== 0,
+    flag_degraded_reboot_required:  (mergedFlags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
+    flag_sensor_unavailable:        (mergedFlags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+    whoami_raw:                     latestFault ? latestFault["whoami_raw"] ?? null : null,
+    health_summary:                 buildHealthSummary(age, mergedFlags, rms),
   };
 }
 
@@ -236,26 +229,38 @@ function buildHealthSummary(ageSeconds: number, flags: number, rms: number): str
 /**
  * get_recent_anomalies
  * Returns all records within the window where an anomaly or E-Stop flag was set.
+ * Queries both vibration and sensor_faults so I2C fault events are not missed.
  */
 async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
   validateNodeId(nodeId);
   const window = clampWindowMinutes(windowMinutes);
-  const flux = `
-    from(bucket: "${INFLUX_BUCKET}")
-      |> range(start: -${window}m)
-      |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
-      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> filter(fn: (r) =>
-        exists r.flags and exists r.vibration_rms and
-        exists r.ax and exists r.ay and exists r.az
-      )
-      |> filter(fn: (r) => r.flags > 0)
-      |> sort(columns: ["_time"], desc: true)
-  `;
 
-  const rows = await runFlux(flux);
+  // flags >= 4 excludes accel/gyro-clip-only records (0x01, 0x02, 0x03) while
+  // capturing all actionable flags: interlock (0x04), anomaly (0x08), and all
+  // sensor-fault variants (0x10, 0x20, 0x40).
+  const [vibRows, faultRows] = await Promise.all([
+    runFlux(`
+      from(bucket: "${INFLUX_BUCKET}")
+        |> range(start: -${window}m)
+        |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
+        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> filter(fn: (r) =>
+          exists r.flags and exists r.vibration_rms and
+          exists r.ax and exists r.ay and exists r.az
+        )
+        |> filter(fn: (r) => r.flags >= 4)
+        |> sort(columns: ["_time"], desc: true)
+    `),
+    runFlux(`
+      from(bucket: "${INFLUX_BUCKET}")
+        |> range(start: -${window}m)
+        |> filter(fn: (r) => r._measurement == "sensor_faults" and r.node_id == "${nodeId}")
+        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> sort(columns: ["_time"], desc: true)
+    `),
+  ]);
 
-  if (rows.length === 0) {
+  if (vibRows.length === 0 && faultRows.length === 0) {
     return {
       node_id:        nodeId,
       window_minutes: windowMinutes,
@@ -265,11 +270,15 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
     };
   }
 
-  const events = rows.map((r) => {
+  const vibEvents = vibRows.map((r) => {
     const flags = r["flags"] as number;
+    const windowRms = (r["window_rms"] ?? r["vibration_rms"]) as number;
     return {
       timestamp:                      toISOString(r["_time"]),
-      vibration_rms_mps2:             r["vibration_rms"],
+      source:                         "vibration",
+      vibration_rms_mps2:             windowRms,
+      window_rms_mps2:                windowRms,
+      vector_magnitude_mps2:          r["vibration_rms"] as number,
       ax: r["ax"], ay: r["ay"], az: r["az"],
       flags,
       flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
@@ -279,6 +288,26 @@ async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
       flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
     };
   });
+
+  const faultEvents = faultRows.map((r) => {
+    const flags = (r["flags"] != null ? r["flags"] : FLAG_SENSOR_FAULT) as number;
+    return {
+      timestamp:                      toISOString(r["_time"]),
+      source:                         "sensor_faults",
+      vibration_rms_mps2:             null,
+      ax: null, ay: null, az: null,
+      flags,
+      flag_interlock_open:            false,
+      flag_anomaly:                   false,
+      flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
+      flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
+      flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+    };
+  });
+
+  const events = [...vibEvents, ...faultEvents].sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+  );
 
   return {
     node_id:        nodeId,

@@ -38,16 +38,17 @@ python3 mqtt_to_influx.py
 
 | Topic | InfluxDB measurement |
 |-------|----------------------|
-| `sensor/+/telemetry` (flags < 0x10) | `vibration` |
-| `sensor/+/telemetry` (flags ≥ 0x10) | `sensor_faults` |
-| `sensor/+/estop` | `estop_events` |
+| `sensor/+/telemetry` without `0x10/0x20/0x40` | `vibration` |
+| `sensor/+/telemetry` with `0x10/0x20/0x40` | `sensor_faults` |
+| `sensor/+/estop` | `estop_event` |
 
 Fault records (`STATUS_SENSOR_FAULT`, `STATUS_DEGRADED_REBOOT_REQUIRED`,
 `STATUS_SENSOR_UNAVAILABLE`) are routed to `sensor_faults` to keep them
 out of the normal vibration stream.
 
-`vibration_rms` is derived in the bridge as `sqrt(ax² + ay² + az²)` and
-written alongside the raw IMU fields.
+`window_rms` is parsed from firmware `wrms` and is the metric used for anomaly
+detection. `vibration_rms` is still derived as `sqrt(ax² + ay² + az²)` for
+legacy panels and compatibility.
 
 ### Timestamps
 

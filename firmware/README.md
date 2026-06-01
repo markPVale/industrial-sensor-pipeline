@@ -81,7 +81,7 @@ NORMAL ──(disconnect)──▶ BUFFERING ──(reconnect)──▶ SYNCING 
 ```
 
 - **NORMAL** — real-time 2Hz telemetry via MQTT
-- **BUFFERING** — records written to PSRAM ring buffer (up to 50,000 × 44 bytes ≈ 2.1 MB)
+- **BUFFERING** — records written to PSRAM ring buffer (up to 50,000 × 48 bytes ≈ 2.4 MB)
 - **SYNCING** — live stream resumes; `syncTask` burst-drains buffer in batches of 20
 
 `NodeState` is a single `std::atomic<NodeState>` — no scattered boolean flags.

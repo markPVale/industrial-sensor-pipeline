@@ -14,13 +14,17 @@ Raspberry Pi alongside the gateway stack and queries InfluxDB directly.
 
 `get_sensor_health` returns a `health_summary` string with one of:
 
+Health merges the latest `vibration` and `sensor_faults` flags inside the
+freshness window. If `STATUS_INTERLOCK_OPEN` is present in either path, E-Stop
+takes priority over sensor-fault summaries.
+
 | Summary | Condition |
 |---------|-----------|
 | `OK — Normal operation` | No flags, data fresh |
 | `WARNING — Anomaly detected` | `STATUS_ANOMALY` set |
 | `DEGRADED — I2C fault detected. Auto-reboot pending.` | `STATUS_DEGRADED_REBOOT_REQUIRED` set |
-| `CRITICAL — Sensor unavailable. Max auto-reboots exhausted.` | `STATUS_SENSOR_UNAVAILABLE` set |
 | `CRITICAL — E-Stop / safety interlock is active.` | `STATUS_INTERLOCK_OPEN` set |
+| `CRITICAL — Sensor unavailable. Max auto-reboots exhausted.` | `STATUS_SENSOR_UNAVAILABLE` set |
 | `OFFLINE — no recent telemetry.` | No data in last 30s |
 
 ## Setup
@@ -71,12 +75,12 @@ reboot. Restart manually, or add to `gateway/docker-compose.yml` as a service.
 
 ## Claude Code Configuration
 
-`.mcp.json` is gitignored (contains your Pi's local IP). Copy the template and
+`.mcp.json` is gitignored (contains your Pi's local IP). Copy the example and
 fill in your Pi's IP address — use the IP directly, not `sensor-gateway.local`,
 as mDNS hostnames are not reliably resolved by Claude Code:
 
 ```bash
-cp .mcp.json.template .mcp.json
+cp .mcp.example.json .mcp.json
 # Edit .mcp.json and replace <PI_IP> with your Pi's IP (e.g. 192.168.1.189)
 ```
 

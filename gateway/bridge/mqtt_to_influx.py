@@ -84,8 +84,8 @@ def write_telemetry(node_id: str, payload: dict) -> None:
     Write a telemetry record to InfluxDB.
 
     Payload shape follows docs/telemetry-schema.md.
-    vibration_rms is not transmitted by firmware — it is derived here as
-    sqrt(ax² + ay² + az²) for use by Grafana panels and MCP queries.
+    vibration_rms is derived here as sqrt(ax² + ay² + az²) for legacy Grafana
+    panels. window_rms is the firmware rolling RMS used by anomaly detection.
     Records with STATUS_SENSOR_FAULT are routed to sensor_faults instead.
     """
     if int(payload.get("flags", 0)) & FAULT_FLAGS_MASK:
@@ -96,6 +96,8 @@ def write_telemetry(node_id: str, payload: dict) -> None:
     ay = float(payload.get("ay", 0.0))
     az = float(payload.get("az", 0.0))
     vibration_rms = math.sqrt(ax ** 2 + ay ** 2 + az ** 2)
+    raw_wrms = payload.get("wrms")
+    window_rms = float(raw_wrms) if raw_wrms is not None else vibration_rms
 
     flags = int(payload.get("flags", 0))
 
@@ -111,6 +113,8 @@ def write_telemetry(node_id: str, payload: dict) -> None:
         .field("gz",           float(payload.get("gz", 0.0)))
         # Derived metric: accel vector magnitude in m/s²
         .field("vibration_rms", vibration_rms)
+        # Firmware anomaly metric: rolling RMS over the filter window
+        .field("window_rms",    window_rms)
         # Record identity
         .field("boot_id",      int(payload.get("boot", 0)))
         .field("sequence_id",  int(payload.get("seq",  0)))
@@ -123,8 +127,8 @@ def write_telemetry(node_id: str, payload: dict) -> None:
         point = point.time(ts, WritePrecision.MS)
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-    log.debug("Written telemetry for %s: rms=%.4f m/s² flags=0x%02x seq=%d",
-              node_id, vibration_rms, flags, payload.get("seq", -1))
+    log.debug("Written telemetry for %s: wrms=%.4f m/s² flags=0x%02x seq=%d",
+              node_id, window_rms, flags, payload.get("seq", -1))
 
 
 def write_estop(node_id: str, payload: dict) -> None:
@@ -135,6 +139,9 @@ def write_estop(node_id: str, payload: dict) -> None:
         .field("triggered", int(payload.get("triggered", 1)))
         .field("reason", str(payload.get("reason", "unknown")))
     )
+    ts = int(payload.get("ts", 0))
+    if ts > 1_000_000_000_000:
+        point = point.time(ts, WritePrecision.MS)
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
     log.warning("E-Stop event written for node %s", node_id)
 

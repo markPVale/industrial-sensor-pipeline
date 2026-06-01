@@ -153,17 +153,19 @@ class MockESP32:
     def telemetry_payload(self) -> dict:
         """Build a payload matching firmware buildPayload() exactly."""
         axes = self._axis_values()
+        wrms = math.sqrt(axes["ax"] ** 2 + axes["ay"] ** 2 + axes["az"] ** 2)
         return {
             "boot":  self.boot_id,
             "seq":   self.seq_id,
             "ts":    int(time.time() * 1000),
             **axes,
+            "wrms":  wrms,
             "flags": self._flags(),
         }
 
     def estop_payload(self) -> dict:
         return {
-            "timestamp": int(time.time() * 1000),
+            "ts":        int(time.time() * 1000),
             "triggered": 1,
             "reason":    "optical_interlock",
         }

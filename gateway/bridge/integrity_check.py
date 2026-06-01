@@ -7,9 +7,8 @@ Validates three properties of data stored in InfluxDB:
                            within each boot_id. Resets to 0 only on boot change.
   2. Timestamp monotonicity — _time values are strictly increasing and spaced
                               ~500ms apart (FILTER_WINDOW_SIZE=50 at 100Hz).
-  3. Data fidelity — vibration_rms matches recomputed sqrt(ax²+ay²+az²) to
-                     within floating-point tolerance, confirming values are
-                     unchanged through the pipeline.
+  3. Data fidelity — vibration_rms matches recomputed sqrt(ax²+ay²+az²), and
+                     window_rms is present for normal records.
 
 Usage (on Pi):
     source .venv/bin/activate
@@ -34,14 +33,17 @@ INTERVAL_TOLERANCE_MS = 110  # ±110ms — NTP+WiFi+ESP32 crystal jitter; worst 
 PAIR_TOLERANCE_MS = 50       # compensating-pair check: two consecutive intervals must sum to 2×500ms ±this
 RMS_TOLERANCE = 0.01         # m/s² floating-point rounding tolerance
 STATUS_SENSOR_FAULT = 0x10   # matches firmware types.h
+STATUS_DEGRADED_REBOOT_REQUIRED = 0x20
+STATUS_SENSOR_UNAVAILABLE = 0x40
+FAULT_FLAGS_MASK = STATUS_SENSOR_FAULT | STATUS_DEGRADED_REBOOT_REQUIRED | STATUS_SENSOR_UNAVAILABLE
 
 
 def query(client, minutes):
     flux = f"""
 from(bucket: "{INFLUX_BUCKET}")
   |> range(start: -{minutes}m)
-  |> filter(fn: (r) => r._measurement == "vibration")
-  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> filter(fn: (r) => r._measurement == "vibration" or r._measurement == "sensor_faults")
+  |> pivot(rowKey: ["_time", "_measurement"], columnKey: ["_field"], valueColumn: "_value")
   |> sort(columns: ["_time"])
 """
     tables = client.query_api().query(flux, org=INFLUX_ORG)
@@ -50,12 +52,14 @@ from(bucket: "{INFLUX_BUCKET}")
         for row in table.records:
             records.append({
                 "time":     row.get_time(),
+                "measurement": str(row.values.get("_measurement", "")),
                 "boot_id":  int(row.values.get("boot_id", 0)),
                 "seq_id":   int(row.values.get("sequence_id", 0)),
                 "ax":       float(row.values.get("ax", 0.0)),
                 "ay":       float(row.values.get("ay", 0.0)),
                 "az":       float(row.values.get("az", 0.0)),
                 "rms":      float(row.values.get("vibration_rms", 0.0)),
+                "window_rms": row.values.get("window_rms"),
                 "flags":    int(row.values.get("flags", 0)),
             })
     return sorted(records, key=lambda r: r["time"])
@@ -82,7 +86,7 @@ def check_sequence(records):
                       f"seq did not reset to 0 (got {r['seq_id']})")
                 errors += 1
         prev = r
-    fault_count = sum(1 for r in records if r["flags"] & STATUS_SENSOR_FAULT)
+    fault_count = sum(1 for r in records if r["flags"] & FAULT_FLAGS_MASK)
     normal_count = len(records) - fault_count
     note = f" ({fault_count} fault record(s) included)" if fault_count else ""
     if errors == 0:
@@ -99,7 +103,7 @@ def check_timestamps(records):
 
     # Exclude fault records from interval checks — their timing is intentionally
     # irregular (emitted on dropout, not on the 500ms sensor window boundary).
-    normal = [r for r in records if not (r["flags"] & STATUS_SENSOR_FAULT)]
+    normal = [r for r in records if not (r["flags"] & FAULT_FLAGS_MASK)]
 
     deltas = []
     prev = None
@@ -160,7 +164,7 @@ def check_timestamps(records):
 def check_fidelity(records):
     print("\n--- 3. Data Fidelity ---")
     errors = 0
-    normal = [r for r in records if not (r["flags"] & STATUS_SENSOR_FAULT)]
+    normal = [r for r in records if not (r["flags"] & FAULT_FLAGS_MASK)]
     for r in normal:
         expected_rms = math.sqrt(r["ax"]**2 + r["ay"]**2 + r["az"]**2)
         diff = abs(r["rms"] - expected_rms)
@@ -168,8 +172,11 @@ def check_fidelity(records):
             print(f"  RMS MISMATCH  seq={r['seq_id']}  "
                   f"stored={r['rms']:.6f}  computed={expected_rms:.6f}  diff={diff:.6f}")
             errors += 1
+        if r["window_rms"] is None:
+            print(f"  WINDOW RMS MISSING  seq={r['seq_id']}  older firmware/bridge payload")
+            errors += 1
     if errors == 0:
-        print(f"  PASS — {len(normal)} records, vibration_rms matches recomputed values")
+        print(f"  PASS — {len(normal)} records, vibration_rms matches recomputed values and window_rms is present")
     else:
         print(f"  FAIL — {errors} violation(s)")
     return errors == 0
@@ -177,7 +184,7 @@ def check_fidelity(records):
 
 def check_sensor_faults(records):
     print("\n--- 4. Sensor Faults ---")
-    faults = [r for r in records if r["flags"] & STATUS_SENSOR_FAULT]
+    faults = [r for r in records if r["flags"] & FAULT_FLAGS_MASK]
     if not faults:
         print("  PASS — no sensor fault records")
     else:

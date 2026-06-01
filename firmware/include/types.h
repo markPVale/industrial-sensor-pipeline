@@ -30,19 +30,20 @@
 // across reboots. boot_id should be loaded from NVS on startup and
 // incremented each boot cycle.
 //
-// Size: 4 + 4 + 8 + (6 × 4) + 1 + 3 (padding) = 44 bytes
-// At 50,000 records that is ~2.1 MB — well within the 8 MB PSRAM budget.
+// Size: 4 + 4 + 8 + (7 × 4) + 1 + 3 (padding) = 48 bytes
+// At 50,000 records that is ~2.4 MB — well within the 8 MB PSRAM budget.
 // -----------------------------------------------------------------------------
 struct TelemetryRecord {
     uint32_t boot_id;       // increments each reboot (persisted in NVS)
     uint32_t sequence_id;   // monotonic counter, resets to 0 each boot
-    uint64_t timestamp_ms;  // millis() at time of sample
+    uint64_t timestamp_ms;  // UTC epoch ms when synced; monotonic millis fallback pre-sync
     float    accel_x;       // m/s²
     float    accel_y;       // m/s²
     float    accel_z;       // m/s²
     float    gyro_x;        // rad/s
     float    gyro_y;        // rad/s
     float    gyro_z;        // rad/s
+    float    window_rms;    // m/s² rolling RMS over FILTER_WINDOW_SIZE samples
     uint8_t  status_flags;  // bitmask — see STATUS_* defines above
 };
 

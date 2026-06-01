@@ -96,11 +96,19 @@ A state machine governs telemetry behavior during failure:
 **Data Record Schema:**
 ```cpp
 struct TelemetryRecord {
-  uint64_t timestamp;   // Edge-side timestamp to prevent clock drift
-  float vibration_rms;  // Computed RMS over sample window
-  uint8_t flags;        // Bitmask: bit0=E-Stop, bit1=Anomaly
+  uint32_t boot_id;       // Boot cycle counter from NVS
+  uint32_t sequence_id;   // Per-boot monotonic sequence
+  uint64_t timestamp_ms;  // UTC epoch ms after NTP sync; monotonic fallback pre-sync
+  float accel_x, accel_y, accel_z;  // Kalman-filtered acceleration, m/s²
+  float gyro_x, gyro_y, gyro_z;     // Kalman-filtered angular velocity, rad/s
+  float window_rms;       // Rolling RMS over FILTER_WINDOW_SIZE samples
+  uint8_t status_flags;   // STATUS_* bitmask: interlock, anomaly, fault, etc.
 };
 ```
+
+The MQTT payload emits `window_rms` as `wrms`. The bridge stores it in InfluxDB
+as `window_rms` and also keeps `vibration_rms = sqrt(ax² + ay² + az²)` for
+legacy vector-magnitude panels.
 
 ---
 
@@ -110,9 +118,9 @@ The MCP server exposes the following tools to LLM clients:
 
 | Tool | Description |
 |------|-------------|
-| `get_latest_telemetry` | Returns the most recent telemetry record (vibration RMS, flags, timestamp) for a node |
-| `get_sensor_health` | Returns a health summary: online status, last-seen age, active anomaly/E-Stop flags |
-| `get_recent_anomalies` | Returns anomaly events within a configurable lookback window |
+| `get_latest_telemetry` | Returns the most recent telemetry record (`window_rms`, IMU values, flags, timestamp) for a node |
+| `get_sensor_health` | Returns a merged health summary from latest vibration + sensor-fault records; E-Stop takes priority |
+| `get_recent_anomalies` | Returns flagged vibration and sensor-fault events within a configurable lookback window |
 
 **Connection:** The MCP server runs on the Pi and listens for MCP client connections. Configure Claude Code's MCP settings to point to the Pi's IP and port 3002.
 

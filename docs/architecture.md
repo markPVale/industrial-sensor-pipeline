@@ -54,7 +54,7 @@ stateDiagram-v2
     BUFFERING --> SYNCING : MQTT reconnect
 
     NORMAL : NORMAL\nReal-time 2Hz publish via MQTT
-    BUFFERING : BUFFERING\nRecords written to PSRAM\n(up to 50,000 × 44 bytes ≈ 2.1 MB)
+    BUFFERING : BUFFERING\nRecords written to PSRAM\n(up to 50,000 × 48 bytes ≈ 2.4 MB)
     SYNCING : SYNCING\nLive stream resumes\nsyncTask burst-drains buffer\nin batches of 20
 
     SYNCING --> NORMAL : buffer empty
