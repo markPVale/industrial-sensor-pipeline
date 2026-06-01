@@ -1,0 +1,3 @@
+# Codex project config.
+# Intentionally no MCP servers here.
+# Claude Code uses local .mcp.json; Codex stays isolated from MCP.
