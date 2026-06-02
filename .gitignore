@@ -22,4 +22,5 @@ firmware/secrets.ini
 docs/claude-notes/
 docs/portfolio.md
 docs/demo-shot-list.md
+docs/data-flow-guide.md
 firmware/.pio/
