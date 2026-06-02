@@ -178,21 +178,29 @@ static bool mqttEnqueue(const char* topic, const char* payload,
 // buildPayload() — serialise one TelemetryRecord to a JSON string.
 // Uses snprintf — no heap allocation, deterministic timing.
 //
-// Output example:
-//   {"boot":1,"seq":42,"ts":123456789,"ax":-9.8123,"ay":0.1234,"az":9.8765,
-//    "gx":0.0012,"gy":-0.0034,"gz":0.0056,"wrms":9.8123,"flags":0}
+// Output examples:
+//   normal: {"boot":1,"seq":42,"ts":123456789,"ax":-9.8123,"ay":0.1234,"az":9.8765,
+//            "gx":0.0012,"gy":-0.0034,"gz":0.0056,"wrms":9.8123,"flags":0}
+//   fault:  {"boot":1,"seq":43,"ts":123456790,"ax":104.0000,"ay":0.0000,"az":0.0000,
+//            "gx":0.0000,"gy":0.0000,"gz":0.0000,"wrms":null,"flags":32}
 // -----------------------------------------------------------------------------
 static void buildPayload(const TelemetryRecord& rec, char* buf, size_t len) {
+    char wrms_str[16];
+    if (isnan(rec.window_rms)) {
+        strlcpy(wrms_str, "null", sizeof(wrms_str));
+    } else {
+        snprintf(wrms_str, sizeof(wrms_str), "%.4f", rec.window_rms);
+    }
     snprintf(buf, len,
         "{\"boot\":%u,\"seq\":%u,\"ts\":%llu,"
         "\"ax\":%.4f,\"ay\":%.4f,\"az\":%.4f,"
         "\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f,"
-        "\"wrms\":%.4f,"
+        "\"wrms\":%s,"
         "\"flags\":%u}",
         rec.boot_id,      rec.sequence_id,  rec.timestamp_ms,
         rec.accel_x,      rec.accel_y,      rec.accel_z,
         rec.gyro_x,       rec.gyro_y,       rec.gyro_z,
-        rec.window_rms,
+        wrms_str,
         rec.status_flags);
 }
 
@@ -210,6 +218,36 @@ static void filterTask(void* pvParams);
 static void telemetryTask(void* pvParams);
 static void syncTask(void* pvParams);
 static void safetyTask(void* pvParams);
+
+// =============================================================================
+// fatalSetupHalt() — called when a critical resource cannot be allocated in
+// setup(). Retries with exponential-ish backoff up to kSetupMaxRetries times,
+// then enters a visible terminal loop (never restarts again).
+//
+// NVS key "sensor"/"setup_fails" tracks attempts across soft resets.
+// Cleared at the end of a successful setup() so the counter is per-incident.
+// =============================================================================
+static constexpr uint8_t  kSetupMaxRetries  = 3;
+static const     uint32_t kSetupRetryDelays[] = {1000, 5000, 15000};  // ms
+
+static void fatalSetupHalt(const char* msg) {
+    Serial.println(msg);
+    Preferences prefs;
+    prefs.begin("sensor", false);
+    const uint8_t n = prefs.getUChar("setup_fails", 0);
+    if (n < kSetupMaxRetries) {
+        const uint32_t waitMs = kSetupRetryDelays[n];
+        prefs.putUChar("setup_fails", n + 1);
+        prefs.end();
+        Serial.printf("[Setup] Retry %u/%u — restarting in %u ms.\n",
+                      n + 1, kSetupMaxRetries, waitMs);
+        delay(waitMs);
+        esp_restart();
+    }
+    prefs.end();
+    Serial.println("[Setup] FATAL — max retries exhausted. Power-cycle required.");
+    for (;;) { vTaskDelay(pdMS_TO_TICKS(5000)); }
+}
 
 // =============================================================================
 // setup()
@@ -243,16 +281,12 @@ void setup() {
     // -------------------------------------------------------------------------
     g_sensorQueue = xQueueCreate(SENSOR_QUEUE_DEPTH, sizeof(RawSample));
     if (g_sensorQueue == nullptr) {
-        Serial.println("[Queue] FATAL — could not create sensor queue.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Queue] FATAL — could not create sensor queue.");
     }
 
     g_publishQueue = xQueueCreate(MQTT_PUBLISH_QUEUE_DEPTH, sizeof(MqttMessage));
     if (g_publishQueue == nullptr) {
-        Serial.println("[Queue] FATAL — could not create publish queue.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Queue] FATAL — could not create publish queue.");
     }
 
     Serial.printf("[Queue] OK — sensor depth %d, publish depth %d.\n",
@@ -263,9 +297,7 @@ void setup() {
     // -------------------------------------------------------------------------
     g_mqttEvents = xEventGroupCreate();
     if (g_mqttEvents == nullptr) {
-        Serial.println("[EventGroup] FATAL — could not create mqtt event group.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[EventGroup] FATAL — could not create mqtt event group.");
     }
 
     // -------------------------------------------------------------------------
@@ -291,9 +323,7 @@ void setup() {
     // -------------------------------------------------------------------------
     g_safetyEvents = xEventGroupCreate();
     if (g_safetyEvents == nullptr) {
-        Serial.println("[EventGroup] FATAL — could not create safety event group.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[EventGroup] FATAL — could not create safety event group.");
     }
     pinMode(PIN_SAFETY_INTERLOCK, INPUT_PULLUP);
     delay(20);  // allow pin to settle before arming interrupt (prevents boot false trigger)
@@ -301,6 +331,12 @@ void setup() {
     Serial.printf("[Safety] Interlock armed on GPIO %d (pin=%s).\n",
                   PIN_SAFETY_INTERLOCK,
                   digitalRead(PIN_SAFETY_INTERLOCK) == LOW ? "LOW — interlock open" : "HIGH — OK");
+    if (digitalRead(PIN_SAFETY_INTERLOCK) == LOW) {
+        // Interlock was already open at boot — latch without waiting for the FALLING edge.
+        g_interlockActive.store(true);
+        xEventGroupSetBits(g_safetyEvents, kBitInterlock);
+        Serial.println("[Safety] Interlock open at boot — latch armed, E-Stop will publish on connect.");
+    }
 
     // -------------------------------------------------------------------------
     // FreeRTOS tasks
@@ -308,36 +344,30 @@ void setup() {
     //   Core 0: connectionTask + telemetryTask + syncTask — network I/O
     // -------------------------------------------------------------------------
     if (xTaskCreatePinnedToCore(safetyTask,     "SafetyTask",    2048, nullptr, 6, nullptr, 0) != pdPASS) {
-        Serial.println("[Task] FATAL — could not create SafetyTask.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Task] FATAL — could not create SafetyTask.");
     }
     if (xTaskCreatePinnedToCore(connectionTask, "ConnTask",      8192, nullptr, 4, nullptr, 0) != pdPASS) {
-        Serial.println("[Task] FATAL — could not create ConnTask.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Task] FATAL — could not create ConnTask.");
     }
     if (xTaskCreatePinnedToCore(sensorTask,     "SensorTask",    4096, nullptr, 5, nullptr, 1) != pdPASS) {
-        Serial.println("[Task] FATAL — could not create SensorTask.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Task] FATAL — could not create SensorTask.");
     }
     if (xTaskCreatePinnedToCore(filterTask,     "FilterTask",    8192, nullptr, 5, nullptr, 1) != pdPASS) {
-        Serial.println("[Task] FATAL — could not create FilterTask.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Task] FATAL — could not create FilterTask.");
     }
     if (xTaskCreatePinnedToCore(telemetryTask,  "TelemetryTask", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
-        Serial.println("[Task] FATAL — could not create TelemetryTask.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Task] FATAL — could not create TelemetryTask.");
     }
     if (xTaskCreatePinnedToCore(syncTask,       "SyncTask",      4096, nullptr, 3, nullptr, 0) != pdPASS) {
-        Serial.println("[Task] FATAL — could not create SyncTask.");
-        delay(200);
-        esp_restart();
+        fatalSetupHalt("[Task] FATAL — could not create SyncTask.");
     }
 
+    {
+        Preferences prefs;
+        prefs.begin("sensor", false);
+        prefs.putUChar("setup_fails", 0);
+        prefs.end();
+    }
     Serial.println("Boot complete — FreeRTOS tasks running.");
 }
 
@@ -486,6 +516,29 @@ static bool reinitMpu() {
     return true;
 }
 
+// Builds and pushes one fault TelemetryRecord. Called from both the immediate
+// fault-state-entry path and the rate-limited slow-poll path in sensorTask.
+// window_rms is set to NAN so buildPayload emits "wrms":null.
+static void emitFaultRecord() {
+    uint8_t faultFlag = (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
+        ? STATUS_SENSOR_UNAVAILABLE : STATUS_DEGRADED_REBOOT_REQUIRED;
+    if (g_interlockActive.load()) {
+        faultFlag |= STATUS_INTERLOCK_OPEN;
+    }
+    TelemetryRecord fault{};
+    fault.boot_id      = g_bootId;
+    fault.sequence_id  = g_sequenceId.fetch_add(1);
+    fault.timestamp_ms = getEpochMs();
+    fault.status_flags = faultFlag;
+    fault.accel_x      = (float)g_lastWhoAmI;
+    fault.window_rms   = NAN;
+    if (!g_buffer.push(fault)) {
+        Serial.println("[SensorTask] WARN — buffer full, fault record lost.");
+    }
+    Serial.printf("[SensorTask] WARN — sensor fault seq=%u flags=0x%02X\n",
+                  fault.sequence_id, faultFlag);
+}
+
 static void sensorTask(void* pvParams) {
     const TickType_t period   = pdMS_TO_TICKS(1000 / SAMPLE_RATE_HZ);
     TickType_t       lastWake = xTaskGetTickCount();
@@ -551,24 +604,7 @@ static void sensorTask(void* pvParams) {
             // Rate-limited fault record — one per SENSOR_FAULT_EMIT_INTERVAL_MS.
             if (now - lastFaultEmitMs >= SENSOR_FAULT_EMIT_INTERVAL_MS) {
                 lastFaultEmitMs = now;
-                uint8_t faultFlag =
-                    (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
-                        ? STATUS_SENSOR_UNAVAILABLE
-                        : STATUS_DEGRADED_REBOOT_REQUIRED;
-                if (g_interlockActive.load()) {
-                    faultFlag |= STATUS_INTERLOCK_OPEN;
-                }
-                TelemetryRecord fault{};
-                fault.boot_id      = g_bootId;
-                fault.sequence_id  = g_sequenceId.fetch_add(1);
-                fault.timestamp_ms = getEpochMs();
-                fault.status_flags = faultFlag;
-                fault.accel_x      = (float)g_lastWhoAmI;
-                if (!g_buffer.push(fault)) {
-                    Serial.println("[SensorTask] WARN — buffer full, fault record lost.");
-                }
-                Serial.printf("[SensorTask] WARN — sensor fault seq=%u flags=0x%02X\n",
-                              fault.sequence_id, faultFlag);
+                emitFaultRecord();
             }
             continue;
         }
@@ -588,18 +624,7 @@ static void sensorTask(void* pvParams) {
                               "(reboots this session: %u/%u)\n",
                               now, g_faultRebootCount, SENSOR_FAULT_MAX_REBOOTS);
                 // Emit one record immediately rather than waiting for the 500ms slow-poll.
-                uint8_t faultFlag = (g_faultRebootCount >= SENSOR_FAULT_MAX_REBOOTS)
-                    ? STATUS_SENSOR_UNAVAILABLE : STATUS_DEGRADED_REBOOT_REQUIRED;
-                if (g_interlockActive.load()) {
-                    faultFlag |= STATUS_INTERLOCK_OPEN;
-                }
-                TelemetryRecord fault{};
-                fault.boot_id      = g_bootId;
-                fault.sequence_id  = g_sequenceId.fetch_add(1);
-                fault.timestamp_ms = getEpochMs();
-                fault.status_flags = faultFlag;
-                fault.accel_x      = (float)g_lastWhoAmI;
-                g_buffer.push(fault);
+                emitFaultRecord();
             }
             vTaskDelayUntil(&lastWake, period);
             continue;
@@ -919,8 +944,9 @@ static void initFaultRebootCount() {
     prefs.begin("sensor", false);
     if (esp_reset_reason() == ESP_RST_POWERON) {
         prefs.putUChar("fault_reboots", 0);
+        prefs.putUChar("setup_fails",   0);
         g_faultRebootCount = 0;
-        Serial.println("[NVS] fault_reboots cleared (power-on reset).");
+        Serial.println("[NVS] fault_reboots + setup_fails cleared (power-on reset).");
     } else {
         g_faultRebootCount = prefs.getUChar("fault_reboots", 0);
         Serial.printf("[NVS] fault_reboots = %u (software reset).\n",

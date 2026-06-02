@@ -52,7 +52,9 @@ export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: strin
                     : isAnomaly     ? "ANOMALY"
                     :                 "NORMAL";
 
-  const rmsValues = history.map((r) => r.vibration_rms);
+  const rmsValues = history
+    .map((r) => r.vibration_rms)
+    .filter((v): v is number => v !== null);
 
   return (
     <div
@@ -95,7 +97,11 @@ export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: strin
           <tr>
             <td style={{ color: "var(--muted)", paddingBottom: "0.4rem" }}>Vibration RMS</td>
             <td style={{ textAlign: "right", color: "var(--text)" }}>
-              {latest ? `${latest.vibration_rms.toFixed(4)} m/s²` : "—"}
+              {latest
+                ? latest.vibration_rms != null
+                  ? `${latest.vibration_rms.toFixed(4)} m/s²`
+                  : "—"
+                : "—"}
             </td>
           </tr>
           <tr>
