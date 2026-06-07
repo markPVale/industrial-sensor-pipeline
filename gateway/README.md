@@ -23,6 +23,15 @@ InfluxDB is auto-initialised on first boot (org: `industrial`, bucket: `sensors`
 token: `dev-token-change-in-production`). Data persists in named Docker volumes
 across restarts. Use `docker compose down -v` only when a clean slate is needed.
 
+Grafana provisions its InfluxDB datasource and dashboard JSON from
+`gateway/grafana/` when the container starts. After pulling dashboard changes,
+recreate Grafana with the current Compose config:
+
+```bash
+cd gateway
+docker compose up -d grafana
+```
+
 ## Bridge
 
 The Python bridge subscribes to MQTT and writes records to InfluxDB.
