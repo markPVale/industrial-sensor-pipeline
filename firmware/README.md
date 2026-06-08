@@ -69,8 +69,8 @@ for runtime observability instead of the serial monitor.
 | `sensorTask` | 1 | 5 | 100Hz MPU-6050 sampling via `vTaskDelayUntil` |
 | `filterTask` | 1 | 5 | 6× Kalman filters, rolling RMS, anomaly detection |
 | `connectionTask` | 0 | 4 | Sole MQTT socket owner, drains publish queue |
-| `telemetryTask` | 0 | 3 | Pops buffer, publishes at 2Hz |
-| `syncTask` | 0 | 3 | Burst-drains PSRAM buffer on reconnect |
+| `telemetryTask` | 0 | 3 | Enqueues oldest buffered telemetry at 2Hz |
+| `syncTask` | 0 | 3 | Drains PSRAM buffer on reconnect |
 
 Safety and sensor work runs on Core 1; all network I/O runs on Core 0.
 
@@ -82,11 +82,17 @@ NORMAL ──(disconnect)──▶ BUFFERING ──(reconnect)──▶ SYNCING 
 
 - **NORMAL** — real-time 2Hz telemetry via MQTT
 - **BUFFERING** — records written to PSRAM ring buffer (up to 50,000 × 48 bytes ≈ 2.4 MB)
-- **SYNCING** — live stream resumes; `syncTask` burst-drains buffer in batches of 20
+- **SYNCING** — buffered records drain after reconnect; the current shortcut
+  allows one buffered telemetry record in flight at a time
 
 `NodeState` is a single `std::atomic<NodeState>` — no scattered boolean flags.
 All MQTT callbacks only call `xEventGroupSetBits` — no Serial, no state writes
 (USB CDC + WiFi interrupt contention causes crashes if callbacks block).
+
+Store-and-forward is improved but not guaranteed delivery. `connectionTask`
+commits a buffered record only after `publish()` succeeds, but MQTT still uses
+QoS 0 style publish behavior. See `docs/store-and-forward-status.md` for the
+current validation plan and long-term ACK options.
 
 ### I2C Fault Recovery
 

@@ -105,7 +105,7 @@
 #define MQTT_TOPIC_ESTOP      "sensor/node01/estop"
 #define MQTT_KEEPALIVE_S      15    // PubSubClient keepalive interval in seconds
 
-// Outbound publish queue: MqttMessage items enqueued by telemetryTask/syncTask
-// and drained by connectionTask. 40 slots × ~390 bytes each ≈ 15 KB.
+// Outbound publish queue: MqttMessage items enqueued by tasks and drained by
+// connectionTask. 40 slots × ~400 bytes each ≈ 16 KB.
 #define MQTT_PUBLISH_QUEUE_DEPTH  40
 #define MQTT_PAYLOAD_SIZE         320   // bytes — fits one ArduinoJson telemetry record

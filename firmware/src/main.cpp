@@ -47,6 +47,9 @@ struct MqttMessage {
     char topic[64];
     char payload[MQTT_PAYLOAD_SIZE];
     bool retained;
+    bool commit_buffer_record;
+    uint32_t boot_id;
+    uint32_t sequence_id;
 };
 
 // -----------------------------------------------------------------------------
@@ -160,9 +163,10 @@ static BufferManager    g_buffer;
 static MqttManager      g_mqttManager;
 static QueueHandle_t    g_sensorQueue  = nullptr;
 static QueueHandle_t    g_publishQueue = nullptr;
+static std::atomic<bool> g_bufferRecordInFlight{false};
 
 // -----------------------------------------------------------------------------
-// mqttEnqueue() — thread-safe helper used by telemetryTask and syncTask.
+// mqttEnqueue() — thread-safe helper used for non-buffered MQTT messages.
 // Non-blocking: returns false immediately if the queue is full.
 // -----------------------------------------------------------------------------
 static bool mqttEnqueue(const char* topic, const char* payload,
@@ -172,6 +176,28 @@ static bool mqttEnqueue(const char* topic, const char* payload,
     strlcpy(msg.payload, payload, sizeof(msg.payload));
     msg.retained = retained;
     return xQueueSend(g_publishQueue, &msg, 0) == pdTRUE;
+}
+
+static bool mqttEnqueueTelemetry(const TelemetryRecord& rec,
+                                 const char* payload) {
+    bool expected = false;
+    if (!g_bufferRecordInFlight.compare_exchange_strong(expected, true)) {
+        return false;
+    }
+
+    MqttMessage msg{};
+    strlcpy(msg.topic,   MQTT_TOPIC_TELEMETRY, sizeof(msg.topic));
+    strlcpy(msg.payload, payload,              sizeof(msg.payload));
+    msg.retained = false;
+    msg.commit_buffer_record = true;
+    msg.boot_id = rec.boot_id;
+    msg.sequence_id = rec.sequence_id;
+
+    if (xQueueSend(g_publishQueue, &msg, 0) != pdTRUE) {
+        g_bufferRecordInFlight.store(false);
+        return false;
+    }
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -423,7 +449,26 @@ static void connectionTask(void* pvParams) {
         // Drain the publish queue — only while connected
         while (g_mqttManager.isConnected() &&
                xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE) {
-            if (!g_mqttManager.publish(msg.topic, msg.payload, msg.retained)) {
+            const bool published =
+                g_mqttManager.publish(msg.topic, msg.payload, msg.retained);
+
+            if (msg.commit_buffer_record) {
+                if (published) {
+                    TelemetryRecord head;
+                    if (g_buffer.peek(head) &&
+                        head.boot_id == msg.boot_id &&
+                        head.sequence_id == msg.sequence_id) {
+                        g_buffer.pop(head);
+                    } else {
+                        Serial.printf("[ConnTask] WARN — publish commit mismatch boot=%u seq=%u.\n",
+                                      msg.boot_id, msg.sequence_id);
+                    }
+                } else {
+                    Serial.printf("[ConnTask] WARN — publish failed for boot=%u seq=%u, will retry.\n",
+                                  msg.boot_id, msg.sequence_id);
+                }
+                g_bufferRecordInFlight.store(false);
+            } else if (!published) {
                 Serial.println("[ConnTask] WARN — publish failed mid-drain.");
             }
         }
@@ -762,9 +807,9 @@ static void filterTask(void* pvParams) {
 // telemetryTask — Core 0, Priority 3
 //
 // In NORMAL state only: peeks the oldest record from g_buffer, serialises it
-// to JSON, and enqueues it for connectionTask to publish. Only pops the record
-// after a successful enqueue — if the publish queue is full the record stays in
-// g_buffer and will be retried next tick.
+// to JSON, and enqueues it for connectionTask to publish. connectionTask owns
+// the final pop/commit after publish() succeeds; if publish fails, the record
+// stays in g_buffer and will be retried.
 //
 // In BUFFERING state: does nothing — records accumulate in PSRAM.
 // In SYNCING state: does nothing — syncTask owns the buffer exclusively to
@@ -780,11 +825,9 @@ static void telemetryTask(void* pvParams) {
             TelemetryRecord rec;
             if (g_buffer.peek(rec)) {
                 buildPayload(rec, payload, sizeof(payload));
-                if (mqttEnqueue(MQTT_TOPIC_TELEMETRY, payload)) {
-                    g_buffer.pop(rec);  // commit only after successful enqueue
-                } else {
-                    // Publish queue full — record stays in buffer, retry next tick
-                    Serial.println("[TelemetryTask] WARN — publish queue full, will retry.");
+                if (!mqttEnqueueTelemetry(rec, payload)) {
+                    // Queue full or one buffered record is already in flight.
+                    Serial.println("[TelemetryTask] WARN — telemetry publish busy, will retry.");
                 }
             }
         }
@@ -801,8 +844,8 @@ static void telemetryTask(void* pvParams) {
 // when the state transitions BUFFERING → SYNCING.
 //
 // Drains g_buffer in batches of SYNC_BATCH_SIZE with SYNC_BATCH_DELAY_MS
-// between batches to avoid flooding the MQTT broker. Uses the same
-// peek/enqueue/pop pattern as telemetryTask.
+// between batches to avoid flooding the MQTT broker. Records are only removed
+// by connectionTask after publish() succeeds.
 //
 // When the buffer is empty, transitions SYNCING → NORMAL.
 // If the connection drops mid-drain, exits the inner loop; the outer loop
@@ -833,11 +876,9 @@ static void syncTask(void* pvParams) {
                 TelemetryRecord rec;
                 if (g_buffer.peek(rec)) {
                     buildPayload(rec, payload, sizeof(payload));
-                    if (mqttEnqueue(MQTT_TOPIC_TELEMETRY, payload)) {
-                        g_buffer.pop(rec);
-                    } else {
-                        // Publish queue full — back off and retry this batch
-                        Serial.println("[SyncTask] WARN — publish queue full, backing off.");
+                    if (!mqttEnqueueTelemetry(rec, payload)) {
+                        // Queue full or one buffered record is already in flight.
+                        Serial.println("[SyncTask] WARN — telemetry publish busy, backing off.");
                         break;
                     }
                 }

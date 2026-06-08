@@ -70,10 +70,10 @@ The firmware runs six FreeRTOS tasks across two cores:
 | `sensorTask` | 1 | 5 | 100Hz MPU-6050 sampling via `vTaskDelayUntil` |
 | `filterTask` | 1 | 5 | 6× Kalman filters, rolling RMS, anomaly detection |
 | `connectionTask` | 0 | 4 | Sole MQTT socket owner, drains publish queue |
-| `telemetryTask` | 0 | 3 | Pops buffer, publishes at 2Hz |
-| `syncTask` | 0 | 3 | Burst-drains PSRAM buffer on reconnect |
+| `telemetryTask` | 0 | 3 | Enqueues oldest buffered telemetry at 2Hz |
+| `syncTask` | 0 | 3 | Drains PSRAM buffer on reconnect |
 
-**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 48 bytes ≈ 2.4MB) during WiFi outages. On reconnect, `syncTask` drains them in batches of 20 with 100ms inter-batch delay. MQTT publishes use QoS 0 (PubSubClient default).
+**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 48 bytes ≈ 2.4MB) during WiFi outages. The current shortcut commits buffered records after `connectionTask` successfully calls `publish()`, not when records are merely enqueued. MQTT still uses QoS 0 style publish behavior, so this is improved local correctness but not end-to-end guaranteed delivery. See [`docs/store-and-forward-status.md`](docs/store-and-forward-status.md).
 
 **State machine:** `NodeState` (NORMAL → BUFFERING → SYNCING) is a single `std::atomic<NodeState>` — no scattered boolean flags.
 

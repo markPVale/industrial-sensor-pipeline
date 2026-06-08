@@ -41,10 +41,10 @@ graph LR
 ## Store-and-Forward State Machine
 
 Minimises data loss through network partitions — records buffer in PSRAM during
-outages and drain on reconnect. Not end-to-end guaranteed delivery: QoS 0 publish
-and a small in-memory queue between the buffer and the MQTT socket mean a
-a connection drop mid-drain can lose queued/in-flight records. All state is a
-single `std::atomic<NodeState>` — no scattered boolean flags.
+outages and drain on reconnect. Not end-to-end guaranteed delivery: MQTT publish
+is still QoS 0 style, so `publish() == true` is not broker or InfluxDB
+acknowledgement. See [`store-and-forward-status.md`](store-and-forward-status.md)
+for the current shortcut fix, limitations, and validation plan.
 
 ```mermaid
 stateDiagram-v2
@@ -55,7 +55,7 @@ stateDiagram-v2
 
     NORMAL : NORMAL\nReal-time 2Hz publish via MQTT
     BUFFERING : BUFFERING\nRecords written to PSRAM\n(up to 50,000 × 48 bytes ≈ 2.4 MB)
-    SYNCING : SYNCING\nLive stream resumes\nsyncTask burst-drains buffer\nin batches of 20
+    SYNCING : SYNCING\nBuffered records drain\none in-flight record at a time
 
     SYNCING --> NORMAL : buffer empty
     SYNCING --> BUFFERING : disconnect during drain

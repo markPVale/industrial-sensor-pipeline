@@ -72,7 +72,7 @@ ESP32-S3 (MQTT disconnect detected)
   → Telemetry records written to PSRAM circular buffer
   → (reconnect)
   → STATE: BUFFERING → SYNCING
-  → Real-time stream resumes + historical burst to gateway
+  → Buffered records drain to gateway
   → STATE: SYNCING → NORMAL
 ```
 
@@ -91,7 +91,13 @@ The ESP32 runs a multi-tasking scheduler to ensure safety events cannot be block
 A state machine governs telemetry behavior during failure:
 - **NORMAL:** Real-time streaming via MQTT QoS 0.
 - **BUFFERING:** On disconnect, telemetry records are written to a **Circular Buffer in PSRAM**.
-- **SYNCING:** On reconnect, the system prioritizes real-time alerts while "bursting" historical data in rate-limited batches to the gateway.
+- **SYNCING:** On reconnect, buffered records drain in order. The current
+  shortcut allows one buffered telemetry record in flight at a time and commits
+  the record only after `connectionTask` successfully calls `publish()`.
+
+This is improved local correctness, not guaranteed end-to-end delivery. MQTT is
+still QoS 0 style; `publish()` success is not broker ACK or InfluxDB
+persistence ACK. See `docs/store-and-forward-status.md`.
 
 **Data Record Schema:**
 ```cpp
