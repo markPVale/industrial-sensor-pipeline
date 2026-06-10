@@ -1,6 +1,6 @@
 # Store-and-Forward Status
 
-Last updated: 2026-06-08
+Last updated: 2026-06-09
 
 ## Current Status
 
@@ -66,26 +66,69 @@ Build status:
 pio run: SUCCESS
 ```
 
+## App-Level ACK Implemented
+
+The firmware and bridge now include an app-level acknowledgement path.
+
+ACK topic:
+
+```text
+sensor/node01/ack
+```
+
+Bridge behavior:
+
+```text
+1. Receive telemetry or fault record.
+2. Write the record synchronously to InfluxDB.
+3. After the write succeeds, publish:
+   {"boot":<boot_id>,"seq":<sequence_id>}
+   to sensor/node01/ack at QoS 1.
+```
+
+Firmware behavior:
+
+```text
+1. Subscribe to sensor/node01/ack at QoS 1 after each MQTT connect.
+2. Send one buffered record at a time.
+3. Keep the record in PSRAM after publish().
+4. Pop the buffer only after a matching ACK arrives.
+5. If no ACK arrives within MQTT_ACK_TIMEOUT_MS, clear in-flight state and
+   retry the same buffer head.
+6. On disconnect, clear in-flight state and retry after reconnect.
+```
+
+Normal telemetry and sensor fault records are both ACKed because they share the
+same `boot_id + sequence_id` stream. E-Stop event messages are not part of the
+telemetry buffer and are not covered by this ACK path.
+
+Implementation status:
+
+```text
+python3 -m py_compile gateway/bridge/mqtt_to_influx.py gateway/bridge/integrity_check.py: PASS
+pio run: SUCCESS
+```
+
 ## Important Limitations
 
-This is not true guaranteed delivery.
+This is not true guaranteed delivery until hardware validation passes.
 
-Current MQTT behavior is still QoS 0 style:
+The firmware publish leg still uses QoS 0 style behavior:
 
 ```text
 publish() == true
 ```
 
-means the local MQTT client accepted the publish attempt. It does not prove:
+means the local MQTT client accepted the publish attempt. The new app-level ACK
+path adds a stronger commit point:
 
 ```text
-broker acknowledged the record
-bridge wrote it to InfluxDB
-Grafana/MCP can query it later
+bridge wrote the record to InfluxDB
+bridge published ACK
+firmware received matching ACK
 ```
 
-The shortcut fixes the obvious "pop on enqueue" loss path, but it is not a
-replacement for acknowledgement-based delivery.
+If the ACK is dropped, firmware retries after `MQTT_ACK_TIMEOUT_MS`.
 
 ## Throughput Tradeoff
 
@@ -115,52 +158,72 @@ At 2 Hz sampling, a short outage should still catch up quickly:
 
 Longer outages will visibly take longer to drain.
 
-## Validation Needed
+## Validation Result — 2026-06-09
 
-Before claiming telemetry continuity in a demo:
+Controlled outage test run after flashing the shortcut fix.
 
-```text
-1. Flash the updated firmware.
-2. Start Pi gateway stack.
-3. Start mqtt_to_influx.py bridge.
-4. Confirm live telemetry in Grafana.
-5. Stop Mosquitto for 5-10 seconds.
-6. Restart Mosquitto.
-7. Wait for SYNCING drain to complete.
-8. Run integrity_check.py --minutes 5.
-9. Require sequence integrity PASS and data fidelity PASS.
-```
-
-If sequence integrity fails, do not claim continuity. Use the failure to show
-that the integrity checker detects delivery gaps.
-
-## Next Engineering Options
-
-Near-term cleanup:
+Baseline (pre-outage):
 
 ```text
-Update syncTask comments/loop structure so SYNC_BATCH_SIZE no longer implies
-20 records can be drained per cycle while the single in-flight guard is active.
+integrity_check.py --minutes 2: all checks PASS
 ```
 
-Longer-term reliability options:
+Outage procedure:
+
+```text
+- Stopped Mosquitto
+- Restarted Mosquitto
+- ESP32 serial confirmed: BUFFERING → reconnect → SYNCING → ~60 records drained → NORMAL
+```
+
+Post-outage result:
+
+```text
+integrity_check.py --minutes 5: FAIL
+  seq 623 -> 628  (~4 missing records, 2500ms timestamp gap)
+```
+
+Comparison:
+
+```text
+Before shortcut fix:  ~63 records lost
+After shortcut fix:   ~4 records lost
+```
+
+Conclusion: the shortcut fix measurably reduces loss but does not eliminate
+it. The remaining gap is consistent with QoS 0 semantics — `publish()` returned
+true for those records but they did not reach InfluxDB. The likely failure points
+are the TCP/broker boundary or the broker-to-bridge leg (bridge subscribes at
+QoS 0 with clean_session=True and may not have resubscribed before the drain
+messages were published).
+
+Do not claim "no data loss" or "continuity preserved" through broker outage
+with the current firmware. Use the integrity checker as a live demo tool to
+show the gap exists and to verify when a stronger fix closes it.
+
+## Remaining Engineering Options
 
 ```text
 Option A: MQTT QoS 1 + PUBACK tracking
-  - Requires MQTT client support for QoS 1 acknowledgements.
+  - Requires replacing PubSubClient (does not support QoS 1 publish acks).
   - Pop from PSRAM only after broker PUBACK.
-  - Needs in-flight record tracking and duplicate handling.
+  - Needs in-flight record tracking and duplicate handling downstream.
+  - Only guarantees broker custody, not InfluxDB persistence.
+  - LOE: ~7-12 days (medium-high risk — client library swap).
 
 Option B: App-level acknowledgement
-  - Bridge sends an ACK only after writing to InfluxDB.
-  - Proves the persistence point we actually care about.
-  - Avoids replacing the MQTT client but requires an ACK topic/protocol.
+  - Implemented in firmware and bridge.
+  - Needs hardware outage validation.
 ```
 
 Current recommendation:
 
 ```text
-Validate the shortcut fix first.
-Then decide between MQTT QoS 1 and app-level ACK based on the test result and
-desired reliability guarantee.
+Flash and validate the app-level ACK implementation on hardware.
+Acceptance gate:
+  - Baseline integrity PASS.
+  - Controlled Mosquitto outage.
+  - Reconnect and drain.
+  - integrity_check.py sequence integrity PASS.
+  - data fidelity PASS.
 ```

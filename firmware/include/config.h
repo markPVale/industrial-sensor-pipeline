@@ -72,7 +72,8 @@
 // One record per interval — prevents flooding the PSRAM buffer and MQTT.
 #define SENSOR_FAULT_EMIT_INTERVAL_MS   5000
 
-// Sync burst parameters — records per batch and inter-batch delay.
+// Sync drain delay. The current app-level ACK path drains one buffered record
+// per cycle; SYNC_BATCH_SIZE is reserved for a future multi-in-flight design.
 #define SYNC_BATCH_SIZE       20
 #define SYNC_BATCH_DELAY_MS   100
 
@@ -103,7 +104,9 @@
 #define MQTT_CLIENT_ID        "sensor-node01"
 #define MQTT_TOPIC_TELEMETRY  "sensor/node01/telemetry"
 #define MQTT_TOPIC_ESTOP      "sensor/node01/estop"
+#define MQTT_TOPIC_ACK        "sensor/node01/ack"
 #define MQTT_KEEPALIVE_S      15    // PubSubClient keepalive interval in seconds
+#define MQTT_ACK_TIMEOUT_MS   3000  // Retry buffered head if bridge ACK is not received
 
 // Outbound publish queue: MqttMessage items enqueued by tasks and drained by
 // connectionTask. 40 slots × ~400 bytes each ≈ 16 KB.

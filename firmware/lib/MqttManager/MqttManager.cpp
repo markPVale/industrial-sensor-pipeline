@@ -26,6 +26,13 @@ void MqttManager::begin(const char* ssid,
 
     _mqttClient.setServer(_brokerIp, _port);
     _mqttClient.setKeepAlive(keepaliveSecs);
+    _mqttClient.setCallback([this](char* topic,
+                                   uint8_t* payload,
+                                   unsigned int length) {
+        if (_onMessage) {
+            _onMessage(topic, payload, length);
+        }
+    });
 }
 
 // =============================================================================
@@ -95,6 +102,16 @@ bool MqttManager::publish(const char* topic, const char* payload, bool retained)
         return false;
     }
     return _mqttClient.publish(topic, payload, retained);
+}
+
+// =============================================================================
+// subscribe()
+// =============================================================================
+bool MqttManager::subscribe(const char* topic, uint8_t qos) {
+    if (!_mqttClient.connected()) {
+        return false;
+    }
+    return _mqttClient.subscribe(topic, qos);
 }
 
 // =============================================================================

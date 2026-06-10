@@ -37,6 +37,9 @@
 class MqttManager {
 public:
     using Callback = std::function<void()>;
+    using MessageCallback = std::function<void(char* topic,
+                                               uint8_t* payload,
+                                               unsigned int length)>;
 
     // Backoff parameters (milliseconds)
     static constexpr uint32_t kBackoffInitialMs = 1000;
@@ -53,6 +56,7 @@ public:
     // Register event callbacks. Call before begin().
     void onConnect(Callback cb)    { _onConnect = cb; }
     void onDisconnect(Callback cb) { _onDisconnect = cb; }
+    void onMessage(MessageCallback cb) { _onMessage = cb; }
 
     // Store credentials and configure PubSubClient. Does NOT attempt to
     // connect — the first connection happens inside loop().
@@ -78,6 +82,10 @@ public:
     // MUST be called from the same task as loop().
     bool publish(const char* topic, const char* payload, bool retained = false);
 
+    // Subscribe to a topic at the requested QoS. Returns false if not connected.
+    // MUST be called from the same task as loop().
+    bool subscribe(const char* topic, uint8_t qos = 0);
+
     bool isConnected() { return _mqttClient.connected(); }
 
 private:
@@ -98,6 +106,7 @@ private:
 
     Callback _onConnect    = nullptr;
     Callback _onDisconnect = nullptr;
+    MessageCallback _onMessage = nullptr;
 
     // Disconnect-event tracking — ensures callbacks fire exactly once per event
     bool     _wasConnected  = false;

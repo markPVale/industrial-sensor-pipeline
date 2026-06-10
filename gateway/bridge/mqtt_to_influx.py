@@ -59,7 +59,20 @@ influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_OR
 write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
 
-def write_sensor_fault(node_id: str, payload: dict) -> None:
+def publish_ack(client: mqtt.Client, node_id: str, payload: dict) -> None:
+    """ACK a telemetry/fault record after it has been written to InfluxDB."""
+    ack = json.dumps(
+        {"boot": int(payload.get("boot", 0)), "seq": int(payload.get("seq", 0))},
+        separators=(",", ":"),
+    )
+    info = client.publish(f"sensor/{node_id}/ack", ack, qos=1)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(f"failed to publish ACK rc={info.rc}")
+    log.debug("ACK published for node %s boot=%s seq=%s",
+              node_id, payload.get("boot", 0), payload.get("seq", 0))
+
+
+def write_sensor_fault(client: mqtt.Client, node_id: str, payload: dict) -> None:
     """Write a sensor fault record (I2C dropout) to the sensor_faults measurement."""
     # whoami_raw: firmware encodes the raw WHO_AM_I register byte in ax during
     # fault records (0xFF = bus not responding). Store under a clear name.
@@ -76,10 +89,11 @@ def write_sensor_fault(node_id: str, payload: dict) -> None:
     if ts > 1_000_000_000_000:
         point = point.time(ts, WritePrecision.MS)
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    publish_ack(client, node_id, payload)
     log.warning("Sensor fault written for node %s seq=%d", node_id, payload.get("seq", -1))
 
 
-def write_telemetry(node_id: str, payload: dict) -> None:
+def write_telemetry(client: mqtt.Client, node_id: str, payload: dict) -> None:
     """
     Write a telemetry record to InfluxDB.
 
@@ -89,7 +103,7 @@ def write_telemetry(node_id: str, payload: dict) -> None:
     Records with STATUS_SENSOR_FAULT are routed to sensor_faults instead.
     """
     if int(payload.get("flags", 0)) & FAULT_FLAGS_MASK:
-        write_sensor_fault(node_id, payload)
+        write_sensor_fault(client, node_id, payload)
         return
 
     ax = float(payload.get("ax", 0.0))
@@ -127,6 +141,7 @@ def write_telemetry(node_id: str, payload: dict) -> None:
         point = point.time(ts, WritePrecision.MS)
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    publish_ack(client, node_id, payload)
     log.debug("Written telemetry for %s: wrms=%.4f m/s² flags=0x%02x seq=%d",
               node_id, window_rms, flags, payload.get("seq", -1))
 
@@ -176,13 +191,13 @@ def on_message(client, userdata, msg):
 
     try:
         if msg_type == "telemetry":
-            write_telemetry(node_id, payload)
+            write_telemetry(client, node_id, payload)
         elif msg_type == "estop":
             write_estop(node_id, payload)
         else:
             log.debug("Unhandled message type '%s' on topic %s", msg_type, msg.topic)
     except Exception as e:
-        log.error("Failed to write to InfluxDB: %s", e)
+        log.error("Failed to process MQTT message on %s: %s", msg.topic, e)
 
 
 def on_disconnect(client, userdata, rc):

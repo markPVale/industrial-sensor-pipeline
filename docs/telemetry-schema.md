@@ -92,6 +92,28 @@ E-Stop events use `ts`, matching telemetry payload timestamps.
 
 ---
 
+## Telemetry ACK Message
+
+Published by the bridge after a telemetry or sensor-fault record has been
+written successfully to InfluxDB.
+
+**MQTT topic:** `sensor/<node_id>/ack`
+**QoS:** 1 from bridge to firmware
+
+```json
+{
+  "boot": 1,
+  "seq": 42
+}
+```
+
+The firmware keeps the matching record in its PSRAM buffer until this ACK
+arrives. If the ACK does not arrive before `MQTT_ACK_TIMEOUT_MS`, the firmware
+retries the same buffer head. E-Stop event messages are not part of the telemetry
+buffer and are not ACKed by this path.
+
+---
+
 ## InfluxDB Schema
 
 **Measurement:** `vibration`

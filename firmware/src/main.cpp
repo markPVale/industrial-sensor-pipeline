@@ -121,6 +121,7 @@ static EventGroupHandle_t    g_mqttEvents     = nullptr;
 static constexpr EventBits_t kBitReconnect    = BIT0;  // connectionTask -> syncTask
 static constexpr EventBits_t kBitConnected    = BIT1;  // onConnect    -> connectionTask
 static constexpr EventBits_t kBitDisconnected = BIT2;  // onDisconnect -> connectionTask
+static constexpr EventBits_t kBitAckReceived  = BIT3;  // onMessage    -> connectionTask
 
 // -----------------------------------------------------------------------------
 // Safety interlock
@@ -164,6 +165,11 @@ static MqttManager      g_mqttManager;
 static QueueHandle_t    g_sensorQueue  = nullptr;
 static QueueHandle_t    g_publishQueue = nullptr;
 static std::atomic<bool> g_bufferRecordInFlight{false};
+static std::atomic<uint32_t> g_inFlightBoot{0};
+static std::atomic<uint32_t> g_inFlightSeq{0};
+static std::atomic<uint32_t> g_inFlightSentAtMs{0};
+static std::atomic<uint32_t> g_ackBoot{0};
+static std::atomic<uint32_t> g_ackSeq{0};
 
 // -----------------------------------------------------------------------------
 // mqttEnqueue() — thread-safe helper used for non-buffered MQTT messages.
@@ -198,6 +204,43 @@ static bool mqttEnqueueTelemetry(const TelemetryRecord& rec,
         return false;
     }
     return true;
+}
+
+static bool parseAckPayload(const uint8_t* payload, unsigned int length,
+                            uint32_t& boot, uint32_t& seq) {
+    if (length >= MQTT_PAYLOAD_SIZE) return false;
+
+    char buf[MQTT_PAYLOAD_SIZE];
+    memcpy(buf, payload, length);
+    buf[length] = '\0';
+
+    unsigned long parsedBoot = 0;
+    unsigned long parsedSeq = 0;
+    if (sscanf(buf, "{\"boot\":%lu,\"seq\":%lu}", &parsedBoot, &parsedSeq) != 2) {
+        return false;
+    }
+
+    boot = static_cast<uint32_t>(parsedBoot);
+    seq = static_cast<uint32_t>(parsedSeq);
+    return true;
+}
+
+static void handleMqttMessage(char* topic, uint8_t* payload,
+                              unsigned int length) {
+    if (strcmp(topic, MQTT_TOPIC_ACK) != 0) {
+        return;
+    }
+
+    // Safe in PubSubClient callback: parse-only, no Serial, heap, or blocking I/O.
+    uint32_t boot = 0;
+    uint32_t seq = 0;
+    if (!parseAckPayload(payload, length, boot, seq)) {
+        return;
+    }
+
+    g_ackBoot.store(boot);
+    g_ackSeq.store(seq);
+    xEventGroupSetBits(g_mqttEvents, kBitAckReceived);
 }
 
 // -----------------------------------------------------------------------------
@@ -337,6 +380,8 @@ void setup() {
         xEventGroupSetBits(g_mqttEvents, kBitDisconnected);
     });
 
+    g_mqttManager.onMessage(handleMqttMessage);
+
     g_mqttManager.begin(WIFI_SSID, WIFI_PASSWORD,
                          MQTT_BROKER_IP, MQTT_PORT,
                          MQTT_CLIENT_ID, MQTT_KEEPALIVE_S);
@@ -430,10 +475,19 @@ static void connectionTask(void* pvParams) {
 
         if (bits & kBitDisconnected) {
             xEventGroupClearBits(g_mqttEvents, kBitDisconnected | kBitConnected);
+            g_bufferRecordInFlight.store(false);
+            g_inFlightSentAtMs.store(0);
             setState(NodeState::BUFFERING);
             Serial.println("[State] -> BUFFERING");
         } else if (bits & kBitConnected) {
             xEventGroupClearBits(g_mqttEvents, kBitConnected);
+            if (g_mqttManager.subscribe(MQTT_TOPIC_ACK, 1)) {
+                Serial.printf("[MQTT] Subscribed to ACK topic %s (QoS 1).\n",
+                              MQTT_TOPIC_ACK);
+            } else {
+                Serial.printf("[MQTT] WARN — ACK subscribe failed for %s.\n",
+                              MQTT_TOPIC_ACK);
+            }
             const NodeState prev = getState();
             if (prev == NodeState::BUFFERING) {
                 setState(NodeState::SYNCING);
@@ -446,6 +500,44 @@ static void connectionTask(void* pvParams) {
             }
         }
 
+        if (bits & kBitAckReceived) {
+            xEventGroupClearBits(g_mqttEvents, kBitAckReceived);
+            const uint32_t ackBoot = g_ackBoot.load();
+            const uint32_t ackSeq = g_ackSeq.load();
+            const uint32_t inFlightBoot = g_inFlightBoot.load();
+            const uint32_t inFlightSeq = g_inFlightSeq.load();
+
+            if (g_bufferRecordInFlight.load() &&
+                ackBoot == inFlightBoot &&
+                ackSeq == inFlightSeq) {
+                TelemetryRecord head;
+                if (g_buffer.peek(head) &&
+                    head.boot_id == ackBoot &&
+                    head.sequence_id == ackSeq) {
+                    g_buffer.pop(head);
+                    g_bufferRecordInFlight.store(false);
+                    g_inFlightSentAtMs.store(0);
+                } else {
+                    Serial.printf("[ConnTask] WARN — ACK commit mismatch boot=%u seq=%u.\n",
+                                  ackBoot, ackSeq);
+                    g_bufferRecordInFlight.store(false);
+                    g_inFlightSentAtMs.store(0);
+                }
+            } else {
+                Serial.printf("[ConnTask] WARN — stale ACK boot=%u seq=%u.\n",
+                              ackBoot, ackSeq);
+            }
+        }
+
+        const uint32_t sentAt = g_inFlightSentAtMs.load();
+        if (g_bufferRecordInFlight.load() && sentAt != 0 &&
+            millis() - sentAt > MQTT_ACK_TIMEOUT_MS) {
+            Serial.printf("[ConnTask] WARN — ACK timeout boot=%u seq=%u, retrying.\n",
+                          g_inFlightBoot.load(), g_inFlightSeq.load());
+            g_bufferRecordInFlight.store(false);
+            g_inFlightSentAtMs.store(0);
+        }
+
         // Drain the publish queue — only while connected
         while (g_mqttManager.isConnected() &&
                xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE) {
@@ -454,20 +546,15 @@ static void connectionTask(void* pvParams) {
 
             if (msg.commit_buffer_record) {
                 if (published) {
-                    TelemetryRecord head;
-                    if (g_buffer.peek(head) &&
-                        head.boot_id == msg.boot_id &&
-                        head.sequence_id == msg.sequence_id) {
-                        g_buffer.pop(head);
-                    } else {
-                        Serial.printf("[ConnTask] WARN — publish commit mismatch boot=%u seq=%u.\n",
-                                      msg.boot_id, msg.sequence_id);
-                    }
+                    g_inFlightBoot.store(msg.boot_id);
+                    g_inFlightSeq.store(msg.sequence_id);
+                    g_inFlightSentAtMs.store(millis());
                 } else {
                     Serial.printf("[ConnTask] WARN — publish failed for boot=%u seq=%u, will retry.\n",
                                   msg.boot_id, msg.sequence_id);
+                    g_bufferRecordInFlight.store(false);
+                    g_inFlightSentAtMs.store(0);
                 }
-                g_bufferRecordInFlight.store(false);
             } else if (!published) {
                 Serial.println("[ConnTask] WARN — publish failed mid-drain.");
             }
@@ -807,9 +894,9 @@ static void filterTask(void* pvParams) {
 // telemetryTask — Core 0, Priority 3
 //
 // In NORMAL state only: peeks the oldest record from g_buffer, serialises it
-// to JSON, and enqueues it for connectionTask to publish. connectionTask owns
-// the final pop/commit after publish() succeeds; if publish fails, the record
-// stays in g_buffer and will be retried.
+// to JSON, and enqueues it for connectionTask to publish. The record stays in
+// g_buffer until the bridge ACKs a successful InfluxDB write. If publish fails
+// or the ACK times out, the same buffer head is retried.
 //
 // In BUFFERING state: does nothing — records accumulate in PSRAM.
 // In SYNCING state: does nothing — syncTask owns the buffer exclusively to
@@ -843,9 +930,8 @@ static void telemetryTask(void* pvParams) {
 // Waits for the kBitReconnect EventGroup bit, set by the onConnect callback
 // when the state transitions BUFFERING → SYNCING.
 //
-// Drains g_buffer in batches of SYNC_BATCH_SIZE with SYNC_BATCH_DELAY_MS
-// between batches to avoid flooding the MQTT broker. Records are only removed
-// by connectionTask after publish() succeeds.
+// Drains g_buffer one ACK-gated record at a time. Records are only removed by
+// connectionTask after the bridge ACKs a successful InfluxDB write.
 //
 // When the buffer is empty, transitions SYNCING → NORMAL.
 // If the connection drops mid-drain, exits the inner loop; the outer loop
@@ -864,7 +950,8 @@ static void syncTask(void* pvParams) {
         Serial.printf("[SyncTask] Drain starting — %u records buffered.\n",
                       g_buffer.available());
 
-        // Drain in rate-limited batches
+        // Drain in rate-limited single-record attempts. The ACK path controls
+        // when the next buffered record may be sent.
         while (!g_buffer.isEmpty()) {
             if (getState() != NodeState::SYNCING) {
                 // Connection dropped again mid-drain — stop here
@@ -872,14 +959,13 @@ static void syncTask(void* pvParams) {
                 break;
             }
 
-            for (int i = 0; i < SYNC_BATCH_SIZE && !g_buffer.isEmpty(); i++) {
+            if (!g_bufferRecordInFlight.load()) {
                 TelemetryRecord rec;
                 if (g_buffer.peek(rec)) {
                     buildPayload(rec, payload, sizeof(payload));
                     if (!mqttEnqueueTelemetry(rec, payload)) {
-                        // Queue full or one buffered record is already in flight.
+                        // Queue full or an in-flight race; retry next cycle.
                         Serial.println("[SyncTask] WARN — telemetry publish busy, backing off.");
-                        break;
                     }
                 }
             }
