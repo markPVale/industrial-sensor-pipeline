@@ -1,8 +1,27 @@
 # Industrial Sensor Pipeline
 
+[![CI](https://github.com/markPVale/industrial-sensor-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/markPVale/industrial-sensor-pipeline/actions/workflows/ci.yml)
+
 End-to-end industrial vibration monitoring system: ESP32-S3 firmware &rarr; MQTT &rarr; InfluxDB &rarr; Grafana, with ACK-gated store-and-forward delivery, graduated fault recovery, and an AI query layer via Model Context Protocol.
 
 An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vibration anomalies, and streams telemetry to a Raspberry Pi gateway with safety interlock support. A Model Context Protocol server on the Pi lets Claude Code query live sensor data in plain English — _"Is my sensor healthy? Were there any anomalies in the last hour?"_
+
+## Validation Results
+
+Hardware validation on Raspberry Pi 5 + ESP32-S3:
+
+- Baseline run: 234 records, 0 sequence gaps per `integrity_check.py`, timestamp monotonicity PASS, data fidelity PASS.
+- Controlled Mosquitto broker outage/restart: 570 records, 0 sequence gaps per `integrity_check.py`, timestamp monotonicity PASS, data fidelity PASS.
+- ACK path confirmed over MQTT: each telemetry record received a matching `sensor/node01/ack` after the bridge wrote it to InfluxDB.
+- MCP tools validated against live InfluxDB data: latest telemetry, health summary, and recent anomalies.
+
+## Why This Matters
+
+I started this expecting the hard part to be the dashboards. It was not. The hard part was that the sensor lies and the network drops, and almost nothing in a typical tutorial pipeline accounts for either.
+
+A real MPU-6050 does not always fail loudly. Yank the SDA line mid-transaction and it can hang in a state that survives a firmware restart while the sensor remains powered, then quietly returns zeros that look like a machine sitting still. WiFi drops for ninety seconds and a naive pipeline loses those ninety seconds forever. Most monitoring projects assume the broker is always up and the sensor is always honest. Run one in the field for an afternoon and both assumptions break.
+
+So this project is built backwards from the failures. Buffer when the link dies. Refuse to drop a record until the gateway confirms it landed in the database. Tell the difference between a dead sensor and a quiet one. That reliability layer between a physical sensor and a dataset you would actually trust is the boring problem that has to be solved before "AI on real-world data" means anything, and it is the part I'm most interested in.
 
 ## Architecture
 
@@ -224,3 +243,24 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 | Grafana | 3001 |
 | Next.js dashboard | 3000 |
 | MCP server (Pi) | 3002 |
+
+## Scope and Limitations
+
+- Single sensor node today; MQTT topics, client ID, and ACK topic are currently configured for `node01`.
+- Telemetry publish uses PubSubClient QoS 0; persistence is protected by an app-level ACK after the bridge writes to InfluxDB.
+- Store-and-forward capacity is finite: 50,000 records in PSRAM. If the outage lasts longer than the buffer budget, oldest records can be evicted.
+- E-Stop events are published separately and are not part of the ACK-gated telemetry buffer.
+- The MCP server is a stateless query layer over InfluxDB, not a streaming subscriber.
+- No OTA updates, fleet provisioning, or device identity management yet.
+
+## Roadmap
+
+- Multi-node fleet support with dynamic node IDs, per-node ACK topics, and fleet dashboards.
+- OTA firmware updates and gateway-managed configuration.
+- Calibration drift tracking and fleet-level sensor health reports.
+- On-device anomaly model or edge ML path.
+
+## Author
+
+Built by Mark Vale — full-stack engineer working at the hardware, distributed systems, and AI tooling boundary.
+LinkedIn: <https://www.linkedin.com/in/markvalestudio/>
