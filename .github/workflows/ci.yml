@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-and-mcp:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python bridge scripts
+        run: |
+          python -m py_compile gateway/bridge/mqtt_to_influx.py gateway/bridge/integrity_check.py gateway/bridge/mock_esp32.py
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: mcp-server/package-lock.json
+
+      - name: Build MCP server
+        working-directory: mcp-server
+        run: |
+          npm ci
+          npm run build
+
+  firmware-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Build ESP32-S3 firmware
+        working-directory: firmware
+        run: |
+          cp secrets.ini.template secrets.ini
+          pio run
