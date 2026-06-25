@@ -1,28 +1,111 @@
 # Industrial Sensor Pipeline
 
-An end-to-end industrial vibration monitoring system built on an ESP32-S3 microcontroller, Raspberry Pi gateway, and InfluxDB time-series database. Real IMU data flows from hardware to a live Grafana dashboard and is queryable by Claude Code via an MCP server.
+End-to-end industrial vibration monitoring system: ESP32-S3 firmware &rarr; MQTT &rarr; InfluxDB &rarr; Grafana, with ACK-gated store-and-forward delivery, graduated fault recovery, and an AI query layer via Model Context Protocol.
+
+An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vibration anomalies, and streams telemetry to a Raspberry Pi gateway with safety interlock support. A Model Context Protocol server on the Pi lets Claude Code query live sensor data in plain English — _"Is my sensor healthy? Were there any anomalies in the last hour?"_
 
 ## Architecture
 
-See [`docs/architecture.md`](docs/architecture.md) for full system, store-and-forward state machine, and I2C fault escalation diagrams.
+```mermaid
+graph LR
+    subgraph hw["ESP32-S3 N16R8"]
+        mpu["MPU-6050\n100Hz IMU"]
+        ldr["Safety Interlock\n(GPIO ISR)"]
+        fw["FreeRTOS\n6 Tasks"]
+        psram["PSRAM Buffer\n50,000 records"]
+        mpu --> fw
+        ldr -->|"falling-edge ISR"| fw
+        fw <--> psram
+    end
 
+    subgraph pi["Raspberry Pi 5 Gateway (Docker)"]
+        mosquitto["Mosquitto\nMQTT Broker\n:1883 / :9001 WS"]
+        bridge["Python Bridge\nmqtt_to_influx.py"]
+        influx["InfluxDB 2.7\n:8086"]
+        grafana["Grafana\n:3001"]
+        mcp["MCP Server\nNode.js :3002"]
+    end
+
+    subgraph clients["Clients"]
+        dashboard["Next.js Dashboard\n:3000"]
+        claude["Claude Code\nMCP Client"]
+    end
+
+    fw -->|"MQTT QoS 0\nWiFi"| mosquitto
+    mosquitto --> bridge
+    bridge --> influx
+    bridge -->|"ACK after\nInfluxDB write"| mosquitto
+    mosquitto -->|"ACK (QoS 1)"| fw
+    influx --> grafana
+    influx --> mcp
+    mosquitto -->|"WebSocket"| dashboard
+    mcp -->|"SSE / MCP Protocol"| claude
 ```
-ESP32-S3 N16R8
-  └── MPU-6050 (I2C, SDA=8, SCL=9)       100Hz sampling, 6-axis IMU
-  └── Photoresistor (GPIO 10)              Safety interlock ISR
-        │
-        │ MQTT over WiFi (QoS 0)
-        ▼
-Mosquitto Broker (Docker, :1883 / :9001 WS)
-        │
-        ▼
-Python Bridge (paho-mqtt → influxdb-client)
-        │
-        ▼
-InfluxDB 2.7 (Docker, :8086)  ──▶  Grafana (:3001)
-                               ──▶  Next.js Dashboard (:3000)
-                               ──▶  MCP Server (:3002)
+
+## Hard Problems Solved
+
+### Store-and-forward with app-level acknowledgements
+
+Records buffer in 8MB PSRAM (up to 50,000 &times; 48 bytes) during WiFi outages and drain on reconnect. The bridge ACKs each record _after_ writing it to InfluxDB, and the firmware only pops the buffer on a matching ACK — closing the gap between "MQTT accepted the publish" and "the data is actually persisted." Validated with controlled broker-outage tests and an end-to-end sequence integrity checker.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NORMAL : boot + MQTT connect
+    NORMAL --> BUFFERING : MQTT disconnect
+    BUFFERING --> SYNCING : MQTT reconnect
+    SYNCING --> NORMAL : buffer empty
+    SYNCING --> BUFFERING : disconnect during drain
+
+    NORMAL : Real-time 2Hz publish
+    BUFFERING : Records accumulate in PSRAM
+    SYNCING : Buffered records drain with ACK gating
 ```
+
+### I2C fault recovery under hostile conditions
+
+An SDA hot-unplug leaves the MPU-6050's I2C state machine stuck mid-transaction — a state that survives power-to-the-sensor. The firmware runs 9-pulse SCL clock recovery, `PWR_MGMT_1 DEVICE_RESET` on every boot, and a graduated fault escalation: 5 consecutive WHO_AM_I failures &rarr; `DEGRADED` (auto-reboot pending) &rarr; 3 bounded reboots &rarr; `UNAVAILABLE` (power-cycle required). Full in-session recovery on SDA reconnect. Hardware-validated.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Healthy : boot
+    Healthy --> Faulted : 5 consecutive WHO_AM_I failures
+    Faulted --> Healthy : sensor reconnected
+    Faulted --> Rebooting : 30s elapsed, reboots remaining
+    Rebooting --> Faulted : esp_restart()
+    Faulted --> Unavailable : reboots exhausted (3 max)
+    Unavailable --> Healthy : SDA reconnected
+```
+
+### Platform gotchas discovered and solved
+
+- **`RTC_DATA_ATTR` is unreliable on ESP32-S3 / Arduino-ESP32** — `esp_restart()` resets RTC slow memory, causing an infinite reboot loop. Replaced with NVS storage and an `esp_reset_reason()` guard.
+- **MQTT callbacks must stay minimal on ESP32-S3** — USB CDC and WiFi share interrupt resources. Callbacks only set event bits; all state transitions and Serial I/O happen in a dedicated task.
+- **`express.json()` silently breaks MCP SSE** — the middleware consumed POST bodies before the MCP handler could read them.
+
+## Firmware Design
+
+Six FreeRTOS tasks across two cores:
+
+| Task | Core | Priority | Role |
+|------|------|----------|------|
+| `safetyTask` | 0 | 6 | ISR handler — latches interlock, publishes E-Stop |
+| `sensorTask` | 1 | 5 | 100Hz MPU-6050 sampling via `vTaskDelayUntil` |
+| `filterTask` | 1 | 5 | 6&times; Kalman filters, rolling RMS, anomaly detection |
+| `connectionTask` | 0 | 4 | Sole MQTT socket owner, drains publish queue |
+| `telemetryTask` | 0 | 3 | Enqueues oldest buffered telemetry at 2Hz |
+| `syncTask` | 0 | 3 | Drains PSRAM buffer on reconnect |
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Firmware | C++, FreeRTOS, Arduino-ESP32, PlatformIO |
+| Transport | MQTT (PubSubClient) |
+| Gateway | Python 3.12, paho-mqtt, influxdb-client |
+| Storage | InfluxDB 2.7, Flux |
+| Visualization | Grafana, Next.js (MQTT WebSocket) |
+| AI interface | Node.js, TypeScript, Model Context Protocol SDK |
+| Infrastructure | Docker Compose, Raspberry Pi 5 |
 
 ## Hardware
 
@@ -31,7 +114,7 @@ InfluxDB 2.7 (Docker, :8086)  ──▶  Grafana (:3001)
 | MCU | ESP32-S3-DevKitC-1 N16R8 (16MB flash, 8MB OPI PSRAM) |
 | IMU | MPU-6050 at I2C address 0x68 |
 | Safety interlock | Photoresistor on GPIO 10, falling-edge ISR |
-| Gateway | Raspberry Pi (any model with WiFi/Ethernet) |
+| Gateway | Raspberry Pi 5 |
 
 ## Repository Structure
 
@@ -50,44 +133,24 @@ industrial-sensor-pipeline/
 │   ├── docker-compose.yml      # Mosquitto, InfluxDB 2.7, Grafana
 │   ├── config/mosquitto.conf
 │   └── bridge/
-│       ├── mqtt_to_influx.py   # MQTT → InfluxDB bridge
-│       ├── integrity_check.py  # End-to-end data integrity validator
+│       ├── mqtt_to_influx.py   # MQTT → InfluxDB bridge with ACK publishing
+│       ├── integrity_check.py  # End-to-end sequence integrity validator
 │       └── mock_esp32.py       # Simulated sensor node for local dev
 ├── dashboard/                  # Next.js live dashboard (MQTT WebSocket)
 ├── mcp-server/                 # MCP server — exposes sensor data to Claude Code
 └── docs/
-    ├── telemetry-schema.md
-    └── claude-notes/           # Architecture notes, status, state inventory
+    ├── architecture.md         # Mermaid system diagrams
+    ├── telemetry-schema.md     # MQTT payload and status flag reference
+    └── store-and-forward-status.md
 ```
-
-## Firmware Design
-
-The firmware runs six FreeRTOS tasks across two cores:
-
-| Task | Core | Priority | Role |
-|------|------|----------|------|
-| `safetyTask` | 0 | 6 | ISR handler — latches interlock, publishes estop |
-| `sensorTask` | 1 | 5 | 100Hz MPU-6050 sampling via `vTaskDelayUntil` |
-| `filterTask` | 1 | 5 | 6× Kalman filters, rolling RMS, anomaly detection |
-| `connectionTask` | 0 | 4 | Sole MQTT socket owner, drains publish queue |
-| `telemetryTask` | 0 | 3 | Enqueues oldest buffered telemetry at 2Hz |
-| `syncTask` | 0 | 3 | Drains PSRAM buffer on reconnect |
-
-**Store-and-forward:** Records accumulate in PSRAM (up to 50,000 × 48 bytes ≈ 2.4MB) during WiFi outages. The current shortcut commits buffered records after `connectionTask` successfully calls `publish()`, not when records are merely enqueued. MQTT still uses QoS 0 style publish behavior, so this is improved local correctness but not end-to-end guaranteed delivery. See [`docs/store-and-forward-status.md`](docs/store-and-forward-status.md).
-
-**State machine:** `NodeState` (NORMAL → BUFFERING → SYNCING) is a single `std::atomic<NodeState>` — no scattered boolean flags.
-
-**I2C fault recovery:** `sensorTask` probes the MPU-6050 via WHO_AM_I on every sample. After 5 consecutive failures it enters a fault state: periodic 9-pulse SCL bus recovery attempts every 3s, escalating to a full software reboot after 30s. Auto-reboots are capped at 3 per power-on session (tracked in NVS); after the third reboot the node transitions to `STATUS_SENSOR_UNAVAILABLE` and holds that state until SDA is reconnected or the node is power-cycled.
 
 ## Getting Started
 
 ### Gateway (Raspberry Pi)
 
 ```bash
-# Start the Docker stack
 cd gateway && docker compose up -d
 
-# Start the MQTT → InfluxDB bridge
 cd gateway/bridge
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -97,24 +160,21 @@ python3 mqtt_to_influx.py
 ### Firmware (ESP32-S3)
 
 ```bash
-# Copy secrets template and fill in WiFi credentials + broker IP
 cp firmware/secrets.ini.template firmware/secrets.ini
+# Fill in WiFi credentials + broker IP
 
-# Flash via PlatformIO
 cd firmware && pio run --target upload
 ```
 
-### MCP Server (Pi, network mode)
+### MCP Server
 
 ```bash
 cd mcp-server && npm install && npm run build
 TRANSPORT=sse MCP_PORT=3002 INFLUX_URL=http://localhost:8086 \
   INFLUX_TOKEN=dev-token-change-in-production \
   INFLUX_ORG=industrial INFLUX_BUCKET=sensors \
-  nohup node dist/index.js > ~/mcp-server.log 2>&1 &
+  node dist/index.js
 ```
-
-Verify: `curl -s http://sensor-gateway.local:3002/sse` — should return an SSE endpoint event.
 
 ### Integrity Check
 
@@ -134,24 +194,25 @@ Each record published to `sensor/<node_id>/telemetry`:
   "ts": 1714000000000,
   "ax": -0.88, "ay": 0.17, "az": 10.19,
   "gx": -0.07, "gy": -0.15, "gz": -0.05,
+  "wrms": 10.1750,
   "flags": 0
 }
 ```
 
-`wrms` is computed in firmware over the 50-sample filter window and written to InfluxDB as `window_rms`. `vibration_rms` remains a bridge-derived accel vector magnitude for compatibility. See `docs/telemetry-schema.md` for flag bit definitions.
+See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definitions.
 
 ## Status Flags
 
 | Flag | Value | Meaning |
 |------|-------|---------|
 | `STATUS_OK` | `0x00` | Normal sample |
-| `STATUS_ACCEL_CLIPPED` | `0x01` | Accelerometer hit ±8g range limit |
-| `STATUS_GYRO_CLIPPED` | `0x02` | Gyro hit ±500°/s range limit |
-| `STATUS_INTERLOCK_OPEN` | `0x04` | Safety interlock was open at sample time |
-| `STATUS_ANOMALY` | `0x08` | Vibration RMS exceeded threshold |
-| `STATUS_SENSOR_FAULT` | `0x10` | I2C dropout — WHO_AM_I probe failed (legacy) |
-| `STATUS_DEGRADED_REBOOT_REQUIRED` | `0x20` | I2C fault; auto-reboot pending (reboots remaining) |
-| `STATUS_SENSOR_UNAVAILABLE` | `0x40` | I2C fault; max reboots exhausted, power-cycle required |
+| `STATUS_ACCEL_CLIPPED` | `0x01` | Accelerometer hit &plusmn;8g range limit |
+| `STATUS_GYRO_CLIPPED` | `0x02` | Gyro hit &plusmn;500&deg;/s range limit |
+| `STATUS_INTERLOCK_OPEN` | `0x04` | Safety interlock open at sample time |
+| `STATUS_ANOMALY` | `0x08` | Firmware rolling window RMS exceeded threshold |
+| `STATUS_SENSOR_FAULT` | `0x10` | I2C probe failed (legacy) |
+| `STATUS_DEGRADED_REBOOT_REQUIRED` | `0x20` | I2C fault; auto-reboot pending |
+| `STATUS_SENSOR_UNAVAILABLE` | `0x40` | I2C fault; max reboots exhausted |
 
 ## Port Reference
 
