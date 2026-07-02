@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/markPVale/industrial-sensor-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/markPVale/industrial-sensor-pipeline/actions/workflows/ci.yml)
 
+[![Demo video](https://img.youtube.com/vi/uQSLWFSDjXw/maxresdefault.jpg)](https://youtu.be/uQSLWFSDjXw)
+
 End-to-end industrial vibration monitoring system: ESP32-S3 firmware &rarr; MQTT &rarr; InfluxDB &rarr; Grafana, with ACK-gated store-and-forward delivery, graduated fault recovery, and an AI query layer via Model Context Protocol.
 
 An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vibration anomalies, and streams telemetry to a Raspberry Pi gateway with safety interlock support. A Model Context Protocol server on the Pi lets Claude Code query live sensor data in plain English — _"Is my sensor healthy? Were there any anomalies in the last hour?"_
