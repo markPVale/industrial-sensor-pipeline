@@ -130,6 +130,24 @@ firmware received matching ACK
 
 If the ACK is dropped, firmware retries after `MQTT_ACK_TIMEOUT_MS`.
 
+Duplicate delivery is tolerated, but it is not modeled as a first-class storage
+invariant yet. In the normal path, InfluxDB should collapse duplicate writes
+because retries reuse the same measurement, `node_id` tag, and device timestamp.
+However, `boot_id` and `sequence_id` are fields rather than tags, so there is no
+explicit uniqueness key on `boot_id + sequence_id`.
+
+The integrity checker detects duplicate sequence behavior, but it does not
+dedupe rows before validation. If a retry's timestamp ever drifts from the
+original timestamp, for example due to a clock adjustment or NTP correction
+mid-retry, the two writes would not collapse into the same InfluxDB point.
+
+Hardening options:
+
+```text
+1. Add an explicit record-identity tag derived from boot_id + sequence_id.
+2. Make integrity_check.py dedupe by boot_id + sequence_id before validation.
+```
+
 ## Throughput Tradeoff
 
 The shortcut reduces SYNCING drain throughput.

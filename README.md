@@ -250,6 +250,7 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 
 - Single sensor node today; MQTT topics, client ID, and ACK topic are currently configured for `node01`.
 - Telemetry publish uses PubSubClient QoS 0; persistence is protected by an app-level ACK after the bridge writes to InfluxDB.
+- Duplicate delivery is tolerated but not modeled as a first-class storage invariant yet. Normal retries should collapse in InfluxDB because they reuse the same measurement, `node_id` tag, and device timestamp, but `boot_id` and `sequence_id` are fields, not an explicit uniqueness key.
 - Store-and-forward capacity is finite: 50,000 records in PSRAM. If the outage lasts longer than the buffer budget, oldest records can be evicted.
 - E-Stop events are published separately and are not part of the ACK-gated telemetry buffer.
 - The MCP server is a stateless query layer over InfluxDB, not a streaming subscriber.
@@ -258,6 +259,7 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 ## Roadmap
 
 - Multi-node fleet support with dynamic node IDs, per-node ACK topics, and fleet dashboards.
+- Explicit duplicate hardening with a record-identity tag or integrity-check dedupe by `boot_id + sequence_id`.
 - OTA firmware updates and gateway-managed configuration.
 - Calibration drift tracking and fleet-level sensor health reports.
 - On-device anomaly model or edge ML path.
