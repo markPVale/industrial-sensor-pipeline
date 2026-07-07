@@ -4,9 +4,11 @@
 
 [![Demo video](https://img.youtube.com/vi/uQSLWFSDjXw/maxresdefault.jpg)](https://youtu.be/uQSLWFSDjXw)
 
+**[▶ Watch the 85-second demo](https://youtu.be/uQSLWFSDjXw)** — telemetry survives a 30-second MQTT outage with 0 records lost.
+
 End-to-end industrial vibration monitoring system: ESP32-S3 firmware &rarr; MQTT &rarr; InfluxDB &rarr; Grafana, with ACK-gated store-and-forward delivery, graduated fault recovery, and an AI query layer via Model Context Protocol.
 
-An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vibration anomalies, and streams telemetry to a Raspberry Pi gateway with safety interlock support. A Model Context Protocol server on the Pi lets Claude Code query live sensor data in plain English — _"Is my sensor healthy? Were there any anomalies in the last hour?"_
+An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vibration anomalies, and streams telemetry to a Raspberry Pi gateway with safety interlock support. A Model Context Protocol server on the Pi lets Claude Code query live sensor data in plain English: _"Were there any anomalies in the last hour?"_
 
 ## Validation Results
 
