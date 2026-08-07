@@ -32,6 +32,7 @@ jobs:
         working-directory: mcp-server
         run: |
           npm ci
+          npm test
           npm run build
 
   firmware-build:

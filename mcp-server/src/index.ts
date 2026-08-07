@@ -22,19 +22,26 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { InfluxDB } from "@influxdata/influxdb-client";
-
-// ---------------------------------------------------------------------------
-// Status flag bit masks — must match firmware/include/types.h and
-// docs/telemetry-schema.md exactly.
-// ---------------------------------------------------------------------------
-const FLAG_ACCEL_CLIPPED             = 0x01;
-const FLAG_GYRO_CLIPPED              = 0x02;
-const FLAG_INTERLOCK_OPEN            = 0x04;  // E-Stop / safety interlock
-const FLAG_ANOMALY                   = 0x08;
-const FLAG_SENSOR_FAULT              = 0x10;  // I2C dropout (legacy — use degraded/unavailable)
-const FLAG_DEGRADED_REBOOT_REQUIRED  = 0x20;  // I2C fault; auto-reboot pending
-const FLAG_SENSOR_UNAVAILABLE        = 0x40;  // I2C fault; max reboots exhausted
+import { HttpError, InfluxDB } from "@influxdata/influxdb-client";
+import {
+  FLAG_ACCEL_CLIPPED,
+  FLAG_ANOMALY,
+  FLAG_DEGRADED_REBOOT_REQUIRED,
+  FLAG_GYRO_CLIPPED,
+  FLAG_INTERLOCK_OPEN,
+  FLAG_SENSOR_FAULT,
+  FLAG_SENSOR_UNAVAILABLE,
+  InputError,
+  MAX_ANOMALY_EVENTS,
+  NODE_ID_RE,
+  buildAnomalyQueries,
+  capAnomalyEvents,
+  classifyDependencyError,
+  decodeFlags,
+  normalizeWindowMinutes,
+  parseNodeId,
+  validateNodeId,
+} from "./tool-utils.js";
 
 // ---------------------------------------------------------------------------
 // Configuration — override via environment variables
@@ -75,23 +82,6 @@ function toISOString(t: unknown): string {
 
 // ---------------------------------------------------------------------------
 // Tool implementations
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Input validation
-// ---------------------------------------------------------------------------
-const NODE_ID_RE = /^[a-zA-Z0-9_-]{1,32}$/;
-
-function validateNodeId(nodeId: string): void {
-  if (!NODE_ID_RE.test(nodeId)) {
-    throw new Error(`Invalid node_id "${nodeId}" — must match ${NODE_ID_RE}`);
-  }
-}
-
-function clampWindowMinutes(windowMinutes: number): number {
-  return Math.min(Math.max(Math.round(windowMinutes), 1), 1440); // 1 min – 24 h
-}
-
 // ---------------------------------------------------------------------------
 
 /**
@@ -228,91 +218,76 @@ function buildHealthSummary(ageSeconds: number, flags: number, rms: number): str
 
 /**
  * get_recent_anomalies
- * Returns all records within the window where an anomaly or E-Stop flag was set.
+ * Returns up to MAX_ANOMALY_EVENTS records within the window where an anomaly
+ * or E-Stop flag was set.
  * Queries both vibration and sensor_faults so I2C fault events are not missed.
  */
-async function getRecentAnomalies(nodeId: string, windowMinutes: number) {
+async function getRecentAnomalies(nodeId: string, windowMinutes: unknown) {
   validateNodeId(nodeId);
-  const window = clampWindowMinutes(windowMinutes);
+  const window = normalizeWindowMinutes(windowMinutes);
 
-  // flags >= 4 excludes accel/gyro-clip-only records (0x01, 0x02, 0x03) while
-  // capturing all actionable flags: interlock (0x04), anomaly (0x08), and all
-  // sensor-fault variants (0x10, 0x20, 0x40).
+  const queries = buildAnomalyQueries({
+    bucket: INFLUX_BUCKET,
+    nodeId,
+    windowMinutes: window,
+  });
+
   const [vibRows, faultRows] = await Promise.all([
-    runFlux(`
-      from(bucket: "${INFLUX_BUCKET}")
-        |> range(start: -${window}m)
-        |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> filter(fn: (r) =>
-          exists r.flags and exists r.vibration_rms and
-          exists r.ax and exists r.ay and exists r.az
-        )
-        |> filter(fn: (r) => r.flags >= 4)
-        |> sort(columns: ["_time"], desc: true)
-    `),
-    runFlux(`
-      from(bucket: "${INFLUX_BUCKET}")
-        |> range(start: -${window}m)
-        |> filter(fn: (r) => r._measurement == "sensor_faults" and r.node_id == "${nodeId}")
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> sort(columns: ["_time"], desc: true)
-    `),
+    runFlux(queries.vibration),
+    runFlux(queries.faults),
   ]);
 
   if (vibRows.length === 0 && faultRows.length === 0) {
     return {
-      node_id:        nodeId,
-      window_minutes: windowMinutes,
-      anomaly_count:  0,
-      message:        `No anomalies detected in the last ${windowMinutes} minutes.`,
-      events:         [],
+      node_id:              nodeId,
+      window_minutes:       window,
+      returned_event_count: 0,
+      truncated:            false,
+      message:              `No anomalies detected in the last ${window} minutes.`,
+      events:               [],
     };
   }
 
+  // Event payloads stay lean: `active_flags` replaces one boolean per flag, and
+  // the redundant vibration_rms_mps2 alias is dropped. Fault events omit the
+  // accel fields entirely rather than carrying nulls.
   const vibEvents = vibRows.map((r) => {
     const flags = r["flags"] as number;
-    const windowRms = (r["window_rms"] ?? r["vibration_rms"]) as number;
     return {
-      timestamp:                      toISOString(r["_time"]),
-      source:                         "vibration",
-      vibration_rms_mps2:             windowRms,
-      window_rms_mps2:                windowRms,
-      vector_magnitude_mps2:          r["vibration_rms"] as number,
+      timestamp:             toISOString(r["_time"]),
+      source:                "vibration",
+      window_rms_mps2:       (r["window_rms"] ?? r["vibration_rms"]) as number,
+      vector_magnitude_mps2: r["vibration_rms"] as number,
       ax: r["ax"], ay: r["ay"], az: r["az"],
       flags,
-      flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
-      flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
-      flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
-      flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-      flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+      active_flags:          decodeFlags(flags),
     };
   });
 
   const faultEvents = faultRows.map((r) => {
     const flags = (r["flags"] != null ? r["flags"] : FLAG_SENSOR_FAULT) as number;
     return {
-      timestamp:                      toISOString(r["_time"]),
-      source:                         "sensor_faults",
-      vibration_rms_mps2:             null,
-      ax: null, ay: null, az: null,
+      timestamp:    toISOString(r["_time"]),
+      source:       "sensor_faults",
       flags,
-      flag_interlock_open:            false,
-      flag_anomaly:                   false,
-      flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
-      flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-      flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+      active_flags: decodeFlags(flags),
     };
   });
 
-  const events = [...vibEvents, ...faultEvents].sort(
+  const allEvents = [...vibEvents, ...faultEvents].sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
   );
+  const { events, truncated } = capAnomalyEvents(allEvents);
 
+  // `returned_event_count` is deliberately not named anomaly_count: when
+  // truncated is true this is the size of this page, not the number of matches.
+  // The true total is not computed — both queries are row-bounded — so it is
+  // omitted rather than guessed.
   return {
-    node_id:        nodeId,
-    window_minutes: windowMinutes,
-    anomaly_count:  events.length,
+    node_id:              nodeId,
+    window_minutes:       window,
+    returned_event_count: events.length,
+    truncated,
     events,
   };
 }
@@ -337,9 +312,11 @@ function createServer(): Server {
         description: "Returns the most recent telemetry record for a sensor node, including vibration RMS, status flags, and timestamp.",
         inputSchema: {
           type: "object",
+          additionalProperties: false,
           properties: {
             node_id: {
               type:        "string",
+              pattern:     NODE_ID_RE.source,
               description: "Sensor node ID (default: node01)",
               default:     "node01",
             },
@@ -351,9 +328,11 @@ function createServer(): Server {
         description: "Returns a health summary for a sensor node: online status, seconds since last message, current vibration RMS, and whether an anomaly or E-Stop is active.",
         inputSchema: {
           type: "object",
+          additionalProperties: false,
           properties: {
             node_id: {
               type:        "string",
+              pattern:     NODE_ID_RE.source,
               description: "Sensor node ID (default: node01)",
               default:     "node01",
             },
@@ -362,18 +341,22 @@ function createServer(): Server {
       },
       {
         name:        "get_recent_anomalies",
-        description: "Returns all anomaly and E-Stop events detected within a lookback window for a sensor node.",
+        description: `Returns up to ${MAX_ANOMALY_EVENTS} most recent anomaly and E-Stop events detected within a lookback window for a sensor node.`,
         inputSchema: {
           type: "object",
+          additionalProperties: false,
           properties: {
             node_id: {
               type:        "string",
+              pattern:     NODE_ID_RE.source,
               description: "Sensor node ID (default: node01)",
               default:     "node01",
             },
             window_minutes: {
-              type:        "number",
-              description: "How many minutes of history to search (default: 60)",
+              type:        "integer",
+              minimum:     1,
+              maximum:     1440,
+              description: "How many minutes of history to search (1–1440; default: 60)",
               default:     60,
             },
           },
@@ -384,9 +367,9 @@ function createServer(): Server {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    const nodeId = (args?.node_id as string) ?? "node01";
 
     try {
+      const nodeId = parseNodeId(args?.node_id);
       let result: unknown;
 
       switch (name) {
@@ -397,19 +380,28 @@ function createServer(): Server {
           result = await getSensorHealth(nodeId);
           break;
         case "get_recent_anomalies":
-          result = await getRecentAnomalies(nodeId, (args?.window_minutes as number) ?? 60);
+          result = await getRecentAnomalies(nodeId, args?.window_minutes);
           break;
         default:
-          throw new Error(`Unknown tool: ${name}`);
+          throw new InputError(`Unknown tool: ${name}`);
+      }
+
+      // Compact, not pretty-printed — indentation is pure token cost for an
+      // LLM consumer and roughly a third of a large anomaly response.
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    } catch (err) {
+      const error = err instanceof InputError
+        ? { code: "INVALID_ARGUMENT", message: err.message }
+        : classifyDependencyError(err instanceof HttpError ? err.statusCode : undefined);
+
+      if (!(err instanceof InputError)) {
+        console.error(`MCP tool "${name}" failed:`, err);
       }
 
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: "text", text: `Error: ${message}` }],
+        content: [{ type: "text", text: JSON.stringify({ error }) }],
         isError: true,
       };
     }
