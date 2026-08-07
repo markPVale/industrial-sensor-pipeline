@@ -40,11 +40,17 @@ graph LR
 
 ## Store-and-Forward State Machine
 
-Minimises data loss through network partitions — records buffer in PSRAM during
-outages and drain on reconnect. Not end-to-end guaranteed delivery: MQTT publish
-is still QoS 0 style, so `publish() == true` is not broker or InfluxDB
-acknowledgement. See [`store-and-forward-status.md`](store-and-forward-status.md)
-for the current shortcut fix, limitations, and validation plan.
+Records buffer in PSRAM during network partitions and drain one at a time after
+reconnect. The bridge publishes an app-level ACK only after the InfluxDB write
+succeeds, and firmware retains each record until it receives the matching
+`boot_id + sequence_id` ACK. A controlled 2026-06-24 hardware broker-outage test
+is recorded as passing with 570 records and zero sequence gaps, but its raw
+output was not retained; repeat validation remains open.
+
+This is not an unbounded exactly-once guarantee: the PSRAM buffer is finite, and
+a lost ACK can cause a duplicate retry after a successful write. See
+[`store-and-forward-status.md`](store-and-forward-status.md) for the historical
+pre-ACK failure, evidence note, re-validation TODO, and remaining limitations.
 
 ```mermaid
 stateDiagram-v2
@@ -55,7 +61,7 @@ stateDiagram-v2
 
     NORMAL : NORMAL\nReal-time 2Hz publish via MQTT
     BUFFERING : BUFFERING\nRecords written to PSRAM\n(up to 50,000 × 48 bytes ≈ 2.4 MB)
-    SYNCING : SYNCING\nBuffered records drain\none in-flight record at a time
+    SYNCING : SYNCING\nBuffered records drain\none ACK-gated record at a time
 
     SYNCING --> NORMAL : buffer empty
     SYNCING --> BUFFERING : disconnect during drain

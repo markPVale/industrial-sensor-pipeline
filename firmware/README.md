@@ -82,17 +82,27 @@ NORMAL ──(disconnect)──▶ BUFFERING ──(reconnect)──▶ SYNCING 
 
 - **NORMAL** — real-time 2Hz telemetry via MQTT
 - **BUFFERING** — records written to PSRAM ring buffer (up to 50,000 × 48 bytes ≈ 2.4 MB)
-- **SYNCING** — buffered records drain after reconnect; the current shortcut
-  allows one buffered telemetry record in flight at a time
+- **SYNCING** — buffered records drain after reconnect, one record at a time;
+  the firmware retains each record until the bridge confirms its InfluxDB write
+  with a matching app-level ACK
 
 `NodeState` is a single `std::atomic<NodeState>` — no scattered boolean flags.
 All MQTT callbacks only call `xEventGroupSetBits` — no Serial, no state writes
 (USB CDC + WiFi interrupt contention causes crashes if callbacks block).
 
-Store-and-forward is improved but not guaranteed delivery. `connectionTask`
-commits a buffered record only after `publish()` succeeds, but MQTT still uses
-QoS 0 style publish behavior. See `docs/store-and-forward-status.md` for the
-current validation plan and long-term ACK options.
+A 2026-06-24 hardware run is recorded as passing a controlled Mosquitto
+outage/restart: `integrity_check.py` checked 570 records with zero sequence gaps,
+timestamp monotonicity PASS, and data fidelity PASS. Its raw output was not
+retained in the repository, so the result is not independently auditable and a
+repeat hardware test remains open. The bridge publishes `sensor/node01/ack` only
+after an InfluxDB write succeeds, and firmware pops the matching PSRAM record
+only after receiving that ACK.
+
+This is not an unbounded exactly-once guarantee. The PSRAM buffer is finite, and
+a lost ACK can cause a duplicate retry after the original record was persisted.
+See [`docs/store-and-forward-status.md`](../docs/store-and-forward-status.md) for
+the historical pre-ACK failure, recorded ACK-gated result, re-validation TODO,
+and remaining limitations.
 
 ### I2C Fault Recovery
 

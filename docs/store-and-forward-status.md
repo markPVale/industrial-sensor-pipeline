@@ -1,6 +1,6 @@
 # Store-and-Forward Status
 
-Last updated: 2026-06-09
+Last updated: 2026-08-06
 
 ## Current Status
 
@@ -13,8 +13,9 @@ NORMAL -> BUFFERING -> SYNCING -> NORMAL
 Records are produced at about 2 Hz and stored in the PSRAM ring buffer before
 being published over MQTT.
 
-During a broker outage test on 2026-06-07, `integrity_check.py` found a sequence
-gap after Mosquitto was stopped and restarted:
+During a broker outage test on 2026-06-07, before the app-level ACK path was
+implemented, `integrity_check.py` found a sequence gap after Mosquitto was
+stopped and restarted:
 
 ```text
 seq 5531 -> 5594
@@ -23,9 +24,14 @@ seq 5531 -> 5594
 That showed the previous implementation removed records from the PSRAM buffer
 too early.
 
-## Shortcut Fix Implemented
+## Shortcut Fix Implemented — Superseded
 
-The firmware source now moves the buffer commit point closer to the actual MQTT
+> **Superseded by "App-Level ACK Implemented" below.** This section records the
+> first attempt, which moved the commit point to `publish()` success. That is no
+> longer the commit point: the firmware now retains each record until the bridge
+> ACKs the InfluxDB write. Kept for history — do not read it as current behavior.
+
+The firmware source moved the buffer commit point closer to the actual MQTT
 publish attempt.
 
 Old behavior:
@@ -111,7 +117,11 @@ pio run: SUCCESS
 
 ## Important Limitations
 
-This is not true guaranteed delivery until hardware validation passes.
+The ACK-gated path has a recorded passing hardware outage result, but its raw
+evidence was not retained and the repeat test below remains open. This is also
+not an unbounded guaranteed-delivery system: delivery is constrained by the
+finite PSRAM buffer, and duplicate delivery is still possible when an ACK is
+lost after a successful InfluxDB write.
 
 The firmware publish leg still uses QoS 0 style behavior:
 
@@ -150,16 +160,21 @@ Hardening options:
 
 ## Throughput Tradeoff
 
-The shortcut reduces SYNCING drain throughput.
+Sending one record at a time reduces SYNCING drain throughput. Under the
+ACK-gated path the drain rate is bounded by the publish → InfluxDB write → ACK
+round trip, not by the loop delay alone.
 
-Previous intended drain:
+Previously intended drain:
 
 ```text
 SYNC_BATCH_SIZE = 20 records per 100 ms
 about 200 records/sec
 ```
 
-Current effective drain:
+`SYNC_BATCH_SIZE` is currently unused — see the note at `firmware/include/config.h:76`,
+which reserves it for a future multi-in-flight design.
+
+Healthy drain, ACKs arriving well inside SYNC_BATCH_DELAY_MS:
 
 ```text
 1 buffered record in flight at a time
@@ -167,18 +182,30 @@ about 1 record per 100 ms
 about 10 records/sec
 ```
 
-At 2 Hz sampling, a short outage should still catch up quickly:
+At 2 Hz sampling, a short outage catches up quickly in that regime:
 
 ```text
 10 second outage ~= 20 buffered records
 10 records/sec drain ~= 2-3 seconds to catch up
 ```
 
-Longer outages will visibly take longer to drain.
+Degraded drain, ACKs being lost — each retry waits for the timeout
+(`MQTT_ACK_TIMEOUT_MS = 3000`, `firmware/include/config.h:109`):
 
-## Validation Result — 2026-06-09
+```text
+1 record per 3000 ms
+about 0.33 records/sec
+```
 
-Controlled outage test run after flashing the shortcut fix.
+That is below the 2 Hz production rate, so under sustained ACK loss the PSRAM
+buffer grows during SYNCING rather than draining. It only recovers when ACKs
+resume; if they do not, the buffer fills and the oldest records are overwritten.
+Longer outages take proportionally longer to drain even in the healthy regime.
+
+## Historical Validation — Shortcut Fix — 2026-06-09
+
+This controlled outage test was run after flashing the shortcut fix but before
+validating the app-level ACK implementation.
 
 Baseline (pre-outage):
 
@@ -215,9 +242,62 @@ are the TCP/broker boundary or the broker-to-bridge leg (bridge subscribes at
 QoS 0 with clean_session=True and may not have resubscribed before the drain
 messages were published).
 
-Do not claim "no data loss" or "continuity preserved" through broker outage
-with the current firmware. Use the integrity checker as a live demo tool to
-show the gap exists and to verify when a stronger fix closes it.
+This result showed that the shortcut fix alone could not support a no-data-loss
+claim. It is retained here as historical evidence of the failure that motivated
+the app-level ACK path.
+
+## ACK-Gated Hardware Validation — 2026-06-24
+
+The app-level ACK implementation has a recorded Raspberry Pi 5 + ESP32-S3 test
+result with the bridge ACKing each record only after its InfluxDB write
+completed.
+
+Recorded results:
+
+```text
+Baseline run:
+  234 records
+  0 sequence gaps
+  timestamp monotonicity: PASS
+  data fidelity: PASS
+
+Controlled Mosquitto outage/restart:
+  570 records
+  0 sequence gaps
+  timestamp monotonicity: PASS
+  data fidelity: PASS
+
+ACK path:
+  Matching sensor/node01/ack observed after each InfluxDB write
+```
+
+Evidence note: the raw terminal output or screenshot from this run is not
+present in the repository. The values above are the recorded validation result,
+not a reproducible artifact. Future hardware validation runs should commit the
+raw `integrity_check.py` output alongside the summarized result.
+
+This recorded passing run supersedes the June 9 shortcut-fix result for the
+current ACK-gated implementation, but it is pending an evidence-backed repeat.
+Even if reproduced, it validates only the controlled outage scenario and tested
+buffer depth; it does not remove the finite-buffer and duplicate-delivery
+limitations described above.
+
+## TODO — Repeat ACK-Gated Hardware Validation
+
+- [ ] Record the firmware commit, gateway commit, hardware versions, InfluxDB
+  version, broker version, configured buffer size, and test date.
+- [ ] Capture a baseline `integrity_check.py` run with sequence integrity,
+  timestamp monotonicity, and data fidelity all passing.
+- [ ] Stop Mosquitto for a recorded duration while the ESP32 continues sampling.
+- [ ] Restart Mosquitto and capture the ESP32 transition from `BUFFERING` through
+  `SYNCING` back to `NORMAL`.
+- [ ] Run `integrity_check.py` over a window covering the full baseline, outage,
+  reconnect, and drain; require zero sequence gaps and data fidelity PASS.
+- [ ] Capture ACK-topic evidence showing matching `boot_id + sequence_id` values
+  after successful InfluxDB writes.
+- [ ] Commit the raw terminal output under
+  `docs/validation/store-and-forward-YYYY-MM-DD.txt`, then update the summarized
+  result and mark this TODO complete.
 
 ## Remaining Engineering Options
 
@@ -231,17 +311,15 @@ Option A: MQTT QoS 1 + PUBACK tracking
 
 Option B: App-level acknowledgement
   - Implemented in firmware and bridge.
-  - Needs hardware outage validation.
+  - A 2026-06-24 outage run is recorded as passing, without retained raw output.
+  - Evidence-backed hardware re-validation is still open.
 ```
 
 Current recommendation:
 
 ```text
-Flash and validate the app-level ACK implementation on hardware.
-Acceptance gate:
-  - Baseline integrity PASS.
-  - Controlled Mosquitto outage.
-  - Reconnect and drain.
-  - integrity_check.py sequence integrity PASS.
-  - data fidelity PASS.
+Keep the ACK-gated implementation and repeat the outage test after changes to
+the firmware, bridge, broker configuration, or telemetry schema. Preserve raw
+integrity-check output for future validation runs, and harden duplicate identity
+before treating delivery as a storage-level exactly-once guarantee.
 ```

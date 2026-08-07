@@ -12,12 +12,16 @@ An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vib
 
 ## Validation Results
 
-Hardware validation on Raspberry Pi 5 + ESP32-S3:
+Recorded hardware validation on Raspberry Pi 5 + ESP32-S3:
 
 - Baseline run: 234 records, 0 sequence gaps per `integrity_check.py`, timestamp monotonicity PASS, data fidelity PASS.
 - Controlled Mosquitto broker outage/restart: 570 records, 0 sequence gaps per `integrity_check.py`, timestamp monotonicity PASS, data fidelity PASS.
 - ACK path confirmed over MQTT: each telemetry record received a matching `sensor/node01/ack` after the bridge wrote it to InfluxDB.
 - MCP tools validated against live InfluxDB data: latest telemetry, health summary, and recent anomalies.
+
+The raw output from this run was not retained in the repository, so these are
+recorded results rather than independently auditable evidence. See the
+[validation note and hardware re-test TODO](docs/store-and-forward-status.md).
 
 ## Why This Matters
 
@@ -69,7 +73,7 @@ graph LR
 
 ### Store-and-forward with app-level acknowledgements
 
-Records buffer in 8MB PSRAM (up to 50,000 &times; 48 bytes) during WiFi outages and drain on reconnect. The bridge ACKs each record _after_ writing it to InfluxDB, and the firmware only pops the buffer on a matching ACK — closing the gap between "MQTT accepted the publish" and "the data is actually persisted." Validated with controlled broker-outage tests and an end-to-end sequence integrity checker.
+Records buffer in 8MB PSRAM (up to 50,000 &times; 48 bytes) during WiFi outages and drain on reconnect. The bridge ACKs each record _after_ writing it to InfluxDB, and the firmware only pops the buffer on a matching ACK — closing the gap between "MQTT accepted the publish" and "the data is actually persisted." A controlled broker-outage test is recorded as passing; raw evidence was not retained, so hardware re-validation remains tracked in the status document.
 
 ```mermaid
 stateDiagram-v2

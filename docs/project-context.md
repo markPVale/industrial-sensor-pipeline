@@ -91,13 +91,17 @@ The ESP32 runs a multi-tasking scheduler to ensure safety events cannot be block
 A state machine governs telemetry behavior during failure:
 - **NORMAL:** Real-time streaming via MQTT QoS 0.
 - **BUFFERING:** On disconnect, telemetry records are written to a **Circular Buffer in PSRAM**.
-- **SYNCING:** On reconnect, buffered records drain in order. The current
-  shortcut allows one buffered telemetry record in flight at a time and commits
-  the record only after `connectionTask` successfully calls `publish()`.
+- **SYNCING:** On reconnect, buffered records drain in order, one record at a
+  time. The bridge publishes an app-level ACK only after the InfluxDB write
+  succeeds, and firmware removes the record from PSRAM only after receiving a
+  matching `boot_id + sequence_id` ACK.
 
-This is improved local correctness, not guaranteed end-to-end delivery. MQTT is
-still QoS 0 style; `publish()` success is not broker ACK or InfluxDB
-persistence ACK. See `docs/store-and-forward-status.md`.
+A controlled Raspberry Pi 5 + ESP32-S3 broker-outage test is recorded as passing
+on 2026-06-24 with 570 records, zero sequence gaps, timestamp monotonicity PASS,
+and data fidelity PASS. The raw output was not retained, so repeat validation is
+still open. Even within the recorded result, this is not an unbounded exactly-once
+guarantee: the PSRAM buffer is finite, and a lost ACK can cause a duplicate
+retry. See `docs/store-and-forward-status.md` for the evidence note and TODO.
 
 **Data Record Schema:**
 ```cpp
@@ -126,7 +130,7 @@ The MCP server exposes the following tools to LLM clients:
 |------|-------------|
 | `get_latest_telemetry` | Returns the most recent telemetry record (`window_rms`, IMU values, flags, timestamp) for a node |
 | `get_sensor_health` | Returns a merged health summary from latest vibration + sensor-fault records; E-Stop takes priority |
-| `get_recent_anomalies` | Returns flagged vibration and sensor-fault events within a configurable lookback window |
+| `get_recent_anomalies` | Returns up to 50 recent flagged vibration and sensor-fault events within a configurable lookback window |
 
 **Connection:** The MCP server runs on the Pi and listens for MCP client connections. Configure Claude Code's MCP settings to point to the Pi's IP and port 3002.
 
