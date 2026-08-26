@@ -146,17 +146,68 @@ because retries reuse the same measurement, `node_id` tag, and device timestamp.
 However, `boot_id` and `sequence_id` are fields rather than tags, so there is no
 explicit uniqueness key on `boot_id + sequence_id`.
 
-The integrity checker detects duplicate sequence behavior, but it does not
-dedupe rows before validation. If a retry's timestamp ever drifts from the
-original timestamp, for example due to a clock adjustment or NTP correction
-mid-retry, the two writes would not collapse into the same InfluxDB point.
+The integrity checker now dedupes rows on `boot_id + sequence_id` before
+validation and reports duplicates separately (see "Checker-Side Deduplication").
+That resolves the validation ambiguity but not the underlying write: two rows
+still exist in InfluxDB whenever a retry lands at a different timestamp.
+
+The firmware itself does not cause that drift — `timestamp_ms` is captured once
+at window-end and stored in the PSRAM record, so a retry re-serializes the same
+value. The reachable case is the bridge's fallback: it only uses the firmware
+timestamp when `ts > 1_000_000_000_000`, so a record buffered before NTP sync is
+written at broker-arrival time, which differs on every delivery.
 
 Hardening options:
 
 ```text
 1. Add an explicit record-identity tag derived from boot_id + sequence_id.
+   NOT DONE — and not planned. See below.
 2. Make integrity_check.py dedupe by boot_id + sequence_id before validation.
+   DONE — see "Checker-Side Deduplication".
 ```
+
+A `boot_id + sequence_id` tag is not being added because it would create one
+series per record and still would not collapse retries written at different
+timestamps: an InfluxDB point's identity is measurement + tag set + field key +
+timestamp, so adding tags makes points more distinct, not less. Checker-side
+deduplication handles the validation ambiguity; fixing the pre-NTP timestamp
+fallback remains separate work.
+
+## Checker-Side Deduplication
+
+`integrity_check.py` now deduplicates records on `(boot_id, sequence_id)` before
+running the validation checks:
+
+```text
+- Records are keyed on (boot_id, sequence_id); _measurement is deliberately
+  excluded, since telemetry and fault records share one identity stream and the
+  same identity in both is itself a defect.
+- The earliest stored _time is kept as canonical. Note that _time is the data
+  timestamp, not the write time, so the kept row is canonical by convention
+  rather than provably the original write.
+- Duplicates are reported in their own section, split by severity:
+    RETRY (same measurement)   -> WARN, does not fail the run.
+    IDENTITY COLLISION (differing measurements) -> FAIL.
+  The count appears in the summary either way.
+- Sequence, timestamp, and fidelity checks all run on the deduplicated set, so
+  a reported gap now means actual data loss. The old label was GAP/DUP because
+  the check could not tell the two apart; it is now GAP.
+```
+
+A duplicate surfacing here means the same identity was written twice at
+different timestamps and/or in different measurements.
+
+The two cases are not equally benign. A same-measurement repeat is a tolerated
+retry — at-least-once delivery permits it — and its likely cause is the bridge's
+broker-arrival-time fallback for pre-NTP-sync records, whose differing
+timestamps prevent InfluxDB from collapsing the write. A replayed record looks
+identical.
+
+The same identity in two measurements is a hard failure. The bridge routes on
+payload flags (`write_telemetry` delegates to `write_sensor_fault` when
+`flags & FAULT_FLAGS_MASK`), and a retry re-sends the same buffered record with
+the same flags, so a retry cannot change measurement. A collision therefore
+means a reused sequence number or a corrupted payload, not duplicate delivery.
 
 ## Throughput Tradeoff
 

@@ -265,7 +265,7 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 ## Roadmap
 
 - Multi-node fleet support with dynamic node IDs, per-node ACK topics, and fleet dashboards.
-- Explicit duplicate hardening with a record-identity tag or integrity-check dedupe by `boot_id + sequence_id`.
+- Fix the bridge's pre-NTP-sync timestamp fallback, the remaining path that can write a retried record twice. (Integrity-check dedupe by `boot_id + sequence_id` is done; a record-identity tag was ruled out — it would add a series per record without collapsing differing timestamps.)
 - OTA firmware updates and gateway-managed configuration.
 - Calibration drift tracking and fleet-level sensor health reports.
 - On-device anomaly model or edge ML path.

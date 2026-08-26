@@ -1,14 +1,23 @@
 """
 integrity_check.py — End-to-End Pipeline Integrity Check (Phase 4, Step 3)
 
-Validates three properties of data stored in InfluxDB:
+Validates sequence integrity, timestamp monotonicity, and data fidelity;
+reports duplicate delivery and sensor faults.
 
-  1. Sequence integrity  — seq_id strictly increases with no gaps or duplicates
-                           within each boot_id. Resets to 0 only on boot change.
-  2. Timestamp monotonicity — _time values are strictly increasing and spaced
-                              ~500ms apart (FILTER_WINDOW_SIZE=50 at 100Hz).
-  3. Data fidelity — vibration_rms matches recomputed sqrt(ax²+ay²+az²), and
-                     window_rms is present for normal records.
+  Sequence integrity  — seq_id strictly increases with no gaps within each
+                        boot_id. Resets to 0 only on boot change.
+  Timestamp monotonicity — _time values are strictly increasing and spaced
+                        ~500ms apart (FILTER_WINDOW_SIZE=50 at 100Hz).
+  Data fidelity — vibration_rms matches recomputed sqrt(ax²+ay²+az²), and
+                  window_rms is present for normal records.
+
+Sensor faults are reported for review and never fail the run. Duplicate delivery
+is split by severity: a same-measurement repeat is a tolerated retry and only
+warns, while the same identity in two measurements fails, because the bridge
+routes on payload flags and a retry cannot change measurement.
+
+Records are deduplicated on (boot_id, sequence_id) before validation, so a
+sequence gap means actual data loss rather than gap-or-duplicate ambiguity.
 
 Usage (on Pi):
     source .venv/bin/activate
@@ -21,7 +30,6 @@ import argparse
 import math
 import os
 import sys
-from influxdb_client import InfluxDBClient
 
 INFLUX_URL    = os.getenv("INFLUX_URL",   "http://localhost:8086")
 INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN", "dev-token-change-in-production")
@@ -65,8 +73,79 @@ from(bucket: "{INFLUX_BUCKET}")
     return sorted(records, key=lambda r: r["time"])
 
 
+def dedupe(records):
+    """Split records into unique and duplicate lists, keyed on (boot_id, seq_id).
+
+    Expects records sorted by stored _time, as returned by query(). The first
+    occurrence of an identity is kept as canonical; later ones are collected as
+    duplicates. Note that _time is the data timestamp, not the write time, so
+    the kept row is canonical by convention — it is not provably the original
+    write. Callers passing unsorted records will keep an arbitrary copy.
+
+    The key deliberately omits _measurement: telemetry and fault records share
+    one boot_id + sequence_id stream, so the same identity appearing in both is
+    itself a defect worth surfacing rather than two legitimate rows.
+    """
+    seen = {}
+    unique = []
+    duplicates = []
+    for r in records:
+        key = (r["boot_id"], r["seq_id"])
+        if key in seen:
+            duplicates.append((seen[key], r))  # (kept, duplicate)
+            continue
+        seen[key] = r
+        unique.append(r)
+    return unique, duplicates
+
+
+def check_duplicates(duplicates):
+    """Report duplicate delivery, split by severity. Returns (ok, count).
+
+    Same-measurement repeats are retries: at-least-once delivery permits them,
+    so they WARN and do not fail the run.
+
+    The same identity in two different measurements is a hard failure. The
+    bridge routes on payload flags (write_telemetry -> write_sensor_fault), and
+    a retry re-sends the same buffered record with the same flags, so a retry
+    cannot change measurement. A collision therefore means a reused sequence
+    number or a corrupted payload, not tolerated duplicate delivery.
+    """
+    print("\n--- 1. Duplicate Delivery ---")
+    if not duplicates:
+        print("  PASS — no duplicate (boot_id, sequence_id) identities")
+        return True, 0
+
+    retries = [(k, d) for k, d in duplicates if k["measurement"] == d["measurement"]]
+    collisions = [(k, d) for k, d in duplicates if k["measurement"] != d["measurement"]]
+
+    for kept, dup in retries:
+        delta_ms = (dup["time"] - kept["time"]).total_seconds() * 1000
+        print(f"  RETRY  boot={dup['boot_id']}  seq={dup['seq_id']}  "
+              f"{kept['measurement']}  {kept['time']} -> {dup['time']}  "
+              f"(+{delta_ms:.0f}ms)")
+    for kept, dup in collisions:
+        print(f"  IDENTITY COLLISION  boot={dup['boot_id']}  seq={dup['seq_id']}  "
+              f"{kept['measurement']}@{kept['time']} vs "
+              f"{dup['measurement']}@{dup['time']}")
+
+    if retries:
+        print(f"  WARN — {len(retries)} retried record(s). At-least-once delivery "
+              f"permits retries, so these do not fail the run.")
+        print("  Likely cause: the bridge's broker-arrival-time fallback for "
+              "pre-NTP-sync records, whose differing timestamps prevent InfluxDB "
+              "from collapsing the write. A replayed record would look the same.")
+    if collisions:
+        print(f"  FAIL — {len(collisions)} identity collision(s) across "
+              f"measurements. A retry cannot change measurement, so the same "
+              f"boot_id + sequence_id in both means a reused sequence number or "
+              f"a corrupted payload.")
+
+    return not collisions, len(duplicates)
+
+
 def check_sequence(records):
-    print("\n--- 1. Sequence Integrity ---")
+    print("\n--- 2. Sequence Integrity ---")
     errors = 0
     prev = None
     for r in records:
@@ -77,7 +156,7 @@ def check_sequence(records):
         if same_boot:
             expected = prev["seq_id"] + 1
             if r["seq_id"] != expected:
-                print(f"  GAP/DUP  boot={r['boot_id']}  "
+                print(f"  GAP  boot={r['boot_id']}  "
                       f"seq {prev['seq_id']} -> {r['seq_id']} (expected {expected})")
                 errors += 1
         else:
@@ -90,14 +169,14 @@ def check_sequence(records):
     normal_count = len(records) - fault_count
     note = f" ({fault_count} fault record(s) included)" if fault_count else ""
     if errors == 0:
-        print(f"  PASS — {normal_count} telemetry + {fault_count} fault records, no gaps or duplicates{note}")
+        print(f"  PASS — {normal_count} telemetry + {fault_count} fault records, no gaps{note}")
     else:
         print(f"  FAIL — {errors} violation(s){note}")
     return errors == 0
 
 
 def check_timestamps(records):
-    print("\n--- 2. Timestamp Monotonicity ---")
+    print("\n--- 3. Timestamp Monotonicity ---")
     errors = 0
     jitter_warnings = 0
 
@@ -162,7 +241,7 @@ def check_timestamps(records):
 
 
 def check_fidelity(records):
-    print("\n--- 3. Data Fidelity ---")
+    print("\n--- 4. Data Fidelity ---")
     errors = 0
     normal = [r for r in records if not (r["flags"] & FAULT_FLAGS_MASK)]
     for r in normal:
@@ -183,7 +262,7 @@ def check_fidelity(records):
 
 
 def check_sensor_faults(records):
-    print("\n--- 4. Sensor Faults ---")
+    print("\n--- 5. Sensor Faults ---")
     faults = [r for r in records if r["flags"] & FAULT_FLAGS_MASK]
     if not faults:
         print("  PASS — no sensor fault records")
@@ -195,6 +274,11 @@ def check_sensor_faults(records):
 
 
 def main():
+    # Imported here rather than at module scope so the pure helpers above stay
+    # importable without third-party packages installed (see
+    # test_integrity_check.py, which runs in CI without requirements.txt).
+    from influxdb_client import InfluxDBClient
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--minutes", type=int, default=10)
     args = parser.parse_args()
@@ -208,20 +292,28 @@ def main():
         print("No records found — is the pipeline running?")
         sys.exit(1)
 
-    boots = sorted(set(r["boot_id"] for r in records))
-    print(f"Found {len(records)} records across boot_id(s): {boots}")
+    # Deduplicate before validation so a sequence gap means real data loss
+    # rather than gap-or-duplicate ambiguity.
+    records, duplicates = dedupe(records)
 
-    seq_ok   = check_sequence(records)
-    time_ok  = check_timestamps(records)
-    fid_ok   = check_fidelity(records)
+    boots = sorted(set(r["boot_id"] for r in records))
+    print(f"Found {len(records) + len(duplicates)} records "
+          f"({len(records)} unique) across boot_id(s): {boots}")
+
+    dup_ok, dup_count = check_duplicates(duplicates)
+    seq_ok    = check_sequence(records)
+    time_ok   = check_timestamps(records)
+    fid_ok    = check_fidelity(records)
     check_sensor_faults(records)
 
     print("\n--- Summary ---")
+    print(f"  Duplicate delivery:     {'PASS' if dup_ok else 'FAIL'} "
+          f"({dup_count} duplicate(s); retries warn, cross-measurement fails)")
     print(f"  Sequence integrity:     {'PASS' if seq_ok  else 'FAIL'}")
     print(f"  Timestamp monotonicity: {'PASS' if time_ok else 'FAIL'}")
     print(f"  Data fidelity:          {'PASS' if fid_ok  else 'FAIL'}")
 
-    if seq_ok and time_ok and fid_ok:
+    if dup_ok and seq_ok and time_ok and fid_ok:
         print("\nAll checks passed.")
         sys.exit(0)
     else:

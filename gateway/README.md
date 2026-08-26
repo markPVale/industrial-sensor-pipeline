@@ -99,11 +99,27 @@ cd gateway/bridge && source .venv/bin/activate
 python3 integrity_check.py --minutes 10
 ```
 
-Checks:
-1. **Sequence integrity** — `seq` is strictly increasing with no gaps or duplicates per `boot_id`
-2. **Timestamp monotonicity** — timestamps are monotonic and real-time aligned after NTP sync
-3. **Data fidelity** — values and flags are unchanged end-to-end
-4. **Fault classification** — fault records are correctly routed to `sensor_faults`
+Records are deduplicated on `boot_id + sequence_id` before validation, so a
+reported gap means actual data loss rather than a duplicate.
+
+Checks (gate the exit code):
+1. **Duplicate delivery** — a repeated `boot_id + sequence_id` in the *same*
+   measurement is a tolerated retry and only WARNs. The same identity in *two*
+   measurements FAILs: the bridge routes on payload flags and a retry re-sends
+   identical flags, so a retry cannot change measurement — a collision means a
+   reused sequence number or a corrupted payload.
+2. **Sequence integrity** — `seq` is strictly increasing with no gaps per `boot_id`
+3. **Timestamp monotonicity** — timestamps are monotonic and real-time aligned after NTP sync
+4. **Data fidelity** — values and flags are unchanged end-to-end
+
+Reports (never fail the run):
+- **Fault classification** — fault records are correctly routed to `sensor_faults`
+
+Unit tests for the dedupe helpers run without InfluxDB:
+
+```bash
+python3 test_integrity_check.py
+```
 
 ## Credentials (dev only)
 
