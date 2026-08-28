@@ -258,6 +258,7 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 - Telemetry publish uses PubSubClient QoS 0; persistence is protected by an app-level ACK after the bridge writes to InfluxDB.
 - Duplicate delivery is tolerated but not modeled as a first-class storage invariant yet. Normal retries should collapse in InfluxDB because they reuse the same measurement, `node_id` tag, and device timestamp, but `boot_id` and `sequence_id` are fields, not an explicit uniqueness key.
 - Store-and-forward capacity is finite: 50,000 records in PSRAM. If the outage lasts longer than the buffer budget, oldest records can be evicted.
+- The PSRAM buffer has a single priority tier. Sensor-fault records share the ring with normal telemetry and get no eviction protection, so on a full buffer a queued fault record can be dropped by newer routine samples.
 - E-Stop events are published separately and are not part of the ACK-gated telemetry buffer.
 - The MCP server is a stateless query layer over InfluxDB, not a streaming subscriber.
 - No OTA updates, fleet provisioning, or device identity management yet.
@@ -268,6 +269,7 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 - Fix the bridge's pre-NTP-sync timestamp fallback, the remaining path that can write a retried record twice. (Integrity-check dedupe by `boot_id + sequence_id` is done; a record-identity tag was ruled out — it would add a series per record without collapsing differing timestamps.)
 - OTA firmware updates and gateway-managed configuration.
 - Calibration drift tracking and fleet-level sensor health reports.
+- Priority-tiered store-and-forward: protect fault and interlock records from drop-oldest eviction so a full buffer sheds routine telemetry first.
 - On-device anomaly model or edge ML path.
 
 ## Author
