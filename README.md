@@ -269,6 +269,7 @@ See [`docs/telemetry-schema.md`](docs/telemetry-schema.md) for flag bit definiti
 - Fix the bridge's pre-NTP-sync timestamp fallback, the remaining path that can write a retried record twice. (Integrity-check dedupe by `boot_id + sequence_id` is done; a record-identity tag was ruled out — it would add a series per record without collapsing differing timestamps.)
 - OTA firmware updates and gateway-managed configuration.
 - Calibration drift tracking and fleet-level sensor health reports.
+- `get_vibration_trend` MCP tool: server-side bucketed min/mean/max over a time window, so gradual deterioration can be spotted without shipping raw records to the client. InfluxDB does the aggregation; the response size is bounded by bucket count, not by how many records the window contains.
 - Priority-tiered store-and-forward: protect fault and interlock records from drop-oldest eviction so a full buffer sheds routine telemetry first.
 - On-device anomaly model or edge ML path.
 
