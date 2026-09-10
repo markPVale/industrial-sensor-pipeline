@@ -1,8 +1,9 @@
 # Delivery Lease — Design
 
 Status: **design**, not yet implemented.
-Last updated: 2026-09-09 (rev 4 — inline state table, loss-identity ownership,
-checked MQTT allocation, loss-range ordering)
+Last updated: 2026-09-10 (rev 7 — atomicity scope, lost-event degradation;
+rev 6 — failure-mode summary; rev 5 — abandonment outcome reconciliation,
+connected-time liveness bound, diagnostic terminology)
 
 Supersedes the informal in-flight tracking described in
 `docs/store-and-forward-status.md` under "App-Level ACK Implemented". That
@@ -13,7 +14,39 @@ lands.
 
 ## 1. Problem
 
-Two defects, independently triggerable, sharing one root cause.
+### 1.0 Failure mode
+
+The system's guarantee is that a telemetry record stays in PSRAM until the
+bridge confirms it reached InfluxDB. That guarantee is enforced by state no
+single component owns: *which record is currently being delivered* is spread
+across a boolean flag, two identity globals, and the ring buffer's tail
+position — written at different moments, by different tasks, on different
+cores, with nothing keeping them consistent.
+
+Two consequences follow independently. At capacity, the overflow policy evicts
+the record currently awaiting acknowledgment — and, between the ACK handler's
+identity check and its removal step, can cause a *different*, unacknowledged
+record to be discarded instead. Separately, because a record's identity is
+published-then-recorded rather than assigned at selection, a stale
+acknowledgment can clear the in-flight marker for a record that is still in
+flight, causing it to be published twice. The first is silent data loss; the
+second is duplication. Neither requires the other to occur.
+
+"Silent" is literal: the eviction counter is never read anywhere in the
+firmware — `droppedCount()` and `getStats()` have zero call sites — so the
+device cannot distinguish a record it deliberately dropped from one it lost to
+a bug.
+
+**Why this survived validation.** Every overflow-dependent path requires a full
+50,000-record ring, ~6.9 hours of undrained buffering at 2 Hz. The run that
+certified the ACK-gated design used 570 records — 1.1% of capacity. These paths
+were not missed by inspection; they were structurally unreachable in every test
+ever run against this firmware.
+
+Sections 1.1 and 1.2 are those two independently triggerable lease defects and
+1.3 is their shared root cause. Section 1.4 is a separate latent transport
+defect that can turn the head-of-line risk in 1.5 into a deterministic
+failure.
 
 ### 1.1 Overflow can destroy an unresolved retry head
 
@@ -112,7 +145,7 @@ pin would additionally block delivery of every retained record behind it.
 |---|---|---|
 | `BufferManager` | Ring layout, pinned identity, pinned-record relocation, overflow and pressure counters — all under its mutex | Release a pin autonomously |
 | `filterTask`, `sensorTask` | Call `push()` and forward any returned loss identity to `LossJournal`. May relocate the pinned record and increment pressure counters as a side effect of overflow | Acquire, commit, abandon, or release a pin |
-| `connectionTask` | **Sole** caller of acquire / commit / abandon. Owns phase, `ever_published`, attempts, and timers; owns generation only in the future deferred design | — |
+| `connectionTask` | **Sole** caller of acquire / commit / abandon. Owns phase, `ever_published`, publish counters, and timers; owns generation only in the future deferred design | — |
 | `telemetryTask`, `syncTask` | Signal that delivery is due (cadence only) | Create or mutate a lease; call `peek()` |
 | `safetyTask`, other publishers | Enqueue non-leased messages (E-Stop) onto `g_publishQueue` | Affect telemetry delivery state |
 | `LossJournal` | Thread-safe compression and bounded RAM retention of exact loss identities/ranges | Mutate the telemetry ring or lease |
@@ -147,16 +180,14 @@ future deferred path in §4.2 but are not implemented in the initial landing
 
 Initial-landing lease fields: `identity {boot_id, sequence_id}`,
 `ever_published`, `publish_calls`, `successful_publishes`,
-`connected_wait_ms`, `sent_at_ms`, `next_attempt_at_ms`, and
-`protected_evictions_at_acquire`. `generation` belongs only to the deferred
-publishing contract in §4.2 and is not present in the initial implementation.
+`connected_wait_ms`, `sent_at_ms`, and `next_attempt_at_ms`. `generation`
+belongs only to the deferred publishing contract in §4.2 and is not present in
+the initial implementation.
 
 `publish_calls` counts every `publish()` invocation, successful or not;
 `successful_publishes` counts only those returning true. Both are needed: a
 budget keyed on successes alone cannot terminate a lease that never publishes
-(§6). `protected_evictions_at_acquire` snapshots the global counter so the
-budget uses a per-lease delta — comparing the cumulative counter directly would
-make every lease after the first inherit an already-exceeded threshold.
+(§6).
 
 `ever_published` is independent of phase and is the sole ACK-eligibility
 predicate. Gating on phase is wrong: `RETRY_PENDING` is reachable from a publish
@@ -170,21 +201,29 @@ path disappears.)
 With `connectionTask` acquiring, building, and publishing in one iteration
 (§3.1), only three phases are observable: `IDLE`, `AWAITING_ACK`, and
 `RETRY_PENDING`. Acquisition, payload construction, and the synchronous
-`publish()` call are one transition action; no MQTT callback can run partway
-through them because `connectionTask` is the sole MQTT owner.
+`publish()` call are one transition action **with respect to MQTT callbacks
+only**: no ACK can be observed partway through them, because `connectionTask`
+is the sole MQTT owner.
+
+That is not general atomicity, and the distinction matters. `filterTask` and
+`sensorTask` run on core 1 and can call `push()` — including a protected
+eviction that relocates the pinned record — at any point inside that window.
+What protects the record there is the **pin**, not the iteration boundary.
+Reading "one transition action" as "nothing else can interleave" is the same
+assumption that produced §1.1, so it is stated explicitly here. Test 6 covers
+the window.
 
 | # | From | To | Trigger | Actor | Buffer effect |
 |---|---|---|---|---|---|
-| 1 | `IDLE` | `AWAITING_ACK` | delivery due, buffer non-empty, connected; acquire + build + `publish()` returns true | connectionTask | pin acquired; identity assigned; per-lease counters zeroed; acquire-time pressure snapshotted; `publish_calls++`, `successful_publishes++`, `ever_published = true`, timers set |
+| 1 | `IDLE` | `AWAITING_ACK` | delivery due, buffer non-empty, connected; acquire + build + `publish()` returns true | connectionTask | pin acquired; identity assigned; per-lease counters zeroed; `publish_calls++`, `successful_publishes++`, `ever_published = true`, timers set |
 | 2 | `IDLE` | `RETRY_PENDING` | same action, but `publish()` returns false | connectionTask | pin acquired and held; `publish_calls++`; `ever_published = false`; retry backoff set |
 | 3 | `AWAITING_ACK` | `IDLE` | ACK matches pinned identity | connectionTask | `commitPinnedHead()` validates + pops under one lock |
 | 4 | `AWAITING_ACK` | `RETRY_PENDING` | ACK timeout (`MQTT_ACK_TIMEOUT_MS`) | connectionTask | pin held; retry time set |
 | 5 | `AWAITING_ACK` | `RETRY_PENDING` | MQTT disconnect | connectionTask | pin held; connected-time accrual stops |
-| 6 | `AWAITING_ACK` | `IDLE` | protected-eviction budget exhausted | connectionTask | `abandonPinnedHead()`; bounds pressure even if thresholds are tuned below the ACK timeout |
-| 7 | `RETRY_PENDING` | `AWAITING_ACK` | retry due, connected, `publish()` returns true | connectionTask | same pin; `publish_calls++`, `successful_publishes++`, `ever_published = true`, ACK timer set |
-| 8 | `RETRY_PENDING` | `RETRY_PENDING` | retry due, connected, `publish()` returns false | connectionTask | same pin; `publish_calls++`; `ever_published` unchanged; next backoff set |
-| 9 | `RETRY_PENDING` | `IDLE` | ACK matches pinned identity and `ever_published` | connectionTask | `commitPinnedHead()`; avoids a duplicate write |
-| 10 | `RETRY_PENDING` | `IDLE` | abandonment budget exhausted | connectionTask | `abandonPinnedHead()`; record exact loss identity; emit later from journal |
+| 6 | `RETRY_PENDING` | `AWAITING_ACK` | retry due, connected, `publish()` returns true | connectionTask | same pin; `publish_calls++`, `successful_publishes++`, `ever_published = true`, ACK timer set |
+| 7 | `RETRY_PENDING` | `RETRY_PENDING` | retry due, connected, `publish()` returns false | connectionTask | same pin; `publish_calls++`; `ever_published` unchanged; next backoff set |
+| 8 | `RETRY_PENDING` | `IDLE` | ACK matches pinned identity and `ever_published` | connectionTask | `commitPinnedHead()`; avoids a duplicate write |
+| 9 | `RETRY_PENDING` | `IDLE` | connected-time/publish-call budget exhausted | connectionTask | `abandonPinnedHead()`; record an abandonment outcome, not an asserted delivery loss |
 
 `connected_wait_ms` accrues from acquisition through commit or abandonment, but
 only during intervals in which MQTT is connected. It accrues in both active
@@ -254,30 +293,22 @@ struct PushOutcome {
     RecordIdentity lost;
 };
 
-struct AcquiredPin {
-    TelemetryRecord record;
-    uint64_t protected_evictions_at_acquire;
-};
-
 PushOutcome push(const TelemetryRecord& rec);
-bool acquirePin(AcquiredPin& out);                             // pin + pressure snapshot, one lock
+bool acquirePin(TelemetryRecord& out);                         // pin + record copy, one lock
 bool commitPinnedHead(uint32_t boot_id, uint32_t seq);         // validate + pop, one lock
 bool abandonPinnedHead(uint32_t boot_id, uint32_t seq,
                        RecordIdentity& abandoned);             // validate + drop + count
 ```
 
-`acquirePin()` copies the record and the current `protected_evictions` counter
-under the same buffer-mutex acquisition that establishes the pin. Taking the
-counter snapshot through a later `getStats()` call would be another cross-core
-check-then-act race: a producer could perform a protected eviction after the pin
-was established but before the snapshot, causing that lease's pressure budget
-to miss the eviction.
-
 Extend the existing atomic `BufferStats` snapshot with cumulative
 `evicted_oldest`, `protected_evictions`, `rejected_newest`, and `abandoned`
-counters. `connectionTask` uses that snapshot for periodic diagnostics;
+counters. Here `abandoned` counts local lease-release decisions, not confirmed
+delivery loss. `connectionTask` uses that snapshot for periodic diagnostics;
 `buffer_unavailable` and `diagnostic_events_lost` live in `LossJournal` because
 they can occur when the buffer is unavailable or the journal itself is full.
+The buffer's cumulative `abandoned` value maps to diagnostic
+`lease_abandoned`; connectionTask additionally increments exactly one subtype,
+`lease_abandoned_unpublished` or `lease_abandoned_after_publish`.
 
 `abandonPinnedHead()` replaces an earlier `releasePin(bool dropRecord)`. A
 boolean parameter makes it too easy to unpin a transmitted record without
@@ -286,8 +317,9 @@ the implementation guarantee that abandonment always counts. It validates the
 requested identity under the buffer mutex and returns the identity it actually
 removed. It does **not** emit MQTT or mutate the diagnostic journal:
 `BufferManager` has neither the lease timers nor ownership of the network path.
-`connectionTask` records the returned identity and its lease metadata in
-`LossJournal`, then publishes the event later. A second operation
+`connectionTask` records the returned identity and its lease metadata as a
+delivery-outcome event in `LossJournal`, then publishes the event later. A
+second operation
 `cancelUnpublishedPin()` would be needed only for releasing a lease that was
 never published — no transition in §4 reaches that, so it is not added until a
 caller exists.
@@ -305,10 +337,13 @@ cannot mean that. The enum removes the ambiguity; fix that log with it.
 
 ### 5.1 LossJournal boundary
 
-`LossJournal` accepts `{policy, lost identity}` observations from every buffer
-producer and the richer abandonment observation from `connectionTask`. It
-serializes updates under its own mutex, coalesces only adjacent identities, and
-keeps a bounded RAM queue of closed ranges/events for `connectionTask` to emit.
+`LossJournal` accepts `{policy, lost identity}` observations for confirmed local
+losses from every buffer producer, plus delivery-outcome observations for lease
+abandonment from `connectionTask`. An abandonment after a successful publish is
+not labeled as loss because its downstream result is unknown until reconciled.
+The journal serializes updates under its own mutex, coalesces only adjacent
+identities, and keeps a bounded RAM queue of closed ranges/events for
+`connectionTask` to emit.
 `connectionTask` periodically asks it to close an expired open range before
 draining that queue; a timer does not depend on another loss arriving. The
 journal never calls MQTT itself. If its bounded queue overflows, it increments
@@ -358,23 +393,30 @@ not consume an ACK retry budget, since ACK receipt is impossible then.
 Abandon when:
 
 ```
-(publish_calls >= ABANDON_MAX_PUBLISH_CALLS
-     && connected_wait_ms >= ABANDON_MIN_CONNECTED_MS)
-  || (protected_evictions - protected_evictions_at_acquire)
-         >= ABANDON_MAX_PROTECTED_EVICTIONS
+publish_calls >= ABANDON_MAX_PUBLISH_CALLS
+  && connected_wait_ms >= ABANDON_MIN_CONNECTED_MS
 ```
+
+`protected_evictions` remains an operational pressure counter but is not an
+abandonment trigger. With the proposed defaults, connected-time abandonment
+matures around 15 seconds while 1000 protected evictions require about 500
+seconds at 2 Hz, so the pressure term cannot win while connected. While
+disconnected, no drain is possible and the pin costs only one buffer slot;
+discarding it under pressure would give up the retry guarantee without
+unblocking delivery. Connected and ACK-capable time directly measures the
+head-of-line blocking the policy needs to bound.
 
 Failed publishes must be **paced**. `publish() == false` moves straight to
 `RETRY_PENDING`, and without a retry-time guard the next delivery signal would
 retry it 100 ms later in `SYNCING`. With the cap reached at call 5 (500 ms) but
 the time condition not maturing until 15 s, the firmware would make **150
-failed `publish()` calls**
-in that window. The constants below were sized for the success path, where
+failed `publish()` calls** in that window. The constants below were sized for
+the success path, where
 pacing comes from the 3 s ACK timeout; the failure path has no such pacing.
 
 Add `next_attempt_at_ms` to the lease. A failed publish schedules the next
 attempt at an exponential backoff starting at `ABANDON_RETRY_BACKOFF_MS`
-(1000 ms) and doubling. The retry transitions in rows 7-8 fire only when
+(1000 ms) and doubling. The retry transitions in rows 6-7 fire only when
 `millis() >= next_attempt_at_ms`.
 Once `publish_calls >= ABANDON_MAX_PUBLISH_CALLS`, **no further `publish()`
 calls are made** while the connected-time condition matures.
@@ -388,9 +430,9 @@ deterministic cause such as an oversized payload is not repaired by reconnecting
 The budget keys on `publish_calls`, **not** on successful publishes. A budget
 counting only successes cannot terminate a lease whose `publish()` fails
 deterministically — payload over the transport ceiling (§1.4), an oversized
-topic, a persistent client-state fault. In that case successes stay at zero
-forever, and without saturation the eviction term never fires either, so the
-lease pins the buffer permanently and delivery stalls with no diagnostic.
+topic, or a persistent client-state fault. Without the publish-call budget,
+successes would stay at zero forever, pinning the buffer permanently and
+stalling delivery with no diagnostic.
 `successful_publishes` is retained to attribute the abandonment reason.
 
 Proposed starting values, to be tuned on hardware:
@@ -400,16 +442,12 @@ Proposed starting values, to be tuned on hardware:
 | `ABANDON_MAX_PUBLISH_CALLS` | 5 | Success path: 5 × `MQTT_ACK_TIMEOUT_MS` (3000) = 15 s. Failure path: 5 backoff steps = 15 s |
 | `ABANDON_RETRY_BACKOFF_MS` | 1000 | Doubling; paces failed publishes so both conditions mature together |
 | `ABANDON_MIN_CONNECTED_MS` | 15000 | Both conditions required, so a fast retry storm cannot abandon early |
-| `ABANDON_MAX_PROTECTED_EVICTIONS` | 1000 | ~500 s of head-of-line blocking at saturation and 2 Hz |
 
 Reason codes: `ack_budget_exhausted` (`successful_publishes > 0`),
-`publish_failure_budget_exhausted` (`successful_publishes == 0`),
-`head_of_line_blocking` (eviction term fired).
-
-The eviction term is the head-of-line-blocking bound and fires independently: it
-is the only trigger that responds to the pin costing other records their
-delivery. It uses a per-lease delta against the acquire-time snapshot, never the
-raw cumulative counter.
+and `publish_failure_budget_exhausted` (`successful_publishes == 0`). The former
+means delivery is unknown, not failed: one or more MQTT publishes were accepted,
+but no matching application ACK arrived. The latter is a confirmed local loss
+under the client contract because no publish attempt was accepted.
 
 Because the pin is held across disconnect, a record published-but-unACKed just
 before an outage becomes the head of the post-reconnect drain. The budget
@@ -421,13 +459,18 @@ therefore bounds recovery time from every outage, not only pathological ones.
 
 New topic `sensor/<node>/diag`, separate from telemetry. Three message kinds,
 all carrying `boot_id` and a monotonic `diag_id` in **its own ID space** — a
-loss record is control-plane evidence about missing telemetry, not telemetry,
-and must not consume a `sequence_id` or perturb the sequence it explains.
+diagnostic record is control-plane evidence about the delivery pipeline, not
+telemetry, and must not consume a `sequence_id` or perturb the sequence it
+describes.
 
-**Abandonment is not the only intentional loss.** `evicted_oldest`,
-`evicted_protected`, `rejected_newest`, and `buffer_unavailable` each create
-sequence gaps. If exact classification is a requirement, every loss policy must
-journal identities, not just lease abandonment. Per-record MQTT events are
+Lease abandonment is not itself proof of delivery loss. It means the firmware
+stopped retaining and retrying a record after its bounded budget expired. If
+`successful_publishes > 0`, the record may already be in InfluxDB and the
+missing ACK may be the only failure. The confirmed local loss policies
+`evicted_oldest`, `evicted_protected`, `rejected_newest`, and
+`buffer_unavailable` each create sequence gaps. If exact classification is a
+requirement, every loss policy must journal identities, not just lease
+abandonment. Per-record MQTT events are
 infeasible at 2 Hz saturation, but adjacent loss identities can be compressed
 into an exact range:
 
@@ -476,22 +519,28 @@ than an oversight.
 Ranges are otherwise emitted on close — policy change, a bounded max span, or a
 publish interval — not per evicted record.
 
-Abandonment event:
+Lease-abandonment outcome event:
 
 ```json
 {
   "boot": 4,
   "diag_id": 17,
-  "kind": "abandonment",
+  "kind": "lease_abandonment",
   "abandoned_boot": 4,
   "abandoned_seq": 4821,
   "reason": "ack_budget_exhausted",
+  "delivery_outcome": "unknown_after_publish",
+  "ever_published": true,
   "publish_calls": 5,
   "successful_publishes": 5,
-  "connected_wait_ms": 15000,
-  "protected_evictions": 42
+  "connected_wait_ms": 15000
 }
 ```
+
+For `publish_failure_budget_exhausted`, emit `ever_published: false` and
+`delivery_outcome: "not_published"`. For `ack_budget_exhausted`, always emit
+`delivery_outcome: "unknown_after_publish"`; never label it `lost` merely
+because the firmware stopped retrying.
 
 Periodic cumulative counters (not on `TelemetryRecord`: adding four `uint32`
 fields to the 48-byte record would grow the ring by ~800 KB and change the MQTT
@@ -507,7 +556,9 @@ changes rarely):
   "protected_evictions": 42,
   "rejected_newest": 0,
   "buffer_unavailable": 0,
-  "abandoned": 1,
+  "lease_abandoned": 1,
+  "lease_abandoned_unpublished": 0,
+  "lease_abandoned_after_publish": 1,
   "diagnostic_events_lost": 0,
   "lease_internal_errors": 0,
   "ack_mismatch": 0,
@@ -519,8 +570,15 @@ Counters give magnitude and self-heal — any later message re-reports the
 cumulative total, so a lost diagnostic does not lose the count. Events give
 identity. Both are needed: a bare counter cannot say *which* gap is explained,
 and a best-effort event can itself be lost during the outage that caused it.
-The exact identity comes from `PushOutcome` or `abandonPinnedHead()`, is recorded
-by `LossJournal`, and is never reconstructed from buffer state after mutation.
+`lease_abandoned_after_publish` is an outcome counter, not a confirmed-loss
+counter, and must never be subtracted from an unrelated gap by magnitude. The
+exact record identity comes from `PushOutcome` or `abandonPinnedHead()`, is
+recorded by `LossJournal`, and is never reconstructed from buffer state after
+mutation.
+
+The diagnostic name `buffer_unavailable` maps exactly to
+`PushResult::NOT_INITIALISED`; it is the loss policy used when the incoming
+record cannot enter an unavailable buffer.
 
 **Cumulative counters reset to zero at boot.** A decrease across records is a
 boot marker, not corruption, and the checker must encode that. Counters
@@ -553,6 +611,41 @@ as loss — never converted into an unconditional pass. A counter-driven
 classifier is exactly the thing that decays into a way to launder failures;
 this rule is the guard.
 
+### 8.1 Lease-abandonment reconciliation
+
+Lease-abandonment events require a separate identity reconciliation because an
+event may refer to a record that was delivered successfully. They are not fed
+blindly into loss-counter subtraction.
+
+| Result | Condition | Meaning |
+|---|---|---|
+| **Abandoned but delivered** | Referenced identity exists in InfluxDB and `ever_published == true` | ACK path failed or was too slow; delivery succeeded; no sequence loss |
+| **Attributed abandonment gap** | Referenced identity is absent and falls inside an observed sequence gap | Real observed data loss associated with the bounded-abandonment decision |
+| **Unexpected delivery after local publish failure** | Referenced identity exists but `ever_published == false` | Transport-contract anomaly, partial-write edge case, or identity collision; investigate |
+| **Indeterminate abandonment** | Referenced identity lies outside the telemetry query's covered identity/time range | No delivery conclusion; do not use the event for reconciliation |
+
+The checker must query the referenced `boot_id + sequence_id` directly, or prove
+that its telemetry query covers that identity, before declaring it absent. A
+diagnostic event inside a recent time window may reference an older telemetry
+record outside that window. Treating absence from the window as delivery loss
+would create a false gap.
+
+`lease_abandoned_after_publish` never explains another gap by magnitude. An
+exact identity match can attribute an observed gap; an identity found in
+InfluxDB instead produces `Abandoned but delivered`. The unpublished-abandonment
+counter may support the weaker device-reported/unattributed category, but only
+within the same boot and covered query interval.
+
+**A lost after-publish abandonment event therefore degrades to `Unexplained`
+(FAIL), not to the unattributed category — and that is intentional.** The event
+is the only exact path, since magnitude reconciliation is barred for this
+counter by the rule above. If the event is lost (journal overflow, or RAM-only
+retention across a reboot per D2) and the record was genuinely not persisted,
+the resulting gap is a record the device published and the pipeline did not
+store. That warrants investigation rather than a softer verdict, so the
+classifier is correct to fail it. Recorded here so the outcome reads as a
+decision rather than as an overlooked counter.
+
 ---
 
 ## 9. Open decisions
@@ -570,6 +663,13 @@ across a reboot. A boot boundary explains why *numbering resets*; it does not
 explain a gap created earlier within the previous boot. If an abandonment
 occurs, later records in that boot are delivered, the diagnostic is lost, and
 the device then reboots, the checker sees an unexplained gap from a prior boot.
+The cost is sharper than lost attribution alone: per §8.1, a lost after-publish
+abandonment event cannot fall back to magnitude reconciliation, so RAM-only
+retention converts a known policy outcome into an `Unexplained` FAIL whenever
+that event is lost and the record was not persisted. That is the correct
+verdict, but it means the durability choice changes test results, not just
+diagnostic richness.
+
 *Recommendation:* RAM-only for this landing, with the limitation stated in
 `store-and-forward-status.md`. Revisit if a hardware run produces an unexplained
 gap. NVS persistence would need batched writes for flash wear, following the
@@ -633,7 +733,7 @@ original.
 | 9 | Late ACK commits in `RETRY_PENDING` when `ever_published` | — |
 | 10 | ACK rejected when `ever_published == false` | — |
 | 11 | Mismatched ACK increments `ack_mismatch` and mutates nothing | Yes |
-| 12 | Abandonment emits an event, increments `abandoned`, and releases the pin | — |
+| 12 | Abandonment emits a delivery-outcome event, increments `lease_abandoned` and its correct subtype, and releases the pin | — |
 | 13 | Persistent `publish() == false` follows backoff, makes no calls after the cap, and abandons when connected time matures | — |
 | 14 | `PushOutcome` reports the exact second-oldest victim identity before overwrite | — |
 | 15 | Same-policy losses separated by delivered records produce separate ranges | — |
@@ -641,9 +741,13 @@ original.
 | 17 | MQTT transport-buffer allocation failure is surfaced by `MqttManager::begin()` | — |
 | 18 | Loss-journal overflow increments `diagnostic_events_lost` and preserves cumulative magnitude accounting | — |
 | 19 | Failed commit/abandon identity validation increments `lease_internal_errors` and clears no state | — |
-| 20 | Protected-eviction budget can abandon safely while `AWAITING_ACK` | — |
-| 21 | Matching ACK wins when ACK, timeout, and abandonment become ready in the same iteration | — |
-| 22 | `acquirePin()` snapshots protected-eviction count atomically; a concurrent first eviction is included in that lease's delta | — |
+| 20 | Matching ACK wins when ACK, timeout, and abandonment become ready in the same iteration | — |
+| 21 | Abandoned-after-publish identity present in InfluxDB reports `Abandoned but delivered` and no loss | — |
+| 22 | Abandoned identity absent inside an observed gap reports `Attributed abandonment gap` | — |
+| 23 | Abandoned identity outside the covered query range reports `Indeterminate abandonment` | — |
+| 24 | `PushResult::NOT_INITIALISED` maps to `buffer_unavailable` | — |
+| 25 | `lease_abandoned_after_publish` never reconciles an unrelated gap by magnitude | — |
+| 26 | Identity present after `publish_failure_budget_exhausted` reports `Unexpected delivery after local publish failure` | — |
 
 Test 1 is the reproducible window in the current implementation and lands first,
 as a failing test against the extracted legacy behaviour, before any lease
@@ -665,8 +769,8 @@ code.
    add the bounded, thread-safe `LossJournal`.
 5. Lease controller in `connectionTask`; `telemetryTask` / `syncTask` reduced to
    cadence.
-6. Diagnostics: loss ranges and abandonment events, cumulative counters, bridge
-   routing, checker four-way classification.
+6. Diagnostics: loss ranges and lease-abandonment outcome events, cumulative
+   counters, bridge routing, gap classification, and abandonment reconciliation.
 7. Evidence-backed hardware validation — raw `integrity_check.py` output
    committed under `docs/validation/`, closing the open TODO in
    `store-and-forward-status.md`.
