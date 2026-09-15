@@ -19,8 +19,8 @@ lands.
 The system's guarantee is that a telemetry record stays in PSRAM until the
 bridge confirms it reached InfluxDB. That guarantee is enforced by state no
 single component owns: *which record is currently being delivered* is spread
-across a boolean flag, two identity globals, and the ring buffer's tail
-position — written at different moments, by different tasks, on different
+across a boolean flag, two identity globals, and the ring buffer's read
+index — written at different moments, by different tasks, on different
 cores, with nothing keeping them consistent.
 
 Two consequences follow independently. At capacity, the overflow policy evicts
@@ -510,7 +510,7 @@ saturate again. Also, sequence IDs are assigned before `push()` by more than one
 producer, so task scheduling can make ring order differ from sequence order.
 Contiguity is an opportunity checked per observation, never an invariant of an
 overflow policy. `rejected_newest` describes discarding the incoming record; it
-does not remove a record at the ring head.
+does not remove the oldest record at `_readIndex`.
 
 Sequence wrap is out of reach within a boot: `sequence_id` is `uint32` and at
 2 Hz would take ~68 years to wrap, and `boot_id` increments make it moot. The

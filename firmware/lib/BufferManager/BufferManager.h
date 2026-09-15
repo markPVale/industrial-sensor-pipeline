@@ -12,9 +12,15 @@
 // --------------------
 //   - Task-safe: all public methods are protected by a FreeRTOS mutex.
 //   - NOT ISR-safe: never call from an interrupt context.
-//   - Intended for exactly one producer (sensorTask) and one consumer
-//     (syncTask). Works correctly with N producers/consumers but the
-//     single-producer/single-consumer assumption is how the system is wired.
+//   - Two producers call push(), both pinned to core 1: filterTask (windowed
+//     telemetry records) and sensorTask (fault records via emitFaultRecord).
+//   - Three tasks read: telemetryTask, syncTask, and connectionTask all call
+//     peek(), but only connectionTask calls pop(). It runs on core 0.
+//   - Producers therefore run genuinely concurrently with the consumer on a
+//     different core. Do NOT assume a push() cannot land between a consumer's
+//     peek() and its pop(): on a full buffer that push() evicts the very
+//     record the consumer just validated, and the pop() then removes a
+//     different, unacknowledged one. See docs/delivery-lease-design.md §1.1.
 //
 // Overflow policy
 // ---------------
