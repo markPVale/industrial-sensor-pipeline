@@ -19,7 +19,7 @@
 // Overflow policy
 // ---------------
 //   When the buffer is full, push() drops the oldest unread record (advances
-//   _tail), increments _dropped, then writes the new record. This preserves
+//   _readIndex), increments _dropped, then writes the new record. This preserves
 //   the most-recent data — correct for industrial telemetry where a stale
 //   reading is less useful than a fresh one. FIFO ordering is maintained
 //   among all retained records.
@@ -52,7 +52,7 @@ public:
     // Safe to call before begin() or after end().
     void end();
 
-    // Reset head, tail, count, and dropped to zero without releasing memory.
+    // Reset read/write indexes, count, and dropped to zero without releasing memory.
     // Existing records are logically discarded (not zeroed).
     // No-op if not initialised.
     void clear();
@@ -92,11 +92,11 @@ public:
     BufferStats getStats();
 
 private:
-    TelemetryRecord*  _buffer   = nullptr;
-    size_t            _head     = 0;   // index of next write slot
-    size_t            _tail     = 0;   // index of next read slot
-    size_t            _capacity = 0;
-    size_t            _count    = 0;   // records currently held
-    size_t            _dropped  = 0;   // cumulative eviction count
-    SemaphoreHandle_t _mutex    = nullptr;
+    TelemetryRecord*  _buffer     = nullptr;
+    size_t            _writeIndex = 0;   // index of next write slot
+    size_t            _readIndex  = 0;   // index of oldest record / next read slot
+    size_t            _capacity   = 0;
+    size_t            _count      = 0;   // records currently held
+    size_t            _dropped    = 0;   // cumulative eviction count
+    SemaphoreHandle_t _mutex      = nullptr;
 };

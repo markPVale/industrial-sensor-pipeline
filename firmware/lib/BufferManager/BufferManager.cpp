@@ -29,13 +29,13 @@ bool BufferManager::begin(size_t capacity) {
     }
 
     // Only commit state once both resources are confirmed good.
-    _buffer   = new_buffer;
-    _mutex    = new_mutex;
-    _capacity = capacity;
-    _head     = 0;
-    _tail     = 0;
-    _count    = 0;
-    _dropped  = 0;
+    _buffer     = new_buffer;
+    _mutex      = new_mutex;
+    _capacity   = capacity;
+    _writeIndex = 0;
+    _readIndex  = 0;
+    _count      = 0;
+    _dropped    = 0;
 
     return true;
 }
@@ -50,11 +50,11 @@ void BufferManager::end() {
         _buffer = nullptr;
     }
 
-    _capacity = 0;
-    _head     = 0;
-    _tail     = 0;
-    _count    = 0;
-    _dropped  = 0;
+    _capacity   = 0;
+    _writeIndex = 0;
+    _readIndex  = 0;
+    _count      = 0;
+    _dropped    = 0;
 
     if (_mutex) {
         xSemaphoreGive(_mutex);
@@ -66,10 +66,10 @@ void BufferManager::end() {
 void BufferManager::clear() {
     if (!_mutex) return;
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    _head    = 0;
-    _tail    = 0;
-    _count   = 0;
-    _dropped = 0;
+    _writeIndex = 0;
+    _readIndex  = 0;
+    _count      = 0;
+    _dropped    = 0;
     xSemaphoreGive(_mutex);
 }
 
@@ -84,13 +84,13 @@ bool BufferManager::push(const TelemetryRecord& rec) {
 
     if (_count == _capacity) {
         // Buffer full: evict oldest record so the newest data is preserved.
-        _tail = (_tail + 1) % _capacity;
+        _readIndex = (_readIndex + 1) % _capacity;
         _dropped++;
         _count--;
     }
 
-    _buffer[_head] = rec;
-    _head = (_head + 1) % _capacity;
+    _buffer[_writeIndex] = rec;
+    _writeIndex = (_writeIndex + 1) % _capacity;
     _count++;
 
     xSemaphoreGive(_mutex);
@@ -107,8 +107,8 @@ bool BufferManager::pop(TelemetryRecord& rec) {
         return false;
     }
 
-    rec   = _buffer[_tail];
-    _tail = (_tail + 1) % _capacity;
+    rec = _buffer[_readIndex];
+    _readIndex = (_readIndex + 1) % _capacity;
     _count--;
 
     xSemaphoreGive(_mutex);
@@ -125,7 +125,7 @@ bool BufferManager::peek(TelemetryRecord& rec) {
         return false;
     }
 
-    rec = _buffer[_tail];
+    rec = _buffer[_readIndex];
 
     xSemaphoreGive(_mutex);
     return true;

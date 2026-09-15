@@ -510,11 +510,11 @@ static void connectionTask(void* pvParams) {
             if (g_bufferRecordInFlight.load() &&
                 ackBoot == inFlightBoot &&
                 ackSeq == inFlightSeq) {
-                TelemetryRecord head;
-                if (g_buffer.peek(head) &&
-                    head.boot_id == ackBoot &&
-                    head.sequence_id == ackSeq) {
-                    g_buffer.pop(head);
+                TelemetryRecord oldestRecord;
+                if (g_buffer.peek(oldestRecord) &&
+                    oldestRecord.boot_id == ackBoot &&
+                    oldestRecord.sequence_id == ackSeq) {
+                    g_buffer.pop(oldestRecord);
                     g_bufferRecordInFlight.store(false);
                     g_inFlightSentAtMs.store(0);
                 } else {
