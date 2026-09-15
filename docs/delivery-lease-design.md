@@ -352,22 +352,24 @@ the device-reported/unattributed classification rather than disappear silently.
 
 ### 5.2 Second-oldest eviction
 
-At capacity with a pinned tail `T`, preserve the pin and shed the second-oldest,
-O(1):
+At capacity with a pinned oldest record at read index `R`, preserve the pin and
+shed the second-oldest, O(1):
 
 ```
-_buffer[(T+1) % cap] = _buffer[T];   // pinned record slides forward
-_tail = (T+1) % cap; _count--; protected_evictions++;
-_buffer[_head] = rec; _head = (_head+1) % cap; _count++;
+_buffer[(R+1) % cap] = _buffer[R];   // pinned record moves to the next slot
+_readIndex = (R+1) % cap; _count--; protected_evictions++;
+_buffer[_writeIndex] = rec; _writeIndex = (_writeIndex+1) % cap; _count++;
 ```
 
-Result: pinned record remains the tail, new record is newest, FIFO holds.
+Result: the pinned record remains the oldest record at `_readIndex`, the new
+record is newest, and FIFO order holds.
 **The pin must be identity-based, not a slot index** — this operation moves the
 pinned record, so a slot pointer would be invalidated by the very step that
 protects it.
 
-Correct for **exactly one** pinned tail, from capacity 2 upward. At capacity 1
-it degenerates to overwriting the pinned record — the exact bug being fixed.
+Correct for **exactly one** pinned oldest record, from capacity 2 upward. At
+capacity 1 it degenerates to overwriting the pinned record — the exact bug being
+fixed.
 Guard it as:
 
 ```cpp
