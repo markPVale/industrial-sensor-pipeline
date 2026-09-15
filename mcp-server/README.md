@@ -12,6 +12,21 @@ Raspberry Pi alongside the gateway stack and queries InfluxDB directly.
 | `get_sensor_health` | Health summary — online status, last-seen age, plain-English diagnosis |
 | `get_recent_anomalies` | Up to 50 most recent actionable vibration and sensor-fault events within a configurable lookback window |
 
+## Known Limitation: Anomaly-Window Coverage
+
+`get_recent_anomalies` currently queries only flagged events. An empty result
+therefore means no matching event was found; it does not prove that ordinary
+telemetry covered the requested interval. A node that was offline for the whole
+window can currently receive the same "No anomalies detected" response as a
+healthy node.
+
+Until the coverage-aware result contract in the
+[engineering roadmap](../docs/roadmap.md#coverage-aware-anomaly-results) is
+implemented, an empty anomaly result must be treated as inconclusive unless
+telemetry coverage for the entire requested window is independently verified.
+`get_sensor_health` can establish current freshness, but it cannot provide that
+historical coverage proof.
+
 `get_sensor_health` returns a `health_summary` string with one of:
 
 Health merges the latest `vibration` and `sensor_faults` flags inside the
