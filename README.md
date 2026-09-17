@@ -6,18 +6,23 @@
 
 **[▶ Watch the 85-second demo](https://youtu.be/uQSLWFSDjXw)** — live telemetry, ACK-gated buffering, broker outage recovery, and integrity validation.
 
-End-to-end industrial vibration monitoring system: ESP32-S3 firmware &rarr; MQTT &rarr; InfluxDB &rarr; Grafana, with ACK-gated store-and-forward delivery, graduated fault recovery, and an AI query layer via Model Context Protocol.
+**MPU-6050 → ESP32-S3/FreeRTOS → PSRAM buffer → MQTT → Raspberry Pi → InfluxDB → Grafana**
 
-An ESP32-S3 samples a 6-axis IMU at 100Hz, applies Kalman filtering, detects vibration anomalies, and streams telemetry to a Raspberry Pi gateway with safety interlock support. A Model Context Protocol server on the Pi lets Claude Code query live sensor data in plain English: _"Were there any anomalies in the last hour?"_
+A fault-tolerant edge telemetry system for industrial vibration monitoring. The ESP32 samples a 6-axis IMU at 100 Hz, detects vibration anomalies, and buffers telemetry locally during connectivity loss. A Raspberry Pi gateway persists records to InfluxDB and acknowledges each record only after a successful write.
 
-## Validation Results
+A Model Context Protocol server provides a natural-language query interface over the resulting telemetry.
 
-Recorded hardware validation on Raspberry Pi 5 + ESP32-S3:
+## Hardware Validation
 
-- Baseline run: 234 records, 0 sequence gaps per `integrity_check.py`, timestamp monotonicity PASS, data fidelity PASS.
-- Controlled Mosquitto broker outage/restart: 570 records, 0 sequence gaps per `integrity_check.py`, timestamp monotonicity PASS, data fidelity PASS.
-- ACK path confirmed over MQTT: each telemetry record received a matching `sensor/node01/ack` after the bridge wrote it to InfluxDB.
-- MCP tools validated against live InfluxDB data: latest telemetry, health summary, and recent anomalies.
+Tested on ESP32-S3 + Raspberry Pi 5:
+
+| Test | Result |
+|---|---|
+| Baseline telemetry | 234 records, 0 sequence gaps |
+| MQTT broker outage/restart | 570 records, 0 sequence gaps |
+| Timestamp monotonicity | PASS |
+| ACK after InfluxDB persistence | PASS |
+| MCP queries against live telemetry | PASS |
 
 The raw output from this run was not retained in the repository, so these are
 recorded results rather than independently auditable evidence. See the
@@ -25,11 +30,11 @@ recorded results rather than independently auditable evidence. See the
 
 ## Why This Matters
 
-I started this expecting the hard part to be the dashboards. It was not. The hard part was that the sensor lies and the network drops, and almost nothing in a typical tutorial pipeline accounts for either.
+Reliable telemetry requires handling failures at both the device and network layers.
 
-A real MPU-6050 does not always fail loudly. Yank the SDA line mid-transaction and it can hang in a state that survives a firmware restart while the sensor remains powered, then quietly returns zeros that look like a machine sitting still. WiFi drops for ninety seconds and a naive pipeline loses those ninety seconds forever. Most monitoring projects assume the broker is always up and the sensor is always honest. Run one in the field for an afternoon and both assumptions break.
+The MPU-6050 can fail in ways that are difficult to distinguish from valid readings. An interrupted I2C transaction, for example, can leave the sensor returning zeros even after the ESP32 restarts. Network outages introduce a separate problem: telemetry generated while MQTT is unavailable must be retained and delivered later without duplication or loss.
 
-So this project is built backwards from the failures. Buffer when the link dies. Refuse to drop a record until the gateway confirms it landed in the database. Tell the difference between a dead sensor and a quiet one. That reliability layer between a physical sensor and a dataset you would actually trust is the boring problem that has to be solved before "AI on real-world data" means anything, and it is the part I'm most interested in.
+This project focuses on those failure modes. Telemetry is buffered locally during outages, replayed after reconnect, and removed only after the gateway confirms persistence to InfluxDB. Sensor health is monitored independently so a failed sensor can be distinguished from a legitimately quiet machine.
 
 ## Architecture
 
@@ -271,5 +276,5 @@ remain in their component documents and are linked from that roadmap.
 
 ## Author
 
-Built by Mark Vale — full-stack engineer working at the hardware, distributed systems, and AI tooling boundary.
+Built by [Mark Vale](...) · [LinkedIn](...)
 LinkedIn: <https://www.linkedin.com/in/markvalestudio/>
