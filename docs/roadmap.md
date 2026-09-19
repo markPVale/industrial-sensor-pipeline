@@ -1,6 +1,6 @@
 # Engineering Roadmap
 
-Last reviewed: **2026-09-12**
+Last reviewed: **2026-09-19**
 
 This is the canonical list of open engineering work for the repository. Component
 documents remain authoritative for design details and test procedures, but new
@@ -85,6 +85,12 @@ conflates healthy telemetry with absent or incomplete telemetry.
 
 - [ ] Add priority-tiered store-and-forward so routine telemetry is evicted
   before sensor-fault and interlock records.
+- [ ] Emit a boot diagnostic containing the new `boot_id`, ESP reset reason,
+  startup timestamp, and reset classification (power-on, brownout,
+  intentional/software, watchdog, or other). Persist and expose it through the
+  gateway so power interruptions are visible. This provides observability only;
+  it does not recover telemetry lost from volatile PSRAM or cover time when the
+  sensor had no power.
 - [ ] Revisit durable diagnostic journaling if RAM-only loss events create
   unexplained gaps during hardware validation; batch NVS writes to control flash
   wear.
