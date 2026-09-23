@@ -23,10 +23,12 @@
 #include "BufferManager.h"
 #include "MqttManager.h"
 
-// PubSubClient stores the full MQTT packet in one buffer. Keep the configured
-// transport capacity tied to the largest declared payload and topic rather than
-// relying on PubSubClient's smaller default MQTT_MAX_PACKET_SIZE.
+// PubSubClient stores the full MQTT packet in one shared transmit/receive
+// buffer. Keep its capacity tied to the largest declared payload and topic,
+// including the packet identifier carried by an inbound QoS 1 ACK PUBLISH,
+// rather than relying on PubSubClient's smaller default MQTT_MAX_PACKET_SIZE.
 static constexpr size_t kMqttTopicLengthBytes = 2;
+static constexpr size_t kMqttQos1PacketIdBytes = 2;
 static constexpr size_t kMqttTelemetryTopicLength = sizeof(MQTT_TOPIC_TELEMETRY) - 1;
 static constexpr size_t kMqttEstopTopicLength = sizeof(MQTT_TOPIC_ESTOP) - 1;
 static constexpr size_t kMqttAckTopicLength = sizeof(MQTT_TOPIC_ACK) - 1;
@@ -38,10 +40,10 @@ static constexpr size_t kMqttLongestTopicLength =
                ? kMqttEstopTopicLength : kMqttAckTopicLength);
 static constexpr size_t kMqttRequiredBufferSize =
     MQTT_MAX_HEADER_SIZE + kMqttTopicLengthBytes +
-    kMqttLongestTopicLength + MQTT_PAYLOAD_SIZE;
+    kMqttLongestTopicLength + kMqttQos1PacketIdBytes + MQTT_PAYLOAD_SIZE;
 
 static_assert(MQTT_CLIENT_BUFFER_SIZE >= kMqttRequiredBufferSize,
-              "MQTT_CLIENT_BUFFER_SIZE is too small for the configured payload and topics");
+              "MQTT_CLIENT_BUFFER_SIZE is too small for the configured QoS 1 packet");
 
 // -----------------------------------------------------------------------------
 // RawSample — passed from sensorTask to filterTask via g_sensorQueue.
@@ -64,13 +66,18 @@ struct RawSample {
 // MqttManager is NOT thread-safe; all publish calls happen in connectionTask.
 // -----------------------------------------------------------------------------
 struct MqttMessage {
-    char topic[64];
+    static constexpr size_t kTopicCapacity = 64;
+
+    char topic[kTopicCapacity];
     char payload[MQTT_PAYLOAD_SIZE];
     bool retained;
     bool commit_buffer_record;
     uint32_t boot_id;
     uint32_t sequence_id;
 };
+
+static_assert(kMqttLongestTopicLength < MqttMessage::kTopicCapacity,
+              "MqttMessage::topic is too small for a configured MQTT topic");
 
 // -----------------------------------------------------------------------------
 // Hardware thresholds — derived from ranges configured in initMPU6050()
@@ -409,7 +416,7 @@ void setup() {
         fatalSetupHalt("[MQTT] FATAL — could not allocate MQTT packet buffer.");
     }
     Serial.printf("[MQTT] OK — %u-byte packet buffer allocated.\n",
-                  MQTT_CLIENT_BUFFER_SIZE);
+                  static_cast<unsigned>(MQTT_CLIENT_BUFFER_SIZE));
 
     // NTP — sync to UTC on WiFi connect. No offset, no DST.
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");

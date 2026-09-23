@@ -16,6 +16,10 @@ bool MqttManager::begin(const char* ssid,
                         const char* clientId,
                         uint16_t    keepaliveSecs,
                         uint16_t    packetBufferSize) {
+    if (!_mqttClient.setBufferSize(packetBufferSize)) {
+        return false;
+    }
+
     _ssid     = ssid;
     _password = password;
     _brokerIp = brokerIp;
@@ -24,10 +28,6 @@ bool MqttManager::begin(const char* ssid,
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);   // MqttManager owns the reconnect logic
-
-    if (!_mqttClient.setBufferSize(packetBufferSize)) {
-        return false;
-    }
 
     _mqttClient.setServer(_brokerIp, _port);
     _mqttClient.setKeepAlive(keepaliveSecs);
