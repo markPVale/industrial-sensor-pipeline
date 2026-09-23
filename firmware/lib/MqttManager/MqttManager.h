@@ -58,14 +58,16 @@ public:
     void onDisconnect(Callback cb) { _onDisconnect = cb; }
     void onMessage(MessageCallback cb) { _onMessage = cb; }
 
-    // Store credentials and configure PubSubClient. Does NOT attempt to
-    // connect — the first connection happens inside loop().
-    void begin(const char* ssid,
+    // Store credentials and configure PubSubClient. Returns false if the MQTT
+    // packet buffer cannot be allocated. Does NOT attempt to connect — the
+    // first connection happens inside loop().
+    bool begin(const char* ssid,
                const char* password,
                const char* brokerIp,
                uint16_t    port,
                const char* clientId,
-               uint16_t    keepaliveSecs = 15);
+               uint16_t    keepaliveSecs,
+               uint16_t    packetBufferSize);
 
     // -------------------------------------------------------------------------
     // Runtime — call from connectionTask only

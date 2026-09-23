@@ -9,12 +9,13 @@
 // =============================================================================
 // begin() — store config; first connection attempt happens in loop()
 // =============================================================================
-void MqttManager::begin(const char* ssid,
-                         const char* password,
-                         const char* brokerIp,
-                         uint16_t    port,
-                         const char* clientId,
-                         uint16_t    keepaliveSecs) {
+bool MqttManager::begin(const char* ssid,
+                        const char* password,
+                        const char* brokerIp,
+                        uint16_t    port,
+                        const char* clientId,
+                        uint16_t    keepaliveSecs,
+                        uint16_t    packetBufferSize) {
     _ssid     = ssid;
     _password = password;
     _brokerIp = brokerIp;
@@ -23,6 +24,10 @@ void MqttManager::begin(const char* ssid,
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);   // MqttManager owns the reconnect logic
+
+    if (!_mqttClient.setBufferSize(packetBufferSize)) {
+        return false;
+    }
 
     _mqttClient.setServer(_brokerIp, _port);
     _mqttClient.setKeepAlive(keepaliveSecs);
@@ -33,6 +38,8 @@ void MqttManager::begin(const char* ssid,
             _onMessage(topic, payload, length);
         }
     });
+
+    return true;
 }
 
 // =============================================================================

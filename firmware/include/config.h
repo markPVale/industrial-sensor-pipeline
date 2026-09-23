@@ -112,3 +112,4 @@
 // connectionTask. 40 slots × ~400 bytes each ≈ 16 KB.
 #define MQTT_PUBLISH_QUEUE_DEPTH  40
 #define MQTT_PAYLOAD_SIZE         320   // bytes — fits one ArduinoJson telemetry record
+#define MQTT_CLIENT_BUFFER_SIZE   384   // full MQTT packet: header + topic + payload

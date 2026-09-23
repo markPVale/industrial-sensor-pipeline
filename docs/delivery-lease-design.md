@@ -760,7 +760,7 @@ code.
 ## 11. Implementation sequence
 
 1. This document. *(done)*
-2. Checked `setBufferSize()` fix + compile-time assertion tying
+2. Checked `setBufferSize()` fix + compile-time assertion tying *(done)*
    `MQTT_PAYLOAD_SIZE`, longest topic, topic-length field, and header reservation
    to `MQTT_CLIENT_BUFFER_SIZE` (§1.4). Small, independent, and removes the
    concrete trigger for deterministic publish failure before the budget depends

@@ -1,6 +1,6 @@
 # Engineering Roadmap
 
-Last reviewed: **2026-09-19**
+Last reviewed: **2026-09-22**
 
 This is the canonical list of open engineering work for the repository. Component
 documents remain authoritative for design details and test procedures, but new
@@ -19,14 +19,14 @@ Status convention:
 
 ### ACK-safe delivery lease
 
-Status: design complete; implementation open.
+Status: design complete; implementation in progress.
 
 Detailed design and test matrix:
 [`delivery-lease-design.md`](delivery-lease-design.md). Implementation order is
 intentional because the early tests must reproduce the current race before the
 state model is replaced.
 
-- [ ] Check the PubSubClient transport-buffer allocation, add the required
+- [x] Check the PubSubClient transport-buffer allocation, add the required
   compile-time size assertion, and surface allocation failure.
 - [ ] Add a native firmware test harness and a behavior-preserving seam around
   the legacy ACK state; reproduce the R0/R1 stale-ACK race as a failing test.
