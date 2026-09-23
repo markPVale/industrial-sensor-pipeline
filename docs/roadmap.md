@@ -1,6 +1,6 @@
 # Engineering Roadmap
 
-Last reviewed: **2026-09-22**
+Last reviewed: **2026-09-23**
 
 This is the canonical list of open engineering work for the repository. Component
 documents remain authoritative for design details and test procedures, but new
@@ -94,6 +94,24 @@ conflates healthy telemetry with absent or incomplete telemetry.
 - [ ] Revisit durable diagnostic journaling if RAM-only loss events create
   unexplained gaps during hardware validation; batch NVS writes to control flash
   wear.
+
+### Transient detection
+
+Status: detection gap. Anomaly detection sees only Kalman-filtered data, and
+accel spike rejection discards up to 7 consecutive samples (≤ 70 ms at 100 Hz)
+more than 0.5g from the estimate. A short impact below the ±8g clip threshold
+therefore never reaches the window RMS and is not flagged. The only raw-sample
+check today is clip detection in `sensorTask`.
+
+- [ ] Add a raw-path check in parallel with the filter: track per-window raw
+  peak accel magnitude and/or the count of filter-rejected samples, and surface
+  it in the published record. Only status bit `0x80` remains free in
+  `status_flags`; a new numeric field may fit better — update
+  [`telemetry-schema.md`](telemetry-schema.md) and the bridge accordingly.
+- [ ] Measure the gyro noise profile and set a gyro spike threshold (currently
+  disabled).
+- [ ] Validate on hardware with a deliberate short impact (tap test) that the
+  transient is flagged while the at-rest false-positive rate stays unchanged.
 
 ### MCP and analytics
 
