@@ -694,16 +694,20 @@ validation.
 
 ## 10. Test plan
 
-**Prerequisite: there is no host test harness, and current code cannot be
-tested in place.** `firmware/` has no `test/` directory and `platformio.ini`
-defines only `env:esp32s3-n16r8`; CI runs `pio run` only.
+**Harness status:** `firmware/platformio.ini` now defines `env:native`, and
+`test/test_legacy_delivery/test_main.cpp` reproduces the R0/R1 stale-ACK race
+against the production-used `LegacyDeliveryState` seam. The matching-ACK
+control test passes and the desired R0/R1 invariant intentionally fails against
+legacy behaviour. The native suite remains out of CI until the lease controller
+makes that regression green; CI continues to run the ESP32 build.
 
-Two distinct coupling problems, neither solved by mutex stubs alone:
+The extraction was required because of two distinct coupling problems, neither
+solved by mutex stubs alone:
 
-- The ACK state is file-static in `main.cpp` (`g_bufferRecordInFlight`,
-  `g_inFlightBoot/Seq`, `g_ackBoot/Seq`) and lives inside `connectionTask`,
-  bound to Arduino, FreeRTOS event groups, PubSubClient, and hardware setup.
-  It cannot be linked natively as written.
+- The ACK state originally lived in file-static globals inside `main.cpp`, bound
+  to `connectionTask`, Arduino, FreeRTOS event groups, PubSubClient, and hardware
+  setup. It is now mechanically represented by the pure
+  `LegacyDeliveryState` seam; ACK receipt staging remains in `main.cpp`.
 - `BufferManager` depends on `Arduino.h`, `freertos/FreeRTOS.h`,
   `freertos/semphr.h`, and `esp_heap_caps.h`. It needs an allocator **and**
   mutex abstraction, or extraction of a pure storage core.
@@ -766,7 +770,8 @@ code.
    concrete trigger for deterministic publish failure before the budget depends
    on it.
 3. `[env:native]` harness; mechanical extraction of the legacy ACK state behind
-   a test seam; failing R0/R1 regression test against that extraction.
+   a test seam; failing R0/R1 regression test against that extraction. *(done;
+   expected failing invariant captured)*
 4. `BufferManager`: pin API, second-oldest eviction, `PushOutcome`, counters;
    add the bounded, thread-safe `LossJournal`.
 5. Lease controller in `connectionTask`; `telemetryTask` / `syncTask` reduced to

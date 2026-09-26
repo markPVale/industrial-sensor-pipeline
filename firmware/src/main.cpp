@@ -22,6 +22,7 @@
 #include "KalmanFilter.h"
 #include "BufferManager.h"
 #include "MqttManager.h"
+#include "LegacyDeliveryState.h"
 
 // PubSubClient stores the full MQTT packet in one shared transmit/receive
 // buffer. Keep its capacity tied to the largest declared payload and topic,
@@ -191,10 +192,7 @@ static BufferManager    g_buffer;
 static MqttManager      g_mqttManager;
 static QueueHandle_t    g_sensorQueue  = nullptr;
 static QueueHandle_t    g_publishQueue = nullptr;
-static std::atomic<bool> g_bufferRecordInFlight{false};
-static std::atomic<uint32_t> g_inFlightBoot{0};
-static std::atomic<uint32_t> g_inFlightSeq{0};
-static std::atomic<uint32_t> g_inFlightSentAtMs{0};
+static LegacyDeliveryState g_legacyDeliveryState;
 static std::atomic<uint32_t> g_ackBoot{0};
 static std::atomic<uint32_t> g_ackSeq{0};
 
@@ -213,8 +211,7 @@ static bool mqttEnqueue(const char* topic, const char* payload,
 
 static bool mqttEnqueueTelemetry(const TelemetryRecord& rec,
                                  const char* payload) {
-    bool expected = false;
-    if (!g_bufferRecordInFlight.compare_exchange_strong(expected, true)) {
+    if (!g_legacyDeliveryState.tryReserve()) {
         return false;
     }
 
@@ -227,7 +224,7 @@ static bool mqttEnqueueTelemetry(const TelemetryRecord& rec,
     msg.sequence_id = rec.sequence_id;
 
     if (xQueueSend(g_publishQueue, &msg, 0) != pdTRUE) {
-        g_bufferRecordInFlight.store(false);
+        g_legacyDeliveryState.release();
         return false;
     }
     return true;
@@ -507,8 +504,7 @@ static void connectionTask(void* pvParams) {
 
         if (bits & kBitDisconnected) {
             xEventGroupClearBits(g_mqttEvents, kBitDisconnected | kBitConnected);
-            g_bufferRecordInFlight.store(false);
-            g_inFlightSentAtMs.store(0);
+            g_legacyDeliveryState.release();
             setState(NodeState::BUFFERING);
             Serial.println("[State] -> BUFFERING");
         } else if (bits & kBitConnected) {
@@ -536,38 +532,39 @@ static void connectionTask(void* pvParams) {
             xEventGroupClearBits(g_mqttEvents, kBitAckReceived);
             const uint32_t ackBoot = g_ackBoot.load();
             const uint32_t ackSeq = g_ackSeq.load();
-            const uint32_t inFlightBoot = g_inFlightBoot.load();
-            const uint32_t inFlightSeq = g_inFlightSeq.load();
 
-            if (g_bufferRecordInFlight.load() &&
-                ackBoot == inFlightBoot &&
-                ackSeq == inFlightSeq) {
-                TelemetryRecord oldestRecord;
-                if (g_buffer.peek(oldestRecord) &&
-                    oldestRecord.boot_id == ackBoot &&
-                    oldestRecord.sequence_id == ackSeq) {
-                    g_buffer.pop(oldestRecord);
-                    g_bufferRecordInFlight.store(false);
-                    g_inFlightSentAtMs.store(0);
-                } else {
-                    Serial.printf("[ConnTask] WARN — ACK commit mismatch boot=%u seq=%u.\n",
-                                  ackBoot, ackSeq);
-                    g_bufferRecordInFlight.store(false);
-                    g_inFlightSentAtMs.store(0);
-                }
-            } else {
+            const LegacyAckResult ackResult = handleLegacyAck(
+                g_legacyDeliveryState,
+                DeliveryIdentity{ackBoot, ackSeq},
+                [](DeliveryIdentity& oldest) {
+                    TelemetryRecord rec;
+                    if (!g_buffer.peek(rec)) return false;
+                    oldest = {rec.boot_id, rec.sequence_id};
+                    return true;
+                },
+                [](DeliveryIdentity& removed) {
+                    TelemetryRecord rec;
+                    if (!g_buffer.pop(rec)) return false;
+                    removed = {rec.boot_id, rec.sequence_id};
+                    return true;
+                });
+
+            if (ackResult == LegacyAckResult::COMMIT_MISMATCH_CLEARED) {
+                Serial.printf("[ConnTask] WARN — ACK commit mismatch boot=%u seq=%u.\n",
+                              ackBoot, ackSeq);
+            } else if (ackResult == LegacyAckResult::STALE) {
                 Serial.printf("[ConnTask] WARN — stale ACK boot=%u seq=%u.\n",
                               ackBoot, ackSeq);
             }
         }
 
-        const uint32_t sentAt = g_inFlightSentAtMs.load();
-        if (g_bufferRecordInFlight.load() && sentAt != 0 &&
+        const uint32_t sentAt = g_legacyDeliveryState.sentAtMs();
+        if (g_legacyDeliveryState.isInFlight() && sentAt != 0 &&
             millis() - sentAt > MQTT_ACK_TIMEOUT_MS) {
+            const DeliveryIdentity inFlight = g_legacyDeliveryState.identity();
             Serial.printf("[ConnTask] WARN — ACK timeout boot=%u seq=%u, retrying.\n",
-                          g_inFlightBoot.load(), g_inFlightSeq.load());
-            g_bufferRecordInFlight.store(false);
-            g_inFlightSentAtMs.store(0);
+                          inFlight.boot_id, inFlight.sequence_id);
+            g_legacyDeliveryState.release();
         }
 
         // Drain the publish queue — only while connected
@@ -578,14 +575,12 @@ static void connectionTask(void* pvParams) {
 
             if (msg.commit_buffer_record) {
                 if (published) {
-                    g_inFlightBoot.store(msg.boot_id);
-                    g_inFlightSeq.store(msg.sequence_id);
-                    g_inFlightSentAtMs.store(millis());
+                    g_legacyDeliveryState.markPublished(
+                        DeliveryIdentity{msg.boot_id, msg.sequence_id}, millis());
                 } else {
                     Serial.printf("[ConnTask] WARN — publish failed for boot=%u seq=%u, will retry.\n",
                                   msg.boot_id, msg.sequence_id);
-                    g_bufferRecordInFlight.store(false);
-                    g_inFlightSentAtMs.store(0);
+                    g_legacyDeliveryState.release();
                 }
             } else if (!published) {
                 Serial.println("[ConnTask] WARN — publish failed mid-drain.");
@@ -991,7 +986,7 @@ static void syncTask(void* pvParams) {
                 break;
             }
 
-            if (!g_bufferRecordInFlight.load()) {
+            if (!g_legacyDeliveryState.isInFlight()) {
                 TelemetryRecord rec;
                 if (g_buffer.peek(rec)) {
                     buildPayload(rec, payload, sizeof(payload));

@@ -28,7 +28,7 @@ state model is replaced.
 
 - [x] Check the PubSubClient transport-buffer allocation, add the required
   compile-time size assertion, and surface allocation failure.
-- [ ] Add a native firmware test harness and a behavior-preserving seam around
+- [x] Add a native firmware test harness and a behavior-preserving seam around
   the legacy ACK state; reproduce the R0/R1 stale-ACK race as a failing test.
 - [ ] Add the `BufferManager` pin API, second-oldest eviction, `PushOutcome`,
   counters, and bounded thread-safe `LossJournal`.
