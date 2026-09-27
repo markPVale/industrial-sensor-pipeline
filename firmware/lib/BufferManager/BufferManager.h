@@ -26,9 +26,10 @@ struct PushOutcome {
 // call from an ISR. begin()/end()/destruction require exclusive lifecycle access
 // (no concurrent users). Call end() before destroying this non-copyable owner.
 //
-// Two producers: filterTask and sensorTask. The future connectionTask lease
-// controller is the sole caller of acquire/commit/abandon. Until it lands, main
-// still uses legacy peek/pop and never acquires a pin: existing ACK races remain.
+// Two producers on core 1: filterTask and sensorTask. connectionTask on core 0
+// is the sole pop caller; its future lease controller will own acquire/commit/
+// abandon. Until it lands, main still uses legacy peek/pop and never acquires
+// a pin: see docs/delivery-lease-design.md §1.1 for the peek/push/pop race.
 //
 // One identity-based pin protects the oldest record until commit or counted
 // abandonment. At capacity, push relocates it and evicts the second-oldest in

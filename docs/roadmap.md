@@ -1,6 +1,6 @@
 # Engineering Roadmap
 
-Last reviewed: **2026-09-25**
+Last reviewed: **2026-09-27**
 
 This is the canonical list of open engineering work for the repository. Component
 documents remain authoritative for design details and test procedures, but new
@@ -30,8 +30,11 @@ state model is replaced.
   compile-time size assertion, and surface allocation failure.
 - [x] Add a native firmware test harness and a behavior-preserving seam around
   the legacy ACK state; reproduce the R0/R1 stale-ACK race as a failing test.
-- [ ] Add the `BufferManager` pin API, second-oldest eviction, `PushOutcome`,
-  counters, and bounded thread-safe `LossJournal`.
+- [x] Add the `BufferManager` pin API, second-oldest eviction, `PushOutcome`,
+  counters, and native buffer tests (commit `09e486c`). These operations are not
+  yet wired into firmware delivery; the legacy ACK races remain.
+- [ ] Add the bounded thread-safe `LossJournal` and forward every lossy
+  `PushOutcome` from both producers. Design §11 step 4 remains partially complete.
 - [ ] Move delivery ownership into a single lease controller in
   `connectionTask`; reduce `telemetryTask` and `syncTask` to cadence signals.
 - [ ] Add loss-range and lease-abandonment diagnostics, cumulative counters,

@@ -1,7 +1,10 @@
 # Delivery Lease — Design
 
-Status: **design**, not yet implemented.
-Last updated: 2026-09-10 (rev 7 — atomicity scope, lost-event degradation;
+Status: **implementation in progress** — transport checks, the legacy regression
+harness, and BufferManager pin operations are implemented. LossJournal and the
+delivery controller are pending; the live ACK path still uses legacy peek/pop.
+Last updated: 2026-09-27 (implementation status and host-test instructions).
+Design revision: 2026-09-10 (rev 7 — atomicity scope, lost-event degradation;
 rev 6 — failure-mode summary; rev 5 — abandonment outcome reconciliation,
 connected-time liveness bound, diagnostic terminology)
 
@@ -278,6 +281,12 @@ Non-transitions that must be explicit in code:
 ---
 
 ## 5. BufferManager API
+
+**Implementation status:** the API below, pin-aware overflow, and buffer counters
+landed in `09e486c`. `main.cpp` handles the new push result but does not acquire
+pins or forward loss identities to a journal yet. `pop()` refuses a pinned
+record; `clear()` and `end()` also refuse an active pin. `begin()` / `end()`
+require exclusive lifecycle access, with no concurrent buffer users.
 
 ```cpp
 enum class PushResult { OK, EVICTED_OLDEST, EVICTED_PROTECTED, REJECTED_NEWEST, NOT_INITIALISED };
@@ -701,6 +710,22 @@ control test passes and the desired R0/R1 invariant intentionally fails against
 legacy behaviour. The native suite remains out of CI until the lease controller
 makes that regression green; CI continues to run the ESP32 build.
 
+The separate `test_buffer_manager` suite contains seven passing tests, including
+a deque-model comparison for capacities 1–7 and a two-producer concurrency test.
+Run from `firmware/`:
+
+```sh
+pio test -e native -f test_buffer_manager
+pio test -e native -f test_legacy_delivery
+pio run -e esp32s3-n16r8
+```
+
+The second command is intentionally nonzero until the legacy state is replaced;
+`pio test -e native` runs both suites and is **not** an all-green validation.
+`default_envs = esp32s3-n16r8` keeps plain `pio run` on the firmware target;
+plain `pio test` also selects the board, so use `-e native` for host tests.
+See [`firmware/test/README.md`](../firmware/test/README.md) for scope and limits.
+
 The extraction was required because of two distinct coupling problems, neither
 solved by mutex stubs alone:
 
@@ -708,9 +733,11 @@ solved by mutex stubs alone:
   to `connectionTask`, Arduino, FreeRTOS event groups, PubSubClient, and hardware
   setup. It is now mechanically represented by the pure
   `LegacyDeliveryState` seam; ACK receipt staging remains in `main.cpp`.
-- `BufferManager` depends on `Arduino.h`, `freertos/FreeRTOS.h`,
-  `freertos/semphr.h`, and `esp_heap_caps.h`. It needs an allocator **and**
-  mutex abstraction, or extraction of a pure storage core.
+- `BufferManager` originally coupled the ring to Arduino, FreeRTOS, and PSRAM.
+  `BufferPlatform.h` now supplies host allocation and a real `std::mutex` for
+  native tests, and PSRAM allocation / FreeRTOS mutexes on ESP32. The ring and
+  pin algorithm is the same in both builds; host tests do not validate the
+  hardware-specific allocator or scheduler.
 
 So test 1 cannot target `main.cpp` directly. Revised approach:
 
@@ -773,7 +800,9 @@ code.
    a test seam; failing R0/R1 regression test against that extraction. *(done;
    expected failing invariant captured)*
 4. `BufferManager`: pin API, second-oldest eviction, `PushOutcome`, counters;
-   add the bounded, thread-safe `LossJournal`.
+   add the bounded, thread-safe `LossJournal`. *(partially done: buffer operations
+   and seven native tests landed in `09e486c`; journal and producer forwarding
+   remain pending)*
 5. Lease controller in `connectionTask`; `telemetryTask` / `syncTask` reduced to
    cadence.
 6. Diagnostics: loss ranges and lease-abandonment outcome events, cumulative
