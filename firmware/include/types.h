@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 // =============================================================================
 // types.h — Shared data structures for the industrial sensor node
@@ -57,6 +58,10 @@ struct BufferStats {
     size_t count;
     size_t free_space;
     size_t dropped;
+    size_t evicted_oldest;
+    size_t protected_evictions;
+    size_t rejected_newest;
+    size_t abandoned; // local abandonment decisions, not confirmed delivery loss
 };
 
 // -----------------------------------------------------------------------------

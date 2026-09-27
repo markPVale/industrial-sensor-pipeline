@@ -691,8 +691,11 @@ static void emitFaultRecord() {
     fault.status_flags = faultFlag;
     fault.accel_x      = (float)g_lastWhoAmI;
     fault.window_rms   = NAN;
-    if (!g_buffer.push(fault)) {
-        Serial.println("[SensorTask] WARN — buffer full, fault record lost.");
+    const PushOutcome outcome = g_buffer.push(fault);
+    if (outcome.result == PushResult::NOT_INITIALISED) {
+        Serial.println("[SensorTask] WARN — buffer not initialised, fault record lost.");
+    } else if (outcome.result == PushResult::REJECTED_NEWEST) {
+        Serial.println("[SensorTask] WARN — pinned buffer full, new fault record rejected.");
     }
     Serial.printf("[SensorTask] WARN — sensor fault seq=%u flags=0x%02X\n",
                   fault.sequence_id, faultFlag);
@@ -906,8 +909,11 @@ static void filterTask(void* pvParams) {
             rec.window_rms   = rms;
             rec.status_flags = accumulated_flags;
 
-            if (!g_buffer.push(rec)) {
+            const PushOutcome outcome = g_buffer.push(rec);
+            if (outcome.result == PushResult::NOT_INITIALISED) {
                 Serial.println("[FilterTask] WARN — buffer not initialised, record lost.");
+            } else if (outcome.result == PushResult::REJECTED_NEWEST) {
+                Serial.println("[FilterTask] WARN — pinned buffer full, new record rejected.");
             }
 
             sum_sq            = 0.0f;

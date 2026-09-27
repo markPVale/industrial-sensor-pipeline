@@ -1,108 +1,93 @@
 #pragma once
 
-#include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
+#include "BufferPlatform.h"
 #include "types.h"
 
-// =============================================================================
-// BufferManager — PSRAM-backed fixed-capacity ring buffer
+struct RecordIdentity {
+    uint32_t boot_id;
+    uint32_t sequence_id;
+};
+
+inline bool operator==(const RecordIdentity& a, const RecordIdentity& b) {
+    return a.boot_id == b.boot_id && a.sequence_id == b.sequence_id;
+}
+
+enum class PushResult : uint8_t {
+    OK, EVICTED_OLDEST, EVICTED_PROTECTED, REJECTED_NEWEST, NOT_INITIALISED
+};
+
+struct PushOutcome {
+    PushResult result;
+    bool record_lost;
+    RecordIdentity lost;  // valid only when record_lost is true
+};
+
+// Fixed-capacity PSRAM ring. All runtime operations take the same mutex; never
+// call from an ISR. begin()/end()/destruction require exclusive lifecycle access
+// (no concurrent users). Call end() before destroying this non-copyable owner.
 //
-// Concurrency contract
-// --------------------
-//   - Task-safe: all public methods are protected by a FreeRTOS mutex.
-//   - NOT ISR-safe: never call from an interrupt context.
-//   - Two producers call push(), both pinned to core 1: filterTask (windowed
-//     telemetry records) and sensorTask (fault records via emitFaultRecord).
-//   - Three tasks read: telemetryTask, syncTask, and connectionTask all call
-//     peek(), but only connectionTask calls pop(). It runs on core 0.
-//   - Producers therefore run genuinely concurrently with the consumer on a
-//     different core. Do NOT assume a push() cannot land between a consumer's
-//     peek() and its pop(): on a full buffer that push() evicts the very
-//     record the consumer just validated, and the pop() then removes a
-//     different, unacknowledged one. See docs/delivery-lease-design.md §1.1.
+// Two producers: filterTask and sensorTask. The future connectionTask lease
+// controller is the sole caller of acquire/commit/abandon. Until it lands, main
+// still uses legacy peek/pop and never acquires a pin: existing ACK races remain.
 //
-// Overflow policy
-// ---------------
-//   When the buffer is full, push() drops the oldest unread record (advances
-//   _readIndex), increments _dropped, then writes the new record. This preserves
-//   the most-recent data — correct for industrial telemetry where a stale
-//   reading is less useful than a fresh one. FIFO ordering is maintained
-//   among all retained records.
-//
-// Lifecycle
-// ---------
-//   1. Construct (zero-initialised by default member values).
-//   2. Call begin(capacity) — allocates PSRAM and mutex.
-//      Returns false and performs no allocation if already initialised,
-//      PSRAM is unavailable, or mutex creation fails.
-//   3. Use push() / pop() / peek() from tasks.
-//   4. Call end() to release all resources. Safe to call multiple times.
-//   5. Call begin() again to reinitialise if needed (e.g. after a config
-//      change that requires a different capacity).
-// =============================================================================
+// One identity-based pin protects the oldest record until commit or counted
+// abandonment. At capacity, push relocates it and evicts the second-oldest in
+// O(1), or rejects the incoming record at capacity 1. Without a pin, drop oldest.
+// No producer may release a pin. A returned loss identity is captured under the
+// lock, ready for journaling by the caller outside the buffer lock.
 class BufferManager {
 public:
-    // -------------------------------------------------------------------------
-    // Lifecycle
-    // -------------------------------------------------------------------------
+    BufferManager() = default;
+    BufferManager(const BufferManager&) = delete;
+    BufferManager& operator=(const BufferManager&) = delete;
 
-    // Allocate a PSRAM-backed ring buffer of `capacity` TelemetryRecords.
-    // Returns true on success. Returns false without allocating anything if:
-    //   - already initialised (call end() first)
-    //   - PSRAM heap_caps_malloc fails
-    //   - FreeRTOS mutex creation fails (buffer memory is freed in this case)
+    // Reject zero/overflowing capacity, repeat begin, or allocation failure.
     bool begin(size_t capacity);
+    // End/clear refuse an active pin. Only commit/abandon may release one.
+    // end() is idempotent; clear() returns false when uninitialised.
+    bool end();
+    bool clear();
 
-    // Release the PSRAM buffer and mutex. Resets all counters.
-    // Safe to call before begin() or after end().
-    void end();
-
-    // Reset read/write indexes, count, and dropped to zero without releasing memory.
-    // Existing records are logically discarded (not zeroed).
-    // No-op if not initialised.
-    void clear();
-
-    // -------------------------------------------------------------------------
-    // Write / Read
-    // -------------------------------------------------------------------------
-
-    // Copy `rec` into the buffer. If full, the oldest record is evicted and
-    // _dropped is incremented before writing. Always returns true if
-    // initialised; returns false only if begin() was never called.
-    bool push(const TelemetryRecord& rec);
-
-    // Copy the oldest record into `rec` and remove it from the buffer.
-    // Returns false if the buffer is empty or not initialised.
+    PushOutcome push(const TelemetryRecord& rec);
+    bool peek(TelemetryRecord& rec);
+    // Transitional legacy API: never removes a pinned record.
     bool pop(TelemetryRecord& rec);
 
-    // Copy the oldest record into `rec` without removing it.
-    // Returns false if the buffer is empty or not initialised.
-    bool peek(TelemetryRecord& rec);
+    // Acquire and copy oldest in one lock. Empty/uninitialised/already pinned
+    // returns false without changing the output or existing pin.
+    bool acquirePin(TelemetryRecord& out);
+    // Validate both pin identity AND current oldest identity before removing.
+    // Failure changes nothing. Commit does not count as a drop/abandonment.
+    bool commitPinnedHead(uint32_t boot_id, uint32_t seq);
+    bool abandonPinnedHead(uint32_t boot_id, uint32_t seq,
+                           RecordIdentity& abandoned);
 
-    // -------------------------------------------------------------------------
-    // Inspection — all take the mutex internally
-    // -------------------------------------------------------------------------
-
-    size_t available();      // number of records ready to read
-    size_t freeSpace();      // number of additional records that can be pushed
-    size_t capacity();       // total record slots (immutable after begin())
-
+    size_t available();
+    size_t freeSpace();
+    size_t capacity();
     bool isEmpty();
     bool isFull();
-
-    size_t droppedCount();   // records evicted due to overflow since last clear()
-
-    // Snapshot of all stats in one mutex acquisition — prefer this over
-    // calling the individual methods separately when you need multiple values.
-    BufferStats getStats();
+    size_t droppedCount();  // evictions only (legacy meaning)
+    BufferStats getStats(); // count and all counters from one locked snapshot
 
 private:
-    TelemetryRecord*  _buffer     = nullptr;
-    size_t            _writeIndex = 0;   // index of next write slot
-    size_t            _readIndex  = 0;   // index of oldest record / next read slot
-    size_t            _capacity   = 0;
-    size_t            _count      = 0;   // records currently held
-    size_t            _dropped    = 0;   // cumulative eviction count
-    SemaphoreHandle_t _mutex      = nullptr;
+    static RecordIdentity identityOf(const TelemetryRecord& rec) {
+        return {rec.boot_id, rec.sequence_id};
+    }
+    bool pinnedHeadMatches(RecordIdentity expected) const; // caller holds lock
+    void removeOldest(); // caller holds lock
+    void resetState();   // caller holds lock, or exclusive lifecycle access
+
+    TelemetryRecord* _buffer = nullptr;
+    size_t _writeIndex = 0;  // next write slot
+    size_t _readIndex = 0;   // oldest record
+    size_t _capacity = 0;
+    size_t _count = 0;
+    size_t _evictedOldest = 0;
+    size_t _protectedEvictions = 0;
+    size_t _rejectedNewest = 0;
+    size_t _abandoned = 0;   // local release decisions, not proven delivery loss
+    bool _hasPinnedHead = false;
+    RecordIdentity _pinnedIdentity{};
+    BufferPlatform::Mutex _mutex = nullptr;
 };
