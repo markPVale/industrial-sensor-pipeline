@@ -1,6 +1,6 @@
 # Engineering Roadmap
 
-Last reviewed: **2026-09-27**
+Last reviewed: **2026-09-29**
 
 This is the canonical list of open engineering work for the repository. Component
 documents remain authoritative for design details and test procedures, but new
@@ -33,8 +33,10 @@ state model is replaced.
 - [x] Add the `BufferManager` pin API, second-oldest eviction, `PushOutcome`,
   counters, and native buffer tests (commit `09e486c`). These operations are not
   yet wired into firmware delivery; the legacy ACK races remain.
-- [ ] Add the bounded thread-safe `LossJournal` and forward every lossy
-  `PushOutcome` from both producers. Design §11 step 4 remains partially complete.
+- [x] Add the bounded thread-safe RAM `LossJournal` and forward every lossy
+  `PushOutcome` from both producers; periodically close expired ranges from
+  `connectionTask`. Native tests cover exact ranges, journal overflow, and
+  concurrent access. Diagnostic publishing is still pending below.
 - [ ] Move delivery ownership into a single lease controller in
   `connectionTask`; reduce `telemetryTask` and `syncTask` to cadence signals.
 - [ ] Add loss-range and lease-abandonment diagnostics, cumulative counters,

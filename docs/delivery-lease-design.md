@@ -1,9 +1,10 @@
 # Delivery Lease — Design
 
 Status: **implementation in progress** — transport checks, the legacy regression
-harness, and BufferManager pin operations are implemented. LossJournal and the
-delivery controller are pending; the live ACK path still uses legacy peek/pop.
-Last updated: 2026-09-27 (implementation status and host-test instructions).
+harness, BufferManager pin operations, and the RAM LossJournal with producer
+forwarding are implemented. The delivery controller and diagnostic publishing
+are pending; the live ACK path still uses legacy peek/pop.
+Last updated: 2026-09-29 (LossJournal implementation and limits).
 Design revision: 2026-09-10 (rev 7 — atomicity scope, lost-event degradation;
 rev 6 — failure-mode summary; rev 5 — abandonment outcome reconciliation,
 connected-time liveness bound, diagnostic terminology)
@@ -283,8 +284,8 @@ Non-transitions that must be explicit in code:
 ## 5. BufferManager API
 
 **Implementation status:** the API below, pin-aware overflow, and buffer counters
-landed in `09e486c`. `main.cpp` handles the new push result but does not acquire
-pins or forward loss identities to a journal yet. `pop()` refuses a pinned
+landed in `09e486c`. `main.cpp` forwards push outcomes to LossJournal but does not
+acquire pins yet. `pop()` refuses a pinned
 record; `clear()` and `end()` also refuse an active pin. `begin()` / `end()`
 require exclusive lifecycle access, with no concurrent buffer users.
 
@@ -316,7 +317,8 @@ delivery loss. `connectionTask` uses that snapshot for periodic diagnostics;
 `buffer_unavailable` and `diagnostic_events_lost` live in `LossJournal` because
 they can occur when the buffer is unavailable or the journal itself is full.
 The buffer's cumulative `abandoned` value maps to diagnostic
-`lease_abandoned`; connectionTask additionally increments exactly one subtype,
+`lease_abandoned`; connectionTask additionally records the outcome through
+`observeAbandonment()`, which increments exactly one journal subtype counter,
 `lease_abandoned_unpublished` or `lease_abandoned_after_publish`.
 
 `abandonPinnedHead()` replaces an earlier `releasePin(bool dropRecord)`. A
@@ -340,9 +342,9 @@ and `NOT_INITIALISED`, the lost identity is the incoming record. Only `OK` has
 `record_lost == false`. The producer forwards lossy outcomes to the thread-safe
 `LossJournal`; it never derives the victim from a later `peek()`.
 
-`push()` returning `false` currently means only "not initialised", which is why
-`main.cpp:668` logs `"buffer full, fault record lost"` on a condition that
-cannot mean that. The enum removes the ambiguity; fix that log with it.
+The former boolean `push()` returned false only for "not initialised", despite
+the fault path logging "buffer full". The enum and corrected fault log landed
+with the buffer API.
 
 ### 5.1 LossJournal boundary
 
@@ -358,6 +360,37 @@ draining that queue; a timer does not depend on another loss arriving. The
 journal never calls MQTT itself. If its bounded queue overflows, it increments
 a separate `diagnostic_events_lost` counter so exact attribution can degrade to
 the device-reported/unattributed classification rather than disappear silently.
+
+**Implemented boundary (2026-09-29):** `LossJournal` has a fixed 64-event array in
+internal RAM, plus one open loss range. Initial bounds are 128 observations per
+range and 30 seconds from its first observation; tests inject smaller limits.
+Range age is not extended by continued loss. `connectionTask` calls
+`closeExpired(millis())` each loop, including while disconnected; actual closure
+can be delayed by blocking networking work. Unsigned millis arithmetic handles
+wrap; small backwards timestamps from competing callers are ignored for expiry.
+The expiry service must run within half a millis wrap (~24.9 days).
+
+Queue overflow drops the **newly closed event**, preserving queued evidence,
+and increments `diagnostic_events_lost` once per event/range (not per telemetry
+record). Buffer eviction/rejection counters remain in BufferManager;
+`buffer_unavailable` and the two abandonment subtype counters remain cumulative
+in the journal even when an event is dropped. All counters reset at reboot.
+`begin()` creates the journal mutex before producers start; failure uses the
+existing fatal setup/retry policy. Runtime observations allocate no memory.
+
+Both producers forward the exact `PushOutcome` after the buffer lock is
+released; the journal never acquires a buffer lock or calls MQTT. Reordering
+between producer observations can split ranges but never fills sequence gaps.
+The abandonment API derives reason/outcome from successful publish count and
+closes any open range first. It is tested but has no firmware caller until the
+delivery controller lands. It does not release a buffer pin or enforce budgets.
+
+`pop()` transfers an event to the sole consumer; the future publisher must retain
+that local event if sending fails. No firmware code drains the journal yet, so
+it will eventually saturate under sustained losses and count dropped diagnostic
+events. Diagnostic envelopes (`boot_id`, `diag_id`), MQTT publishing, and bridge
+reconciliation remain §11 step 6; journaling consumes no telemetry sequence IDs.
+RAM-only retention is the initial D2 choice, not a claim of durable evidence.
 
 ### 5.2 Second-oldest eviction
 
@@ -716,11 +749,12 @@ Run from `firmware/`:
 
 ```sh
 pio test -e native -f test_buffer_manager
+pio test -e native -f test_loss_journal
 pio test -e native -f test_legacy_delivery
 pio run -e esp32s3-n16r8
 ```
 
-The second command is intentionally nonzero until the legacy state is replaced;
+The legacy command is intentionally nonzero until the legacy state is replaced;
 `pio test -e native` runs both suites and is **not** an all-green validation.
 `default_envs = esp32s3-n16r8` keeps plain `pio run` on the firmware target;
 plain `pio test` also selects the board, so use `-e native` for host tests.
@@ -800,9 +834,9 @@ code.
    a test seam; failing R0/R1 regression test against that extraction. *(done;
    expected failing invariant captured)*
 4. `BufferManager`: pin API, second-oldest eviction, `PushOutcome`, counters;
-   add the bounded, thread-safe `LossJournal`. *(partially done: buffer operations
-   and seven native tests landed in `09e486c`; journal and producer forwarding
-   remain pending)*
+   add the bounded, thread-safe `LossJournal`. *(done: buffer operations and
+   seven tests in `09e486c`; RAM journal, producer forwarding, periodic closure,
+   and journal tests added 2026-09-29; publishing remains step 6)*
 5. Lease controller in `connectionTask`; `telemetryTask` / `syncTask` reduced to
    cadence.
 6. Diagnostics: loss ranges and lease-abandonment outcome events, cumulative

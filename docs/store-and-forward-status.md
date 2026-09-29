@@ -1,6 +1,25 @@
 # Store-and-Forward Status
 
-Last updated: 2026-08-06
+Last updated: 2026-09-29
+
+## Delivery-lease implementation update
+
+Buffer pin operations and the bounded RAM LossJournal are implemented, but the
+firmware still uses the legacy ACK delivery path. Both buffer producers now
+journal loss outcomes; `connectionTask` closes expired ranges. There is no
+diagnostic publisher or bridge reconciliation yet, and no new hardware
+validation. The journal does not fix the stale-ACK or peek/pop races by itself.
+
+The journal retains at most 64 closed events plus one open range. Once full, it
+drops new closed events and increments `diagnostic_events_lost`; counters retain
+magnitude but not the missing identities. Journal events and counters are
+RAM-only and are lost on reboot. A boot boundary explains a sequence reset,
+not an earlier gap. In particular, loss of an after-publish abandonment event
+can leave a genuinely missing record unexplained, even if an abandonment count
+was observed. See delivery-lease design §8.1 and §9 D2 for reconciliation limits.
+
+See [the delivery-lease design](delivery-lease-design.md) and
+[roadmap](roadmap.md) for the remaining controller and diagnostics work.
 
 ## Current Status
 

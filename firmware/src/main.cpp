@@ -21,6 +21,7 @@
 #include "types.h"
 #include "KalmanFilter.h"
 #include "BufferManager.h"
+#include "LossJournal.h"
 #include "MqttManager.h"
 #include "LegacyDeliveryState.h"
 
@@ -189,6 +190,7 @@ static uint64_t getEpochMs() {
 // -----------------------------------------------------------------------------
 static Adafruit_MPU6050 g_mpu;
 static BufferManager    g_buffer;
+static LossJournal      g_lossJournal;
 static MqttManager      g_mqttManager;
 static QueueHandle_t    g_sensorQueue  = nullptr;
 static QueueHandle_t    g_publishQueue = nullptr;
@@ -361,6 +363,12 @@ void setup() {
     // -------------------------------------------------------------------------
     // Store-and-forward buffer (PSRAM)
     // -------------------------------------------------------------------------
+    // Journal storage is fixed internal RAM, independent of PSRAM availability.
+    // Initialise its mutex before starting either producer; never silently run
+    // without the ability to count lost diagnostic evidence.
+    if (!g_lossJournal.begin()) {
+        fatalSetupHalt("[Journal] FATAL — could not create loss journal mutex.");
+    }
     if (!g_buffer.begin(PSRAM_BUFFER_CAPACITY)) {
         Serial.println("[Buffer] ERROR — PSRAM allocation failed. Telemetry will"
                        " be lost during network outages.");
@@ -492,6 +500,9 @@ static void connectionTask(void* pvParams) {
     MqttMessage msg;
 
     for (;;) {
+        // Close ranges even if no further losses arrive or MQTT is offline.
+        // Diagnostic publishing is a later milestone; do not drain/discard here.
+        g_lossJournal.closeExpired(millis());
         // Drive WiFi + MQTT connection state machine
         g_mqttManager.loop();
 
@@ -692,6 +703,7 @@ static void emitFaultRecord() {
     fault.accel_x      = (float)g_lastWhoAmI;
     fault.window_rms   = NAN;
     const PushOutcome outcome = g_buffer.push(fault);
+    g_lossJournal.observePush(outcome, millis()); // push has released the buffer lock
     if (outcome.result == PushResult::NOT_INITIALISED) {
         Serial.println("[SensorTask] WARN — buffer not initialised, fault record lost.");
     } else if (outcome.result == PushResult::REJECTED_NEWEST) {
@@ -910,6 +922,7 @@ static void filterTask(void* pvParams) {
             rec.status_flags = accumulated_flags;
 
             const PushOutcome outcome = g_buffer.push(rec);
+            g_lossJournal.observePush(outcome, millis());
             if (outcome.result == PushResult::NOT_INITIALISED) {
                 Serial.println("[FilterTask] WARN — buffer not initialised, record lost.");
             } else if (outcome.result == PushResult::REJECTED_NEWEST) {
