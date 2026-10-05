@@ -25,6 +25,26 @@ or cooldowns. Matching eligible ACKs win in the same iteration. Abandonment afte
 publishing means delivery is unknown, not necessarily lost. These defaults are
 software-tested, not hardware-tuned.
 
+The previous five-call/15-second rule discarded 40 records in a simulated ten-minute
+bridge outage with free buffer space. The regression now retains all 1,201 produced
+records and drains them when the bridge recovers without any MQTT reconnect.
+Repeatedly interrupted sessions can still delay pressure abandonment indefinitely;
+fair retries do not promise bounded drain progress under connection churn.
+
+The 2026-10-04 integration fixes add DeliveryRuntime: missing connect events no
+longer strand BUFFERING; failed subscriptions retry with bounded backoff while
+the pin is preserved; NORMAL backlogs enter SYNCING; ACK resolution does not
+discard an eligible send. A simulated 150 ms ACK round trip permits 150 ms sends
+in SYNCING rather than 200 ms. A one-time lost ACK catches up under continuous
+2 Hz production. These are software-model results, not measured hardware rates.
+
+A follow-up regression exposed healthy-mode flapping when a 500 ms cooldown
+started at publish completion. NORMAL now follows production; both modes use a
+100 ms minimum between new-record publish starts, without saved timer ticks.
+Ten-minute simulations exercise variable publish costs, ACK latency, producer
+phase and loop jitter. Retries remain governed by lease timeout/backoff, not this
+new-record limiter. Queue depth is now four for the E-Stop-only publish queue.
+
 The device now emits cumulative delivery/subscription counters to serial every
 five seconds. Repeated internal validation failures keep the pin and use the
 same rate-limited reporting, rather than printing every loop. Subscription

@@ -105,3 +105,58 @@ the expected failure, and the ESP32 build succeeded (RAM 14.2%, flash 11.9%).
 
 On 2026-09-29, the ten journal tests and seven buffer tests passed together;
 the ESP32 build succeeded (RAM 15.2%, flash 11.9%). No device was flashed.
+
+The subsequent delivery-controller landing passed all 35 native tests, including
+18 delivery tests and the now-green R0/R1 invariant. Its ESP32 build also passed
+(RAM 49,788 bytes / 15.2%; flash 782,737 bytes / 11.9%). No hardware validation or
+threshold tuning is implied by these software tests; the checklist remains open.
+
+On 2026-10-04, all 47 tests passed and the ESP32 build succeeded (RAM 49,892 bytes /
+15.2%; flash 783,477 bytes / 12.0%). No device was flashed. The previous 35-test
+pass did not cover real cadence/subscription orchestration; this landing adds
+that regression coverage without claiming hardware verification.
+
+The subsequent 2026-10-04 pacing cleanup passed all 51 native tests and the ESP32
+build (static RAM 49,876 bytes / 15.2%; flash 783,157 bytes / 12.0%). Removing two
+4096-byte stacks and 36 publish-queue slots eliminates 22,052 bytes of requested
+runtime allocation, plus task/event-group overhead. Those allocations are not
+included in PlatformIO's static RAM percentage; actual free heap and remaining
+task stack margins still need device measurements. No device was flashed.
+
+The pressure-gated abandonment revision passed all 57 native tests and the ESP32
+build (static RAM 49,884 bytes / 15.2%; flash 783,233 bytes / 12.0%). The regression
+was observed failing before the policy change: 40 abandonments during a ten-minute
+bridge outage, plus abandonment before a capped record's fresh reconnect attempt.
+Both now pass. Software validation does not prove real broker/bridge behavior,
+FreeRTOS scheduling or physical link failure detection; no device was flashed.
+
+The nullable-payload revision adds `test_telemetry_payload` (normal formatting,
+NaN/positive and negative infinity on all seven values, mixed valid/invalid,
+extreme finite values, truncation and exact-fit boundaries). Runtime tests add
+full-buffer recovery without a new session after an interrupted ACK wait,
+pressure polling cadence, immediate ACK processing and pressure-timer rollover.
+Run bridge tests with its requirements installed:
+`python gateway/bridge/test_mqtt_to_influx.py` from the repo root; these use the
+real Influx Point serializer and mocked writes/MQTT, not a live database.
+Dashboard nullable-value checks run with `npm test` from `dashboard/`.
+
+Validated on 2026-10-04: 65 native tests, 12 bridge tests, 11 integrity-checker
+tests, nine dashboard helper assertions and dashboard TypeScript checking passed.
+The ESP32 build succeeded (static RAM 49,884 bytes / 15.2%; flash 783,357 bytes /
+12.0%). No device was flashed and no live broker/database was used. Deploy the
+bridge before nullable-axis firmware. Full-window coverage analysis remains
+open in the roadmap, as does the separate permanent-rejection protocol design.
+
+The 2026-10-05 ownership regression was first observed failing when extended
+past the 30-second retry boundary. The latch now blocks retries until matching
+pin validation succeeds. Tests cover 60 seconds of injected failures, reconnect
+churn, a genuinely missing/replaced pin, explicit recovery, and ACK recovery
+during the validation cooldown. MCP tests exercise the production tools with
+injected database rows/clock, including all-invalid and partially valid records,
+missing window RMS, fault priority and no-data responses. These do not execute
+Flux against a live database or replace the hardware validation checklist.
+
+Verification for that revision: all 68 native and 24 MCP tests passed; MCP and
+ESP32 builds succeeded (static RAM 49,884 bytes; flash 783,505 bytes). No device
+was flashed. Full-window coverage analysis and loss-diagnostic publishing remain
+separate unfinished work.
