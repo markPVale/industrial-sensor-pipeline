@@ -82,15 +82,29 @@ def write_sensor_fault(client: mqtt.Client, node_id: str, payload: dict) -> None
         .field("boot_id",     int(payload.get("boot", 0)))
         .field("sequence_id", int(payload.get("seq",  0)))
         .field("flags",       int(payload.get("flags", STATUS_SENSOR_FAULT)))
-        .field("whoami_raw",  int(float(payload.get("ax", 0xFF))))
         .field("reason",      "i2c_dropout")
     )
+    whoami = finite_measurement(payload.get("ax"))
+    if whoami is not None:
+        point.field("whoami_raw", int(whoami))
+    else:
+        point.field("unavailable_fields", "ax")
     ts = int(payload.get("ts", 0))
     if ts > 1_000_000_000_000:
         point = point.time(ts, WritePrecision.MS)
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
     publish_ack(client, node_id, payload)
     log.warning("Sensor fault written for node %s seq=%d", node_id, payload.get("seq", -1))
+
+
+def finite_measurement(value):
+    """Unavailable is not zero. Reject wrong types; tolerate null/nonfinite."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("measurement must be numeric or null")
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 def write_telemetry(client: mqtt.Client, node_id: str, payload: dict) -> None:
@@ -102,38 +116,51 @@ def write_telemetry(client: mqtt.Client, node_id: str, payload: dict) -> None:
     panels. window_rms is the firmware rolling RMS used by anomaly detection.
     Records with STATUS_SENSOR_FAULT are routed to sensor_faults instead.
     """
+    # Never invent an identity for evidence or ACK a coercible/wrong identity.
+    for key in ("boot", "seq"):
+        value = payload.get(key)
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"invalid {key} identity")
     if int(payload.get("flags", 0)) & FAULT_FLAGS_MASK:
         write_sensor_fault(client, node_id, payload)
         return
 
-    ax = float(payload.get("ax", 0.0))
-    ay = float(payload.get("ay", 0.0))
-    az = float(payload.get("az", 0.0))
-    vibration_rms = math.sqrt(ax ** 2 + ay ** 2 + az ** 2)
-    raw_wrms = payload.get("wrms")
-    window_rms = float(raw_wrms) if raw_wrms is not None else vibration_rms
+    values = {key: finite_measurement(payload.get(key))
+              for key in ("ax", "ay", "az", "gx", "gy", "gz", "wrms")}
+    axes = [values[key] for key in ("ax", "ay", "az")]
+    # hypot avoids intermediate overflow. Still omit an unrepresentable result.
+    magnitude = math.hypot(*axes) if all(v is not None for v in axes) else None
+    if magnitude is not None and not math.isfinite(magnitude):
+        magnitude = None
+    # Legacy payloads WITHOUT wrms keep their old fallback. Explicit null does
+    # not claim a measured window RMS and must remain absent in the database.
+    window_rms = values["wrms"] if "wrms" in payload else magnitude
 
     flags = int(payload.get("flags", 0))
 
     point = (
         Point("vibration")
         .tag("node_id", node_id)
-        # Per-axis filtered values (firmware units)
-        .field("ax",           ax)
-        .field("ay",           ay)
-        .field("az",           az)
-        .field("gx",           float(payload.get("gx", 0.0)))
-        .field("gy",           float(payload.get("gy", 0.0)))
-        .field("gz",           float(payload.get("gz", 0.0)))
-        # Derived metric: accel vector magnitude in m/s²
-        .field("vibration_rms", vibration_rms)
-        # Firmware anomaly metric: rolling RMS over the filter window
-        .field("window_rms",    window_rms)
         # Record identity
         .field("boot_id",      int(payload.get("boot", 0)))
         .field("sequence_id",  int(payload.get("seq",  0)))
         .field("flags",        flags)
     )
+    for key in ("ax", "ay", "az", "gx", "gy", "gz"):
+        if values[key] is not None:
+            point.field(key, values[key])
+    if magnitude is not None:
+        point.field("vibration_rms", magnitude)
+    if window_rms is not None:
+        point.field("window_rms", window_rms)
+    unavailable = [key for key, value in values.items() if value is None]
+    point.field("data_complete", not unavailable)
+    if unavailable:
+        point.field("unavailable_fields", ",".join(unavailable))
+    if all(value is None for value in values.values()):
+        # Persist identifiable invalid-data evidence, not fabricated readings.
+        # Keep the measurement deterministic across retries and preserve flags.
+        point.field("reason", "invalid_telemetry")
     # Use firmware timestamp when it looks like a real epoch (> year 2001 in ms).
     # Falls back to broker-arrival time (InfluxDB default) during pre-NTP-sync window.
     ts = int(payload.get("ts", 0))
@@ -142,7 +169,10 @@ def write_telemetry(client: mqtt.Client, node_id: str, payload: dict) -> None:
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
     publish_ack(client, node_id, payload)
-    log.debug("Written telemetry for %s: wrms=%.4f m/s² flags=0x%02x seq=%d",
+    if unavailable:
+        log.warning("Incomplete telemetry persisted for %s boot=%s seq=%s fields=%s",
+                    node_id, payload["boot"], payload["seq"], ",".join(unavailable))
+    log.debug("Written telemetry for %s: wrms=%s m/s² flags=0x%02x seq=%d",
               node_id, window_rms, flags, payload.get("seq", -1))
 
 

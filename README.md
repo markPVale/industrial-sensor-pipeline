@@ -78,13 +78,14 @@ graph LR
 
 ### Store-and-forward with app-level acknowledgements
 
-Records buffer in 8MB PSRAM (up to 50,000 &times; 48 bytes) during WiFi outages and drain on reconnect. The bridge ACKs each record _after_ writing it to InfluxDB, and the firmware only pops the buffer on a matching ACK — closing the gap between "MQTT accepted the publish" and "the data is actually persisted." A controlled broker-outage test is recorded as passing; raw evidence was not retained, so hardware re-validation remains tracked in the status document.
+Records buffer in 8MB PSRAM (up to 50,000 &times; 48 bytes) during WiFi outages and drain on reconnect. The bridge ACKs each record _after_ writing it to InfluxDB. A delivery lease pins the oldest record until a matching eligible ACK commits it. Missing ACKs cause paced retries, not abandonment while buffer space remains. At full capacity, exhausted attempts can permit counted abandonment; a new MQTT session first gets a fresh paced attempt. Overflow evicts the oldest unpinned record. The lease controller is native-tested but not yet hardware-validated. A historical controlled broker-outage test is recorded as passing; raw evidence was not retained, so hardware re-validation remains tracked in the status document.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> NORMAL : boot + MQTT connect
+    [*] --> BUFFERING : boot
     NORMAL --> BUFFERING : MQTT disconnect
-    BUFFERING --> SYNCING : MQTT reconnect
+    BUFFERING --> SYNCING : MQTT connected + subscription sent
+    NORMAL --> SYNCING : backlog exceeds one record
     SYNCING --> NORMAL : buffer empty
     SYNCING --> BUFFERING : disconnect during drain
 
@@ -116,16 +117,18 @@ stateDiagram-v2
 
 ## Firmware Design
 
-Six FreeRTOS tasks across two cores:
+Four application FreeRTOS tasks across two cores:
 
 | Task | Core | Priority | Role |
 |------|------|----------|------|
 | `safetyTask` | 0 | 6 | ISR handler — latches interlock, publishes E-Stop |
 | `sensorTask` | 1 | 5 | 100Hz MPU-6050 sampling via `vTaskDelayUntil` |
 | `filterTask` | 1 | 5 | 6&times; Kalman filters, rolling RMS, anomaly detection |
-| `connectionTask` | 0 | 4 | Sole MQTT socket owner, drains publish queue |
-| `telemetryTask` | 0 | 3 | Enqueues oldest buffered telemetry at 2Hz |
-| `syncTask` | 0 | 3 | Drains PSRAM buffer on reconnect |
+| `connectionTask` | 0 | 4 | Sole MQTT/lease/pacing owner; publishes, handles ACKs, retries and abandonment |
+
+Live delivery follows production (~2 Hz). New-record publishes start at least
+100 ms apart in either mode, allowing ACK-gated catch-up without a second 2 Hz
+timer that accumulates publishing overhead. Retries use separate lease timers.
 
 ## Tech Stack
 

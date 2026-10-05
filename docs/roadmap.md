@@ -1,6 +1,6 @@
 # Engineering Roadmap
 
-Last reviewed: **2026-09-29**
+Last reviewed: **2026-10-05**
 
 This is the canonical list of open engineering work for the repository. Component
 documents remain authoritative for design details and test procedures, but new
@@ -31,17 +31,52 @@ state model is replaced.
 - [x] Add a native firmware test harness and a behavior-preserving seam around
   the legacy ACK state; reproduce the R0/R1 stale-ACK race as a failing test.
 - [x] Add the `BufferManager` pin API, second-oldest eviction, `PushOutcome`,
-  counters, and native buffer tests (commit `09e486c`). These operations are not
-  yet wired into firmware delivery; the legacy ACK races remain.
+  counters, and native buffer tests (commit `09e486c`). The delivery controller
+  now uses these operations; hardware re-validation remains pending.
 - [x] Add the bounded thread-safe RAM `LossJournal` and forward every lossy
   `PushOutcome` from both producers; periodically close expired ranges from
   `connectionTask`. Native tests cover exact ranges, journal overflow, and
   concurrent access. Diagnostic publishing is still pending below.
-- [ ] Move delivery ownership into a single lease controller in
-  `connectionTask`; reduce `telemetryTask` and `syncTask` to cadence signals.
+- [x] Move delivery ownership into a single lease controller in
+  `connectionTask`; subsequently remove the cadence-only telemetry/sync tasks.
+  The R0/R1 regression passes against the production-used controller; native
+  suites now run in CI. Retry/pressure-abandonment policy still needs hardware validation.
+- [x] Harden delivery integration: reconcile current connectivity, retry ACK
+  subscription with readiness gating, catch up NORMAL backlogs, preserve eligible
+  send opportunities, and rate-limit serial counter reporting. Production DeliveryRuntime
+  has native integration tests; timing configuration is shared with firmware.
+- [x] Fix steady-state pacing drift: producer-paced NORMAL, 100 ms minimum
+  start-to-start spacing for new records in either mode, no accumulated ticks.
+  Add nonzero-publish/jitter/phase regression, wrap and no-burst tests; remove
+  redundant cadence tasks, ACK event group/state, and reduce E-Stop queue to four
+  slots. Log short-lived mode entries and subscription outcomes outside callbacks.
+- [x] Replace time-based abandonment with full-buffer pressure plus exhausted,
+  resolved attempts. Verify fullness and pin release atomically; keep slow probes
+  while space remains. New MQTT sessions owe a fresh paced attempt and full ACK
+  window on success without resetting counters/backoff. Native regressions cover
+  bridge outage/recovery without reconnect, session churn and full-buffer recovery.
 - [ ] Add loss-range and lease-abandonment diagnostics, cumulative counters,
   bridge routing, exact gap attribution, and abandonment reconciliation.
 - [ ] Tune abandonment thresholds during hardware validation.
+
+- [x] Prevent nonfinite/truncated telemetry JSON: host-tested serializer,
+  nullable bridge handling and persistence-before-ACK tests. All-invalid records
+  persist identity and invalid-data evidence, not fabricated zero readings.
+  Dashboard and integrity checker preserve unavailable-data semantics.
+- [x] Cover interrupted ACK waits with a surviving MQTT session and a full
+  buffer; rate-limit atomic pressure checks to once per second during slow retry.
+- [x] Latch ownership-validation failures across retries/reconnects; resume only
+  after a read-only matching-pin validation or a successful matching ACK commit.
+  Extend the failure regression past 30/60-second retry boundaries.
+- [ ] TODO: Design explicit permanent-rejection classification/protocol separately.
+  Do not ACK discarded data or treat generic database exceptions as permanent.
+  Poison records outside the handled numeric cases can still block delivery
+  until buffer pressure permits abandonment. The bridge sends no ACK for
+  malformed JSON, a non-numeric measurement, or an invalid `boot`/`seq`
+  identity (`gateway/bridge/mqtt_to_influx.py`). Current `buildPayload()` output
+  cannot produce these, so only another publisher or a future firmware defect
+  can. If one occurs, it holds the buffer head until the 50,000-record buffer
+  fills: about 6.9 h at 2 Hz, during which no other telemetry is delivered.
 
 ### Evidence-backed store-and-forward validation
 
@@ -55,8 +90,15 @@ Run this after the delivery-lease and diagnostic work above.
 
 ### Coverage-aware anomaly results
 
-Status: correctness gap in the current MCP tool. An empty anomaly query currently
-conflates healthy telemetry with absent or incomplete telemetry.
+Status: full-window coverage analysis remains unimplemented. An empty event list
+alone cannot distinguish healthy telemetry from absent or incomplete telemetry;
+the response now explicitly reports coverage as not assessed.
+
+Basic nullable-data handling is implemented: latest/health queries retain invalid
+records, expose unavailable measurements, and never infer window RMS from vector
+magnitude. Invalid records are included in the bounded event query even without
+anomaly flags. Responses explicitly leave coverage `not_assessed`. This does not
+complete the full-window coverage work below: persisted identity is not valid coverage.
 
 - [ ] Query ordinary telemetry coverage independently of flagged anomaly and
   fault events.
@@ -233,8 +275,6 @@ from testing the per-window calculations as pure code.
 - [ ] Add multi-node fleet support: dynamic node IDs, unique client identities,
   per-node ACK topics, and fleet dashboards.
 - [ ] Add an on-device anomaly model or edge-ML path.
-- [ ] Consider collapsing the cadence-only `telemetryTask` and `syncTask` into
-  `connectionTask` after the delivery-lease work is stable.
 - [ ] Consider the deferred queued-publish generation contract if telemetry is
   moved back through an asynchronous publish queue.
 - [ ] Consider bounded multi-record in-flight delivery if single-record ACK

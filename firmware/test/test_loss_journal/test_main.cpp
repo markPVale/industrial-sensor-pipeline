@@ -130,7 +130,7 @@ static void test_abandonment_is_outcome_not_confirmed_loss() {
     TEST_ASSERT_TRUE(journal.pop(event));
     TEST_ASSERT_EQUAL_INT((int)JournalEventKind::LEASE_ABANDONMENT, (int)event.kind);
     TEST_ASSERT_EQUAL_INT((int)DeliveryOutcome::UNKNOWN_AFTER_PUBLISH, (int)event.delivery_outcome);
-    TEST_ASSERT_EQUAL_INT((int)AbandonmentReason::ACK_BUDGET_EXHAUSTED, (int)event.reason);
+    TEST_ASSERT_EQUAL_INT((int)AbandonmentReason::BUFFER_PRESSURE_ACK_EXHAUSTED, (int)event.reason);
     TEST_ASSERT_EQUAL_UINT32(7, event.abandonment.identity.boot_id);
     TEST_ASSERT_EQUAL_UINT32(2, event.abandonment.identity.sequence_id);
     TEST_ASSERT_EQUAL_UINT32(5, event.abandonment.publish_calls);
@@ -138,7 +138,7 @@ static void test_abandonment_is_outcome_not_confirmed_loss() {
     TEST_ASSERT_EQUAL_UINT32(15000, event.abandonment.connected_wait_ms);
     TEST_ASSERT_TRUE(journal.pop(event));
     TEST_ASSERT_EQUAL_INT((int)DeliveryOutcome::NOT_PUBLISHED, (int)event.delivery_outcome);
-    TEST_ASSERT_EQUAL_INT((int)AbandonmentReason::PUBLISH_FAILURE_BUDGET_EXHAUSTED, (int)event.reason);
+    TEST_ASSERT_EQUAL_INT((int)AbandonmentReason::BUFFER_PRESSURE_PUBLISH_FAILURE, (int)event.reason);
     TEST_ASSERT_EQUAL_UINT64(1, journal.getStats().lease_abandoned_after_publish);
     TEST_ASSERT_EQUAL_UINT64(1, journal.getStats().lease_abandoned_unpublished);
 }

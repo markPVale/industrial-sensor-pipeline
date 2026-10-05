@@ -1,14 +1,37 @@
 # Store-and-Forward Status
 
-Last updated: 2026-09-29
+Last updated: 2026-10-04
 
 ## Delivery-lease implementation update
 
-Buffer pin operations and the bounded RAM LossJournal are implemented, but the
-firmware still uses the legacy ACK delivery path. Both buffer producers now
-journal loss outcomes; `connectionTask` closes expired ranges. There is no
-diagnostic publisher or bridge reconciliation yet, and no new hardware
-validation. The journal does not fix the stale-ACK or peek/pop races by itself.
+Buffer pin operations, bounded RAM LossJournal, and DeliveryLease are implemented.
+`connectionTask` exclusively pins, publishes, retries, commits matching ACKs, and
+performs counted abandonment and owns pacing. The cadence-only telemetry/sync
+tasks have been removed.
+The R0/R1 stale-ACK invariant now passes against the production-used controller;
+delivery no longer uses split peek/pop. Both producers journal overflow losses.
+There is no diagnostic publisher or bridge reconciliation yet, and no new
+hardware validation. Historical results below do not validate the new controller.
+
+A pin survives disconnect and overflow (second-oldest eviction, or newest
+rejection at capacity one). Five publish calls now switch to slow probes at a
+30-second completion-to-next-attempt interval; they do not cap attempts or discard
+records while space remains. Initial failed publishes back off at 1/2/4/8 seconds,
+and successful attempts receive a 3-second ACK window. Abandonment requires actual
+full-buffer pressure and a resolved attempt; fullness and matching-pin release
+are one atomic operation. Observed connected time is diagnostic only. New MQTT
+sessions owe a fresh paced attempt before abandonment, without resetting counters
+or cooldowns. Matching eligible ACKs win in the same iteration. Abandonment after
+publishing means delivery is unknown, not necessarily lost. These defaults are
+software-tested, not hardware-tuned.
+
+The device now emits cumulative delivery/subscription counters to serial every
+five seconds. Repeated internal validation failures keep the pin and use the
+same rate-limited reporting, rather than printing every loop. Subscription
+readiness means the request was written, not broker SUBACK confirmation. MQTT
+diagnostic publishing and checker reconciliation remain pending. Mode entries
+and subscription outcomes are additionally logged after runtime service, so
+short-lived transitions do not disappear between five-second summaries.
 
 The journal retains at most 64 closed events plus one open range. Once full, it
 drops new closed events and increments `diagnostic_events_lost`; counters retain
@@ -19,7 +42,7 @@ can leave a genuinely missing record unexplained, even if an abandonment count
 was observed. See delivery-lease design §8.1 and §9 D2 for reconciliation limits.
 
 See [the delivery-lease design](delivery-lease-design.md) and
-[roadmap](roadmap.md) for the remaining controller and diagnostics work.
+[roadmap](roadmap.md) for remaining diagnostics and hardware validation work.
 
 ## Current Status
 
@@ -47,8 +70,8 @@ too early.
 
 > **Superseded by "App-Level ACK Implemented" below.** This section records the
 > first attempt, which moved the commit point to `publish()` success. That is no
-> longer the commit point: the firmware now retains each record until the bridge
-> ACKs the InfluxDB write. Kept for history — do not read it as current behavior.
+> longer the commit point. It was replaced by app-level ACKs, and subsequently
+> the delivery lease described above. Kept for history, not current behavior.
 
 The firmware source moved the buffer commit point closer to the actual MQTT
 publish attempt.
@@ -91,7 +114,11 @@ Build status:
 pio run: SUCCESS
 ```
 
-## App-Level ACK Implemented
+## App-Level ACK Implemented — Historical, Superseded by Delivery Lease
+
+The procedure below describes the pre-lease firmware. It does not describe
+current pin ownership, disconnect behavior or counted abandonment. See the
+implementation update above for current behavior; the bridge ACK contract remains.
 
 The firmware and bridge now include an app-level acknowledgement path.
 
@@ -241,10 +268,10 @@ SYNC_BATCH_SIZE = 20 records per 100 ms
 about 200 records/sec
 ```
 
-`SYNC_BATCH_SIZE` is currently unused — see the note at `firmware/include/config.h:76`,
-which reserves it for a future multi-in-flight design.
+The unused `SYNC_BATCH_SIZE` setting has been removed. Multi-in-flight delivery
+requires a separate design; the current lease protects one record at a time.
 
-Healthy drain, ACKs arriving well inside SYNC_BATCH_DELAY_MS:
+Healthy drain, ACKs arriving well inside `DELIVERY_MIN_PUBLISH_INTERVAL_MS`:
 
 ```text
 1 buffered record in flight at a time

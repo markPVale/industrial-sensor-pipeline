@@ -68,11 +68,10 @@ for runtime observability instead of the serial monitor.
 | `safetyTask` | 0 | 6 | ISR handler — latches interlock, publishes E-Stop |
 | `sensorTask` | 1 | 5 | 100Hz MPU-6050 sampling via `vTaskDelayUntil` |
 | `filterTask` | 1 | 5 | 6× Kalman filters, rolling RMS, anomaly detection |
-| `connectionTask` | 0 | 4 | Sole MQTT socket owner, drains publish queue |
-| `telemetryTask` | 0 | 3 | Enqueues oldest buffered telemetry at 2Hz |
-| `syncTask` | 0 | 3 | Drains PSRAM buffer on reconnect |
+| `connectionTask` | 0 | 4 | Sole MQTT/lease/pacing owner; inline telemetry, ACKs, retries, abandonment, E-Stop queue |
 
-Safety and sensor work runs on Core 1; all network I/O runs on Core 0.
+Sensor acquisition and filtering run on Core 1. Safety handling and network I/O
+run on Core 0. The former cadence-only telemetry/sync tasks have been removed.
 
 ### Store-and-Forward State Machine
 
@@ -80,23 +79,39 @@ Safety and sensor work runs on Core 1; all network I/O runs on Core 0.
 NORMAL ──(disconnect)──▶ BUFFERING ──(reconnect)──▶ SYNCING ──(empty)──▶ NORMAL
 ```
 
-- **NORMAL** — real-time 2Hz telemetry via MQTT
+- **NORMAL** — producer-paced live telemetry (~2Hz); enters SYNCING if backlog develops
 - **BUFFERING** — records written to PSRAM ring buffer (up to 50,000 × 48 bytes ≈ 2.4 MB)
-- **SYNCING** — buffered records drain after reconnect, one record at a time;
-  the firmware retains each record until the bridge confirms its InfluxDB write
-  with a matching app-level ACK
+- **SYNCING** — buffered records drain after reconnect or a live backlog, one at
+  a time. In either mode new-record publishes start at least 100ms apart.
+  The active record is pinned until an eligible matching ACK or counted abandonment
+  under full-buffer pressure after exhausted attempts. With space available it
+  keeps slow-retrying, including when MQTT is up but the bridge is down. Each new
+  MQTT session owes a fresh paced attempt; successful attempts get their full ACK
+  window. Observed connected time cannot authorize abandonment. Overflow evicts
+  the oldest unpinned record.
 
-`NodeState` is a single `std::atomic<NodeState>` — no scattered boolean flags.
-All MQTT callbacks only call `xEventGroupSetBits` — no Serial, no state writes
-(USB CDC + WiFi interrupt contention causes crashes if callbacks block).
+DeliveryRuntime owns `NodeState` on connectionTask; no mirrored atomic state or
+cadence flag is required. MQTT callbacks execute synchronously on that task:
+connection callbacks update runtime readiness, and the message callback stages
+one ACK identity plus a plain pending flag. They perform no serial logging.
+The ISR-driven safety event group remains separate. Mode entries and subscription
+request results are logged after runtime service; cumulative summaries are
+limited to once per five seconds. A sent subscription is not SUBACK confirmation.
+
+Failed pin validation latches an ownership fault and blocks further publishing,
+including across reconnects. Rate-limited read-only validation of the same pin
+permits recovery; a successful matching ACK commit can also clear it. The serial
+summary exposes `ownership_fault`. No automatic unpin or reboot is performed.
 
 A 2026-06-24 hardware run is recorded as passing a controlled Mosquitto
 outage/restart: `integrity_check.py` checked 570 records with zero sequence gaps,
 timestamp monotonicity PASS, and data fidelity PASS. Its raw output was not
 retained in the repository, so the result is not independently auditable and a
-repeat hardware test remains open. The bridge publishes `sensor/node01/ack` only
-after an InfluxDB write succeeds, and firmware pops the matching PSRAM record
-only after receiving that ACK.
+repeat hardware test remains open. That test predates the delivery lease and
+does not validate it. The bridge publishes `sensor/node01/ack` only after an
+InfluxDB write succeeds. The new controller is native-tested, not yet validated
+on hardware. Abandonment after publishing means delivery is unknown, not proven
+lost; diagnostics publishing and downstream reconciliation remain pending.
 
 This is not an unbounded exactly-once guarantee. The PSRAM buffer is finite, and
 a lost ACK can cause a duplicate retry after the original record was persisted.
@@ -135,7 +150,10 @@ to clear any corrupted internal state left by a hot-unplug.
 | `STATUS_DEGRADED_REBOOT_REQUIRED` | `0x20` | I2C fault; auto-reboot pending |
 | `STATUS_SENSOR_UNAVAILABLE` | `0x40` | Max reboots exhausted; power-cycle required |
 
-## Key Configuration (`include/config.h`)
+## Key Configuration
+
+Sensor/buffer/queue settings live in `include/config.h`; shared native-tested
+delivery settings live in `include/delivery_config.h` (included by `config.h`).
 
 | Constant | Default | Description |
 |----------|---------|-------------|
@@ -147,7 +165,12 @@ to clear any corrupted internal state left by a hot-unplug.
 | `SENSOR_FAULT_REBOOT_MS` | 30000 | Time in fault before auto-reboot |
 | `SENSOR_FAULT_MAX_REBOOTS` | 3 | Max reboots per power-on session |
 | `SENSOR_FAULT_EMIT_INTERVAL_MS` | 5000 | Fault record rate limit |
-| `TELEMETRY_PUBLISH_MS` | 500 | Publish interval in NORMAL/SYNCING state |
+| `MQTT_PUBLISH_QUEUE_DEPTH` | 4 | Non-leased E-Stop queue slots; full enqueue logs a drop |
+| `DELIVERY_MIN_PUBLISH_INTERVAL_MS` | 100 | Minimum start-to-start spacing for new records, both modes |
+| `MQTT_ACK_TIMEOUT_MS` | 3000 | ACK wait after successful publish completion |
+| `DELIVERY_RAPID_ATTEMPTS` | 5 | Slow-retry threshold; abandonment additionally requires full buffer and a resolved attempt |
+| `DELIVERY_RETRY_BACKOFF_MS` | 1000 | Initial failure backoff/minimum reconnect cooldown |
+| `DELIVERY_SLOW_RETRY_MS` | 30000 | Completion-to-next-attempt cooldown after the threshold, preserved across sessions |
 
 ## NVS Layout
 

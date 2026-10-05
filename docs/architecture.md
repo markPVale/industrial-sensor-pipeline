@@ -42,8 +42,15 @@ graph LR
 
 Records buffer in PSRAM during network partitions and drain one at a time after
 reconnect. The bridge publishes an app-level ACK only after the InfluxDB write
-succeeds, and firmware retains each record until it receives the matching
-`boot_id + sequence_id` ACK. A controlled 2026-06-24 hardware broker-outage test
+succeeds. The connectionTask-owned delivery lease pins its record until an
+eligible matching `boot_id + sequence_id` ACK or counted abandonment under full-buffer
+pressure after exhausted attempts. With free space, it continues slow retries;
+new MQTT sessions get a fresh paced attempt before abandonment is eligible.
+Other records may still be evicted at capacity. connectionTask also owns pacing;
+the former cadence tasks are removed. Live delivery follows production (~2 Hz),
+with a shared 100 ms minimum between new-record publish starts in either mode.
+This controller is native-tested, not yet hardware-validated.
+A controlled 2026-06-24 hardware broker-outage test of the earlier implementation
 is recorded as passing with 570 records and zero sequence gaps, but its raw
 output was not retained; repeat validation remains open.
 
@@ -54,10 +61,11 @@ pre-ACK failure, evidence note, re-validation TODO, and remaining limitations.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> NORMAL : boot + MQTT connect
+    [*] --> BUFFERING : boot
 
     NORMAL --> BUFFERING : MQTT disconnect\n(WiFi loss / broker down)
-    BUFFERING --> SYNCING : MQTT reconnect
+    BUFFERING --> SYNCING : MQTT connected + subscription sent
+    NORMAL --> SYNCING : backlog exceeds one record
 
     NORMAL : NORMAL\nReal-time 2Hz publish via MQTT
     BUFFERING : BUFFERING\nRecords written to PSRAM\n(up to 50,000 × 48 bytes ≈ 2.4 MB)

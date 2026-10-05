@@ -67,16 +67,16 @@ struct BufferStats {
 // -----------------------------------------------------------------------------
 // NodeState — store-and-forward state machine.
 //
-// Transitions (enforced in main.cpp via setState()):
-//   NORMAL    → BUFFERING  on MQTT disconnect
-//   BUFFERING → SYNCING    on MQTT reconnect
+// Transitions (owned exclusively by DeliveryRuntime in connectionTask):
+//   NORMAL    → BUFFERING  on transport loss / unresolved ACK subscription
+//   BUFFERING → SYNCING    on current connectivity + subscription request sent
+//   NORMAL    → SYNCING    when more than one record is retained (catch-up)
 //   SYNCING   → NORMAL     when g_buffer is empty after drain
 //
-// All tasks key their behavior off this single enum.
-// No task owns a local "connected" flag — check getState() instead.
+// connectionTask alone owns the socket, pacing, lease accounting and transitions.
 // -----------------------------------------------------------------------------
 enum class NodeState : uint8_t {
-    NORMAL,     // Connected. telemetryTask pops and publishes live.
-    BUFFERING,  // Disconnected. Records accumulate in PSRAM. No task pops.
-    SYNCING,    // Reconnected. syncTask drains buffer; telemetryTask resumes.
+    NORMAL,     // Producer-paced live delivery (~2 Hz), no separate cadence task.
+    BUFFERING,  // Transport/subscription unavailable. Accumulate and preserve pin.
+    SYNCING,    // Backlog drain: new-record starts at least 100 ms apart, ACK-gated.
 };

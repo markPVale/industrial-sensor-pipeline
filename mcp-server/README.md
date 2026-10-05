@@ -10,15 +10,32 @@ Raspberry Pi alongside the gateway stack and queries InfluxDB directly.
 |------|-------------|
 | `get_latest_telemetry` | Most recent telemetry record — vibration RMS, IMU values, decoded status flags |
 | `get_sensor_health` | Health summary — online status, last-seen age, plain-English diagnosis |
-| `get_recent_anomalies` | Up to 50 most recent actionable vibration and sensor-fault events within a configurable lookback window |
+| `get_recent_anomalies` | Up to 50 most recent flagged, invalid-data, and sensor-fault events within a configurable lookback window |
+
+## Invalid and Missing Measurements
+
+Latest telemetry and health queries retain the newest record even when it has
+no valid measurements. Responses expose `data_complete`, `data_status`
+(`complete`, `incomplete`, or `unavailable`), `unavailable_fields` (wire names),
+and an optional stored `reason`. Unavailable numeric values are JSON `null`.
+`window_rms_mps2` and its `vibration_rms_mps2` alias never substitute vector
+magnitude; `vector_magnitude_mps2` remains a separate metric. Explicit bridge
+unavailability metadata also overrides a stored legacy fallback value.
+
+Fresh invalid evidence counts toward last-seen freshness, but produces
+`DATA UNAVAILABLE`, not `OK`. E-Stop and sensor-fault summaries retain priority.
+Old complete records without quality metadata are checked using their fields;
+missing window RMS remains unavailable rather than being inferred. Freshness is
+still based on stored record timestamps, not proof of a currently connected device.
 
 ## Known Limitation: Anomaly-Window Coverage
 
-`get_recent_anomalies` currently queries only flagged events. An empty result
+`get_recent_anomalies` queries flagged and invalid-data events. An empty result
 therefore means no matching event was found; it does not prove that ordinary
 telemetry covered the requested interval. A node that was offline for the whole
-window can currently receive the same "No anomalies detected" response as a
-healthy node.
+window can still have the same empty event list as a healthy node. All responses
+include `coverage_status: "not_assessed"`; empty results explicitly say coverage
+has not been assessed, rather than claiming no anomalies occurred.
 
 Until the coverage-aware result contract in the
 [engineering roadmap](../docs/roadmap.md#coverage-aware-anomaly-results) is
@@ -35,7 +52,8 @@ takes priority over sensor-fault summaries.
 
 | Summary | Condition |
 |---------|-----------|
-| `OK — Normal operation` | No flags, data fresh |
+| `OK — Normal operation` | Data fresh and complete; no higher-priority flags |
+| `DATA UNAVAILABLE` | Fresh telemetry with missing/invalid measurements, without a higher-priority fault |
 | `WARNING — Anomaly detected` | `STATUS_ANOMALY` set |
 | `DEGRADED — I2C fault detected. Auto-reboot pending.` | `STATUS_DEGRADED_REBOOT_REQUIRED` set |
 | `CRITICAL — E-Stop / safety interlock is active.` | `STATUS_INTERLOCK_OPEN` set |
@@ -47,6 +65,7 @@ takes priority over sensor-fault summaries.
 ```bash
 npm install
 npm run build       # compiles src/index.ts → dist/index.js
+npm test            # tool helpers and production query/response paths with mocked DB
 ```
 
 ## Running

@@ -9,7 +9,8 @@ reports duplicate delivery and sensor faults.
   Timestamp monotonicity — _time values are strictly increasing and spaced
                         ~500ms apart (FILTER_WINDOW_SIZE=50 at 100Hz).
   Data fidelity — vibration_rms matches recomputed sqrt(ax²+ay²+az²), and
-                  window_rms is present for normal records.
+                  all measurements, including window_rms, are present for
+                  normal records. Unavailable or nonfinite data counts as an error.
 
 Sensor faults are reported for review and never fail the run. Duplicate delivery
 is split by severity: a same-measurement repeat is a tolerated retry and only
@@ -63,11 +64,12 @@ from(bucket: "{INFLUX_BUCKET}")
                 "measurement": str(row.values.get("_measurement", "")),
                 "boot_id":  int(row.values.get("boot_id", 0)),
                 "seq_id":   int(row.values.get("sequence_id", 0)),
-                "ax":       float(row.values.get("ax", 0.0)),
-                "ay":       float(row.values.get("ay", 0.0)),
-                "az":       float(row.values.get("az", 0.0)),
-                "rms":      float(row.values.get("vibration_rms", 0.0)),
+                "ax":       row.values.get("ax"),
+                "ay":       row.values.get("ay"),
+                "az":       row.values.get("az"),
+                "rms":      row.values.get("vibration_rms"),
                 "window_rms": row.values.get("window_rms"),
+                "data_complete": row.values.get("data_complete"),
                 "flags":    int(row.values.get("flags", 0)),
             })
     return sorted(records, key=lambda r: r["time"])
@@ -245,17 +247,23 @@ def check_fidelity(records):
     errors = 0
     normal = [r for r in records if not (r["flags"] & FAULT_FLAGS_MASK)]
     for r in normal:
-        expected_rms = math.sqrt(r["ax"]**2 + r["ay"]**2 + r["az"]**2)
+        if r.get("data_complete") is False or any(
+            r.get(key) is None or not math.isfinite(r[key])
+            for key in ("ax", "ay", "az", "rms", "window_rms")
+        ):
+            # Persisted invalid-data evidence preserves sequence integrity, not
+            # measurement fidelity. Never turn an explained defect into a pass.
+            print(f"  DATA UNAVAILABLE/NONFINITE  seq={r['seq_id']}")
+            errors += 1
+            continue
+        expected_rms = math.hypot(r["ax"], r["ay"], r["az"])
         diff = abs(r["rms"] - expected_rms)
         if diff > RMS_TOLERANCE:
             print(f"  RMS MISMATCH  seq={r['seq_id']}  "
                   f"stored={r['rms']:.6f}  computed={expected_rms:.6f}  diff={diff:.6f}")
             errors += 1
-        if r["window_rms"] is None:
-            print(f"  WINDOW RMS MISSING  seq={r['seq_id']}  older firmware/bridge payload")
-            errors += 1
     if errors == 0:
-        print(f"  PASS — {len(normal)} records, vibration_rms matches recomputed values and window_rms is present")
+        print(f"  PASS — {len(normal)} records, vibration_rms matches recomputed values and all measurements are available")
     else:
         print(f"  FAIL — {errors} violation(s)")
     return errors == 0

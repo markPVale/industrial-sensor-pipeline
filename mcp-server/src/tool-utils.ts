@@ -130,16 +130,20 @@ export function buildAnomalyQueries(opts: {
   // flags >= 4 excludes accel/gyro-clip-only records (0x01, 0x02, 0x03) while
   // capturing all actionable flags: interlock (0x04), anomaly (0x08), and all
   // sensor-fault variants (0x10, 0x20, 0x40).
+  // Invalid telemetry is actionable even with flags=0. Do not require numeric
+  // measurements before filtering: all-invalid records are persisted evidence.
   const vibration = `
     from(bucket: "${bucket}")
       |> range(start: -${window}m)
       |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
       |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> filter(fn: (r) =>
-        exists r.flags and exists r.vibration_rms and
-        exists r.ax and exists r.ay and exists r.az
+        (exists r.flags and r.flags >= 4) or
+        (exists r.data_complete and r.data_complete == false) or
+        not exists r.window_rms or
+        not exists r.ax or not exists r.ay or not exists r.az or
+        not exists r.gx or not exists r.gy or not exists r.gz
       )
-      |> filter(fn: (r) => r.flags >= 4)
       |> sort(columns: ["_time"], desc: true)
       |> limit(n: ${rowLimit})
   `;

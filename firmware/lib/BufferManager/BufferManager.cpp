@@ -120,17 +120,24 @@ bool BufferManager::commitPinnedHead(uint32_t boot_id, uint32_t seq) {
     return true;
 }
 
-bool BufferManager::abandonPinnedHead(uint32_t boot_id, uint32_t seq,
-                                      RecordIdentity& abandoned) {
+bool BufferManager::validatePinnedHead(uint32_t boot_id, uint32_t seq) {
     if (!_mutex) return false;
     BufferPlatform::LockGuard lock(_mutex);
-    if (!pinnedHeadMatches({boot_id, seq})) return false;
+    return pinnedHeadMatches({boot_id, seq});
+}
+
+AbandonResult BufferManager::abandonPinnedHeadIfFull(uint32_t boot_id, uint32_t seq,
+                                                    RecordIdentity& abandoned) {
+    if (!_mutex) return AbandonResult::INVALID_PIN;
+    BufferPlatform::LockGuard lock(_mutex);
+    if (!pinnedHeadMatches({boot_id, seq})) return AbandonResult::INVALID_PIN;
+    if (_count != _capacity) return AbandonResult::NOT_FULL;
     abandoned = identityOf(_buffer[_readIndex]);
     removeOldest();
     ++_abandoned;
     _hasPinnedHead = false;
     _pinnedIdentity = {};
-    return true;
+    return AbandonResult::ABANDONED;
 }
 
 BufferStats BufferManager::getStats() {

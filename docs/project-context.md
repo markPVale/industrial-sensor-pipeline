@@ -83,18 +83,25 @@ The ESP32 runs a multi-tasking scheduler to ensure safety events cannot be block
 - **Safety Interrupt (Highest):** Triggers emergency stop event immediately.
 - **Sensor Task (Medium):** Samples MPU-6050 @ 100Hz.
 - **Filtering Task (Medium):** Runs Kalman filters and computes vibration metrics.
-- **Telemetry/Sync Tasks (Low):** Manages MQTT publishing and PSRAM buffer flushing.
+- **Connection Task (Core 0):** Owns MQTT, the delivery lease and pacing; no separate telemetry/sync tasks.
 
 ---
 
 ## Resilience Engine (Store-and-Forward)
 A state machine governs telemetry behavior during failure:
+
 - **NORMAL:** Real-time streaming via MQTT QoS 0.
-- **BUFFERING:** On disconnect, telemetry records are written to a **Circular Buffer in PSRAM**.
-- **SYNCING:** On reconnect, buffered records drain in order, one record at a
+- **BUFFERING:** While transport or local ACK subscription setup is unavailable,
+  records accumulate in the **Circular Buffer in PSRAM**, preserving any active pin.
+- **SYNCING:** On recovery or when NORMAL develops a backlog, buffered records
+  drain in order, one record at a
   time. The bridge publishes an app-level ACK only after the InfluxDB write
-  succeeds, and firmware removes the record from PSRAM only after receiving a
-  matching `boot_id + sequence_id` ACK.
+  succeeds. The connectionTask-owned lease pins its record until an eligible
+  matching `boot_id + sequence_id` ACK or counted, full-buffer-pressure abandonment
+  after exhausted attempts. Free space means continued slow retries, not abandonment.
+  A new MQTT session gives the pin a fresh paced attempt first.
+  Overflow evicts the oldest unpinned record. The controller is native-tested;
+  hardware validation of this new implementation is pending.
 
 A controlled Raspberry Pi 5 + ESP32-S3 broker-outage test is recorded as passing
 on 2026-06-24 with 570 records, zero sequence gaps, timestamp monotonicity PASS,

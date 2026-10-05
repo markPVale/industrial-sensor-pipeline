@@ -2,6 +2,7 @@
 
 import { useMqttTelemetry, FLAG_ESTOP, FLAG_ANOMALY, FLAG_SENSOR_FAULT, FLAG_DEGRADED_REBOOT_REQUIRED, FLAG_SENSOR_UNAVAILABLE } from "@/hooks/useMqttTelemetry";
 import HeartbeatIndicator from "./HeartbeatIndicator";
+import { incompleteReadings } from "@/hooks/telemetryValues";
 
 // TODO: Replace with a charting library (e.g. Recharts, Chart.js) for Phase 2
 function SparkLine({ values }: { values: number[] }) {
@@ -39,17 +40,20 @@ export default function TelemetryDisplay({ nodeId = "node01" }: { nodeId?: strin
   const isUnavailable = latest ? (latest.flags & FLAG_SENSOR_UNAVAILABLE)       !== 0 : false;
   const isDegraded    = latest ? (latest.flags & (FLAG_DEGRADED_REBOOT_REQUIRED | FLAG_SENSOR_FAULT)) !== 0 : false;
   const isAnomaly     = latest ? (latest.flags & FLAG_ANOMALY)                  !== 0 : false;
+  const isIncomplete = latest ? incompleteReadings(latest) : false;
 
   const statusColor = isEstop       ? "var(--red)"
                     : isUnavailable ? "var(--red)"
                     : isDegraded    ? "var(--yellow)"
                     : isAnomaly     ? "var(--yellow)"
+                    : isIncomplete  ? "var(--yellow)"
                     :                 "var(--green)";
 
   const statusLabel = isEstop       ? "E-STOP"
                     : isUnavailable ? "SENSOR UNAVAILABLE"
                     : isDegraded    ? "DEGRADED"
                     : isAnomaly     ? "ANOMALY"
+                    : isIncomplete  ? "DATA UNAVAILABLE"
                     :                 "NORMAL";
 
   const rmsValues = history

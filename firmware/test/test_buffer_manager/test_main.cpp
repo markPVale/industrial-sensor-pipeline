@@ -7,6 +7,10 @@
 
 static BufferManager buffer;
 
+static bool abandon(uint32_t boot, uint32_t seq, RecordIdentity& out) {
+    return buffer.abandonPinnedHeadIfFull(boot, seq, out) == AbandonResult::ABANDONED;
+}
+
 static TelemetryRecord record(uint32_t seq, uint32_t boot = 7) {
     TelemetryRecord r{};
     r.boot_id = boot;
@@ -57,7 +61,9 @@ static void test_lifecycle_and_uninitialised_operations() {
     TEST_ASSERT_FALSE(buffer.pop(out));
     TEST_ASSERT_FALSE(buffer.acquirePin(out));
     TEST_ASSERT_FALSE(buffer.commitPinnedHead(7, 1));
-    TEST_ASSERT_FALSE(buffer.abandonPinnedHead(7, 1, lost));
+    TEST_ASSERT_FALSE(buffer.validatePinnedHead(7, 1));
+    TEST_ASSERT_EQUAL_INT((int)AbandonResult::INVALID_PIN,
+                         (int)buffer.abandonPinnedHeadIfFull(7, 1, lost));
     TEST_ASSERT_EQUAL_UINT32(99, lost.sequence_id);
     assertRecord(record(999), out);
     TEST_ASSERT_FALSE(buffer.clear());
@@ -102,10 +108,14 @@ static void test_pin_survives_fill_relocation_and_wraparound() {
         TEST_ASSERT_EQUAL_INT((int)PushResult::EVICTED_PROTECTED, (int)result.result);
         assertIdentity(result.lost, record(seq - 2));
         TEST_ASSERT_TRUE(buffer.peek(out)); assertRecord(record(100), out);
+        TEST_ASSERT_TRUE(buffer.validatePinnedHead(7, 100));
+        TEST_ASSERT_FALSE(buffer.validatePinnedHead(8, 100));
+        TEST_ASSERT_FALSE(buffer.validatePinnedHead(7, seq));
         TEST_ASSERT_EQUAL_UINT(3, buffer.available());
     }
     TEST_ASSERT_EQUAL_UINT(37, buffer.getStats().protected_evictions);
     TEST_ASSERT_TRUE(buffer.commitPinnedHead(7, 100));
+    TEST_ASSERT_FALSE(buffer.validatePinnedHead(7, 100));
     TEST_ASSERT_TRUE(buffer.pop(out)); assertRecord(record(38), out);
     TEST_ASSERT_TRUE(buffer.pop(out)); assertRecord(record(39), out);
     TEST_ASSERT_TRUE(buffer.isEmpty());
@@ -142,8 +152,8 @@ static void test_identity_checks_and_counted_abandonment() {
     TEST_ASSERT_FALSE(buffer.commitPinnedHead(8, 1));
     TEST_ASSERT_FALSE(buffer.commitPinnedHead(7, 2));
     RecordIdentity abandoned{99, 99};
-    TEST_ASSERT_FALSE(buffer.abandonPinnedHead(8, 1, abandoned));
-    TEST_ASSERT_FALSE(buffer.abandonPinnedHead(7, 2, abandoned));
+    TEST_ASSERT_FALSE(abandon(8, 1, abandoned));
+    TEST_ASSERT_FALSE(abandon(7, 2, abandoned));
     TEST_ASSERT_EQUAL_UINT32(99, abandoned.boot_id);
     TEST_ASSERT_EQUAL_UINT32(99, abandoned.sequence_id);
     TEST_ASSERT_EQUAL_UINT(2, buffer.available());
@@ -152,9 +162,17 @@ static void test_identity_checks_and_counted_abandonment() {
     TEST_ASSERT_TRUE(buffer.acquirePin(out));
     TEST_ASSERT_FALSE(buffer.commitPinnedHead(7, 1)); // duplicate ACK cannot remove R1
     TEST_ASSERT_TRUE(buffer.peek(out)); assertRecord(record(2), out);
-    TEST_ASSERT_TRUE(buffer.abandonPinnedHead(7, 2, abandoned));
+    // A valid pin is not enough: there must be actual pressure in this lock.
+    TEST_ASSERT_EQUAL_INT((int)AbandonResult::NOT_FULL,
+                         (int)buffer.abandonPinnedHeadIfFull(7, 2, abandoned));
+    TEST_ASSERT_EQUAL_UINT32(99, abandoned.sequence_id);
+    TEST_ASSERT_FALSE(buffer.clear());
+    TEST_ASSERT_EQUAL_UINT(1, buffer.available());
+    TEST_ASSERT_EQUAL_UINT(0, buffer.getStats().abandoned);
+    buffer.push(record(3));
+    TEST_ASSERT_TRUE(abandon(7, 2, abandoned));
     assertIdentity(abandoned, record(2));
-    TEST_ASSERT_FALSE(buffer.abandonPinnedHead(7, 2, abandoned));
+    TEST_ASSERT_FALSE(abandon(7, 2, abandoned));
     TEST_ASSERT_EQUAL_UINT(1, buffer.getStats().abandoned);
     TEST_ASSERT_EQUAL_UINT(0, buffer.droppedCount());
     TEST_ASSERT_TRUE(buffer.clear());
@@ -201,8 +219,8 @@ static void test_ring_matches_deque_model() {
                 RecordIdentity lost{};
                 const bool removed = action == 5
                     ? buffer.commitPinnedHead(first.boot_id, first.sequence_id)
-                    : buffer.abandonPinnedHead(first.boot_id, first.sequence_id, lost);
-                TEST_ASSERT_EQUAL(pinned, removed);
+                    : abandon(first.boot_id, first.sequence_id, lost);
+                TEST_ASSERT_EQUAL(pinned && (action == 5 || model.size() == capacity), removed);
                 if (removed) {
                     if (action == 6) { ++abandoned; assertIdentity(lost, first); }
                     model.pop_front(); pinned = false;
@@ -290,6 +308,35 @@ static void test_two_producers_and_pinned_consumer_account_for_every_record() {
     TEST_ASSERT_EQUAL_UINT(losses[0].size() + losses[1].size(), buffer.droppedCount());
 }
 
+static void test_pressure_abandonment_races_fill_without_removing_another_record() {
+    for (uint32_t run=0;run<100;++run) {
+        TEST_ASSERT_TRUE(buffer.begin(2));
+        buffer.push(record(1));
+        TelemetryRecord pinned{}; TEST_ASSERT_TRUE(buffer.acquirePin(pinned));
+        std::atomic<bool> start{false};
+        PushOutcome pushed{};
+        std::thread producer([&]() {
+            while (!start.load()) std::this_thread::yield();
+            pushed=buffer.push(record(2));
+        });
+        RecordIdentity out{99,99}; start=true;
+        const auto result=buffer.abandonPinnedHeadIfFull(7,1,out);
+        producer.join();
+        TEST_ASSERT_FALSE(pushed.record_lost);
+        if (result==AbandonResult::NOT_FULL) {
+            TEST_ASSERT_EQUAL_UINT32(99,out.sequence_id);
+            TEST_ASSERT_EQUAL_UINT(0,buffer.getStats().abandoned);
+            TEST_ASSERT_EQUAL_INT((int)AbandonResult::ABANDONED,
+                                 (int)buffer.abandonPinnedHeadIfFull(7,1,out));
+        } else TEST_ASSERT_EQUAL_INT((int)AbandonResult::ABANDONED,(int)result);
+        TEST_ASSERT_EQUAL_UINT32(1,out.sequence_id);
+        TEST_ASSERT_EQUAL_UINT(1,buffer.getStats().abandoned);
+        TEST_ASSERT_EQUAL_UINT(1,buffer.available());
+        TEST_ASSERT_TRUE(buffer.peek(pinned)); assertRecord(record(2),pinned);
+        TEST_ASSERT_TRUE(buffer.end());
+    }
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_lifecycle_and_uninitialised_operations);
@@ -299,5 +346,6 @@ int main() {
     RUN_TEST(test_identity_checks_and_counted_abandonment);
     RUN_TEST(test_ring_matches_deque_model);
     RUN_TEST(test_two_producers_and_pinned_consumer_account_for_every_record);
+    RUN_TEST(test_pressure_abandonment_races_fill_without_removing_another_record);
     return UNITY_END();
 }

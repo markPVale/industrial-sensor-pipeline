@@ -7,7 +7,7 @@ enum class LossPolicy : uint8_t {
 };
 enum class JournalEventKind : uint8_t { LOSS, LEASE_ABANDONMENT };
 enum class AbandonmentReason : uint8_t {
-    ACK_BUDGET_EXHAUSTED, PUBLISH_FAILURE_BUDGET_EXHAUSTED
+    BUFFER_PRESSURE_ACK_EXHAUSTED, BUFFER_PRESSURE_PUBLISH_FAILURE
 };
 enum class DeliveryOutcome : uint8_t { NOT_PUBLISHED, UNKNOWN_AFTER_PUBLISH };
 
@@ -20,12 +20,13 @@ struct LossRange {
 };
 
 // Successful-publish count determines the outcome/reason; callers cannot label
-// a published-but-unACKed record as confirmed lost.
+// a published-but-unACKed record as confirmed lost. Production records this only
+// after identity-checked, pressure-gated abandonment succeeds in BufferManager.
 struct LeaseAbandonment {
     RecordIdentity identity{};
     uint32_t publish_calls = 0;
     uint32_t successful_publishes = 0;
-    uint32_t connected_wait_ms = 0;
+    uint32_t connected_wait_ms = 0; // observed readiness diagnostic, not an abandonment budget
 };
 
 struct JournalEvent {

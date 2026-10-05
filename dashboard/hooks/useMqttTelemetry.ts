@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import mqtt, { MqttClient } from "mqtt";
+import { displayedRms, SensorValues } from "./telemetryValues";
 
 // ---------------------------------------------------------------------------
 // Status flag bit positions — must match firmware/include/types.h and
@@ -21,17 +22,10 @@ export const FLAG_ESTOP = FLAG_INTERLOCK_OPEN;
 // ---------------------------------------------------------------------------
 // Types — mirrors TelemetryRecord from firmware + docs/telemetry-schema.md
 // ---------------------------------------------------------------------------
-export interface TelemetryRecord {
+export interface TelemetryRecord extends SensorValues {
   boot:  number;   // boot cycle counter (from NVS)
   seq:   number;   // per-boot sequence counter
   ts:    number;   // epoch ms (edge-side timestamp)
-  ax:    number;   // m/s² Kalman-filtered accel X
-  ay:    number;   // m/s² Kalman-filtered accel Y
-  az:    number;   // m/s² Kalman-filtered accel Z
-  gx:    number;   // rad/s Kalman-filtered gyro X
-  gy:    number;   // rad/s Kalman-filtered gyro Y
-  gz:    number;   // rad/s Kalman-filtered gyro Z
-  wrms?: number | null;  // m/s² rolling RMS; null on fault records (window not computed)
   flags: number;         // bitmask — see FLAG_* constants above
   vibration_rms: number | null;  // wrms when valid; vector magnitude for normal records without wrms; null for fault records
 }
@@ -97,15 +91,9 @@ export function useMqttTelemetry(nodeId: string = "node01"): TelemetryState {
         const raw = data as Omit<TelemetryRecord, "vibration_rms">;
         const faultFlagsMask = FLAG_SENSOR_FAULT | FLAG_DEGRADED_REBOOT_REQUIRED | FLAG_SENSOR_UNAVAILABLE;
         const isFaultRecord  = (raw.flags & faultFlagsMask) !== 0;
-        const vectorMagnitude = Math.sqrt(raw.ax ** 2 + raw.ay ** 2 + raw.az ** 2);
         const record: TelemetryRecord = {
           ...raw,
-          // wrms is null on fault records (window not computed). Fall back to vector
-          // magnitude only for normal records that predate the wrms field. Never use
-          // vector magnitude for fault records — ax encodes WHO_AM_I, not acceleration.
-          vibration_rms: raw.wrms != null ? raw.wrms
-                       : isFaultRecord    ? null
-                       :                   vectorMagnitude,
+          vibration_rms: displayedRms(raw, isFaultRecord),
         };
         setLatest(record);
         setHistory((prev: TelemetryRecord[]) => [...prev.slice(-(HISTORY_LENGTH - 1)), record]);

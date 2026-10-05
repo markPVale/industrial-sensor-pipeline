@@ -1,5 +1,7 @@
 #pragma once
 
+#include "delivery_config.h"
+
 // =============================================================================
 // config.h — Board pin assignments and compile-time constants
 // ESP32-S3 N16R8 Industrial Sensor Node
@@ -65,17 +67,11 @@
 // At 100 Hz and a 10 ms filter budget, 20 slots gives 200 ms of slack.
 #define SENSOR_QUEUE_DEPTH    20
 
-// Interval at which telemetryTask pops and publishes one record (~2 Hz).
-#define TELEMETRY_PUBLISH_MS  500
+// Delivery pacing and retry budgets live in delivery_config.h (also native-tested).
 
 // Rate limit for fault record emission while in fault state.
 // One record per interval — prevents flooding the PSRAM buffer and MQTT.
 #define SENSOR_FAULT_EMIT_INTERVAL_MS   5000
-
-// Sync drain delay. The current app-level ACK path drains one buffered record
-// per cycle; SYNC_BATCH_SIZE is reserved for a future multi-in-flight design.
-#define SYNC_BATCH_SIZE       20
-#define SYNC_BATCH_DELAY_MS   100
 
 // -----------------------------------------------------------------------------
 // WiFi credentials
@@ -106,10 +102,11 @@
 #define MQTT_TOPIC_ESTOP      "sensor/node01/estop"
 #define MQTT_TOPIC_ACK        "sensor/node01/ack"
 #define MQTT_KEEPALIVE_S      15    // PubSubClient keepalive interval in seconds
-#define MQTT_ACK_TIMEOUT_MS   3000  // Retry buffered head if bridge ACK is not received
 
 // Outbound publish queue: MqttMessage items enqueued by tasks and drained by
-// connectionTask. 40 slots × ~400 bytes each ≈ 16 KB.
-#define MQTT_PUBLISH_QUEUE_DEPTH  40
-#define MQTT_PAYLOAD_SIZE         320   // bytes — fits one ArduinoJson telemetry record
+// connectionTask. E-Stop is the only sender: four 385-byte slots = 1540 bytes.
+// Enqueue remains nonblocking; safetyTask logs a full-queue drop. Revisit this
+// capacity if additional non-leased message producers are added.
+#define MQTT_PUBLISH_QUEUE_DEPTH  4
+#define MQTT_PAYLOAD_SIZE         320   // bytes — must hold worst-case buildPayload() output (test_telemetry_payload)
 #define MQTT_CLIENT_BUFFER_SIZE   384   // full MQTT packet: header + topic + payload

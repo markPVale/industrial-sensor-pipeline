@@ -14,7 +14,7 @@ import io
 import sys
 from datetime import datetime, timedelta, timezone
 
-from integrity_check import check_duplicates, dedupe
+from integrity_check import check_duplicates, check_fidelity, dedupe
 
 BASE = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -118,6 +118,15 @@ def test_check_duplicates_fails_if_any_collision_among_retries():
     ok, count = check_duplicates([retry, collision])
     assert ok is False
     assert count == 2
+
+
+def test_fidelity_rejects_missing_nonfinite_and_incomplete_data():
+    good = dict(seq_id=42, flags=0, ax=0.0, ay=0.0, az=9.81,
+                rms=9.81, window_rms=9.81)
+    assert check_fidelity([good])
+    for changes in ({"ax": None}, {"rms": float("nan")},
+                    {"window_rms": float("inf")}, {"data_complete": False}):
+        assert not check_fidelity([dict(good, **changes)])
 
 
 def main():

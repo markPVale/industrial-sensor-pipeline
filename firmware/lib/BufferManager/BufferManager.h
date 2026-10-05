@@ -16,6 +16,8 @@ enum class PushResult : uint8_t {
     OK, EVICTED_OLDEST, EVICTED_PROTECTED, REJECTED_NEWEST, NOT_INITIALISED
 };
 
+enum class AbandonResult : uint8_t { ABANDONED, NOT_FULL, INVALID_PIN };
+
 struct PushOutcome {
     PushResult result;
     bool record_lost;
@@ -27,9 +29,8 @@ struct PushOutcome {
 // (no concurrent users). Call end() before destroying this non-copyable owner.
 //
 // Two producers on core 1: filterTask and sensorTask. connectionTask on core 0
-// is the sole pop caller; its future lease controller will own acquire/commit/
-// abandon. Until it lands, main still uses legacy peek/pop and never acquires
-// a pin: see docs/delivery-lease-design.md §1.1 for the peek/push/pop race.
+// exclusively owns acquire/commit/abandon through DeliveryLease. Firmware does
+// not use legacy peek/pop for delivery; design §1.1 documents the former race.
 //
 // One identity-based pin protects the oldest record until commit or counted
 // abandonment. At capacity, push relocates it and evicts the second-oldest in
@@ -57,11 +58,16 @@ public:
     // Acquire and copy oldest in one lock. Empty/uninitialised/already pinned
     // returns false without changing the output or existing pin.
     bool acquirePin(TelemetryRecord& out);
+    // Read-only recovery check: pin and oldest identity must both match under
+    // the mutex. Never creates/releases a pin or changes counters.
+    bool validatePinnedHead(uint32_t boot_id, uint32_t seq);
     // Validate both pin identity AND current oldest identity before removing.
     // Failure changes nothing. Commit does not count as a drop/abandonment.
     bool commitPinnedHead(uint32_t boot_id, uint32_t seq);
-    bool abandonPinnedHead(uint32_t boot_id, uint32_t seq,
-                           RecordIdentity& abandoned);
+    // Pressure check and removal are atomic. NOT_FULL is a normal deferral;
+    // INVALID_PIN is an invariant failure. Neither changes state or output.
+    AbandonResult abandonPinnedHeadIfFull(uint32_t boot_id, uint32_t seq,
+                                         RecordIdentity& abandoned);
 
     size_t available();
     size_t freeSpace();

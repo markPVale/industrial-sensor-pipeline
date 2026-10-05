@@ -79,11 +79,11 @@ bool LossJournal::observeAbandonment(const LeaseAbandonment& abandonment) {
     event.kind = JournalEventKind::LEASE_ABANDONMENT;
     event.abandonment = abandonment;
     if (abandonment.successful_publishes) {
-        event.reason = AbandonmentReason::ACK_BUDGET_EXHAUSTED;
+        event.reason = AbandonmentReason::BUFFER_PRESSURE_ACK_EXHAUSTED;
         event.delivery_outcome = DeliveryOutcome::UNKNOWN_AFTER_PUBLISH;
         ++_stats.lease_abandoned_after_publish;
     } else {
-        event.reason = AbandonmentReason::PUBLISH_FAILURE_BUDGET_EXHAUSTED;
+        event.reason = AbandonmentReason::BUFFER_PRESSURE_PUBLISH_FAILURE;
         event.delivery_outcome = DeliveryOutcome::NOT_PUBLISHED;
         ++_stats.lease_abandoned_unpublished;
     }

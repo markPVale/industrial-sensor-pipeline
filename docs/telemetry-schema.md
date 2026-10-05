@@ -1,4 +1,4 @@
-# Telemetry Payload Schema — v1
+# Telemetry Payload Schema — v1.1
 
 This document is the **single source of truth** for the telemetry data contract.
 The firmware, mock script, MQTT bridge, MCP server, and dashboard must all agree
@@ -30,6 +30,13 @@ before the change is merged.
 | `flags` | uint8 | — | Firmware | Status bitmask. See flag definitions below. |
 
 ### Example
+
+All seven floating-point fields (`ax`–`gz`, `wrms`) are **number or null** on
+the wire. Nonfinite firmware values become JSON `null`, never `nan`/`inf` or
+zero. Normal finite values retain four decimal places; extreme finite values
+use scientific notation with nine significant digits. Serialization failure or
+truncation prevents publishing and follows the lease's local-failure retry path.
+The PSRAM record layout is unchanged.
 
 ```json
 {
@@ -112,6 +119,13 @@ arrives. If the ACK does not arrive before `MQTT_ACK_TIMEOUT_MS`, the firmware
 retries the same buffer head. E-Stop event messages are not part of the telemetry
 buffer and are not ACKed by this path.
 
+Exception: a resolved, exhausted lease may be explicitly abandoned under full
+buffer pressure (see `delivery-lease-design.md`). An ACK confirms successful
+synchronous persistence, **not measurement validity**. A record with unavailable
+measurements may be ACKed only after its identity and invalid-data evidence have
+been persisted. Parse, identity-validation, and database errors receive no ACK.
+There is no permanent-rejection reply protocol yet (TODO; see `roadmap.md`).
+
 ---
 
 ## InfluxDB Schema
@@ -134,9 +148,29 @@ buffer and are not ACKed by this path.
 | `sequence_id` | payload `seq` | renamed for clarity |
 | `vibration_rms` | **derived** | `sqrt(ax² + ay² + az²)` in m/s², computed by bridge |
 | `window_rms` | payload `wrms` | firmware rolling RMS in m/s², anomaly metric |
+| `data_complete` | bridge | Boolean: all seven measurements are finite and present |
+| `unavailable_fields` | bridge | Comma-separated missing/null/nonfinite field names; omitted when complete |
+| `reason` | bridge | `invalid_telemetry` when all seven measurements are unavailable |
 
 `window_rms` is the operational anomaly signal. `vibration_rms` is retained as a
 derived accel vector magnitude for compatibility with older dashboards and data.
+
+Unavailable numeric fields are **omitted**, not filled with zeros. The bridge
+derives `vibration_rms` only with three valid accel axes and a finite result.
+Explicit `wrms: null` omits `window_rms`; only legacy payloads lacking the `wrms`
+key use the vector-magnitude fallback (and are marked incomplete).
+Even all-invalid routine records remain in `vibration`, with identity, timestamp,
+original flags, `data_complete=false`, `unavailable_fields`, and `reason`, but no
+fabricated sensor values. This preserves deterministic routing and sequence
+accounting. The integrity checker must still fail measurement fidelity for them.
+
+Deploy the bridge before firmware emitting nullable axes. The live dashboard
+preserves missing values and shows DATA UNAVAILABLE rather than NORMAL for
+incomplete routine records. MCP keeps partial/all-invalid points visible and
+returns nullable measurements plus data-quality metadata; fresh invalid data
+is not reported as healthy. It never substitutes vector magnitude for absent
+window RMS. Full-window coverage analysis remains pending: anomaly queries
+return `coverage_status: "not_assessed"`, not proof of healthy coverage.
 
 ### Fault records (`sensor_faults` measurement)
 
@@ -150,6 +184,9 @@ Records with fault flags (`0x10 | 0x20 | 0x40`) are routed here instead of `vibr
 | `whoami_raw` | payload `ax` | WHO_AM_I register byte encoded by firmware (0xFF = bus not responding) |
 | `reason` | bridge | always `"i2c_dropout"` |
 
+When fault-record `ax` is unavailable, omit `whoami_raw` and store
+`unavailable_fields="ax"`; never invent a WHO_AM_I response.
+
 ### Record time
 
 Set from `payload["ts"]` with `WritePrecision.MS`. Falls back to broker-arrival
@@ -161,11 +198,11 @@ time if `ts` is absent.
 
 | Layer | File | Must implement |
 |-------|------|----------------|
-| Firmware | `firmware/src/main.cpp` — `buildPayload()` | Emit all fields per this spec |
+| Firmware | `firmware/lib/TelemetryPayload/TelemetryPayload.h` — `buildPayload()` | Emit all fields per this spec; reject truncation |
 | Mock | `gateway/bridge/mock_esp32.py` | Match firmware payload shape exactly |
 | Bridge | `gateway/bridge/mqtt_to_influx.py` | Parse all fields; compute `vibration_rms`; store `window_rms` |
 | MCP server | `mcp-server/src/index.ts` | Use correct flag bit masks; report units as m/s² |
-| Dashboard hook | `dashboard/hooks/useMqttTelemetry.ts` | Match type shape; display firmware `wrms` with vector fallback |
+| Dashboard hook | `dashboard/hooks/useMqttTelemetry.ts` | Nullable axes; vector fallback only when legacy `wrms` is absent |
 
 ---
 

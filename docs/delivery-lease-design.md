@@ -1,22 +1,26 @@
 # Delivery Lease — Design
 
 Status: **implementation in progress** — transport checks, the legacy regression
-harness, BufferManager pin operations, and the RAM LossJournal with producer
-forwarding are implemented. The delivery controller and diagnostic publishing
-are pending; the live ACK path still uses legacy peek/pop.
-Last updated: 2026-09-29 (LossJournal implementation and limits).
+harness, BufferManager pin operations, RAM LossJournal, and the single-owner
+delivery controller are implemented. Diagnostic publishing and hardware
+validation remain pending. Native delivery tests now include a passing R0/R1
+regression against the production-used controller.
+Last updated: 2026-10-05 (latched ownership failures and read-only pin revalidation).
 Design revision: 2026-09-10 (rev 7 — atomicity scope, lost-event degradation;
 rev 6 — failure-mode summary; rev 5 — abandonment outcome reconciliation,
 connected-time liveness bound, diagnostic terminology)
 
 Supersedes the informal in-flight tracking described in
 `docs/store-and-forward-status.md` under "App-Level ACK Implemented". That
-section describes current behaviour and remains accurate until this design
-lands.
+section describes historical behaviour; its historical test is not evidence
+of hardware validation of the new controller.
 
 ---
 
 ## 1. Problem
+
+This section records the pre-lease implementation and its motivating failures;
+line numbers and split-state globals below refer to that historical code.
 
 ### 1.0 Failure mode
 
@@ -149,8 +153,7 @@ pin would additionally block delivery of every retained record behind it.
 |---|---|---|
 | `BufferManager` | Ring layout, pinned identity, pinned-record relocation, overflow and pressure counters — all under its mutex | Release a pin autonomously |
 | `filterTask`, `sensorTask` | Call `push()` and forward any returned loss identity to `LossJournal`. May relocate the pinned record and increment pressure counters as a side effect of overflow | Acquire, commit, abandon, or release a pin |
-| `connectionTask` | **Sole** caller of acquire / commit / abandon. Owns phase, `ever_published`, publish counters, and timers; owns generation only in the future deferred design | — |
-| `telemetryTask`, `syncTask` | Signal that delivery is due (cadence only) | Create or mutate a lease; call `peek()` |
+| `connectionTask` | **Sole** caller of acquire / commit / abandon. Owns phase, publish counters, timers and pacing; derives `ever_published` from successful publish count; owns generation only in the future deferred design | — |
 | `safetyTask`, other publishers | Enqueue non-leased messages (E-Stop) onto `g_publishQueue` | Affect telemetry delivery state |
 | `LossJournal` | Thread-safe compression and bounded RAM retention of exact loss identities/ranges | Mutate the telemetry ring or lease |
 
@@ -161,12 +164,10 @@ pin reintroduces a cross-core check-then-act race with the publish path.
 
 ### 3.1 Required task-architecture change
 
-Today `telemetryTask` (`main.cpp:913`) and `syncTask` (`main.cpp:964`) call
-`peek()`, build the payload, and establish the in-flight condition. Under this
-design they must not. They reduce to cadence: set a "delivery due" signal at
-`TELEMETRY_PUBLISH_MS` in `NORMAL` and `SYNC_BATCH_DELAY_MS` in `SYNCING`.
-`connectionTask` acquires the pinned head, builds, publishes, and processes the
-ACK.
+Previously `telemetryTask` and `syncTask` called `peek()`, built the payload,
+and established the in-flight condition. They were first reduced to cadence
+signals, then removed after the pacing regression was reproduced. connectionTask
+now owns scheduling as well as pin acquisition, payload building, publish and ACK.
 
 Consequence worth noting: with acquire → build → publish inside one
 `connectionTask` iteration, telemetry no longer transits `g_publishQueue`, so
@@ -175,30 +176,112 @@ being load-bearing for telemetry. `QUEUED` and generation are specified for a
 future deferred path in §4.2 but are not implemented in the initial landing
 (see D3). `g_publishQueue` remains for non-leased messages such as E-Stop.
 
-`syncTask`'s drain-complete check moves to `connectionTask`, which can evaluate
+The former `syncTask` drain-complete check lives in `connectionTask`, which evaluates
 `isEmpty()` immediately after each commit rather than on a 100 ms poll.
+
+**Implemented integration:** `connectionTask` uses host-testable `DeliveryRuntime`,
+which owns `DeliveryLease` and coordinates connection readiness and pacing.
+NORMAL follows record production (~2 Hz), not a second 500 ms timer. In either
+mode new-record publish starts are at least `DELIVERY_MIN_PUBLISH_INTERVAL_MS`
+(100 ms) apart. Publishing cost counts toward this interval, not as an additional
+cooldown. Thus a healthy 2 Hz stream has scheduling headroom; backlog can drain
+at up to 10 Hz subject to ACK latency and task service. Mode is an indication of
+live/backlogged delivery, not a separate source of timing state.
+After commit or abandonment an eligible new-record send may proceed in the same
+iteration. There are no stored cadence credits or accumulated ticks, so a long
+task-service gap cannot cause a burst of missed sends. Retries retain the separate
+lease timeout/backoff policy. The 10 ms task delay and blocking I/O can still
+reduce actual throughput; this is not a hard real-time rate guarantee.
+
+Current transport state is reconciled each loop, not dependent on a one-time
+connect event. A successful local subscription request moves BUFFERING to
+SYNCING. NORMAL also moves to SYNCING when more than one record is retained
+(including the active pin), so a timeout backlog can actually catch up while
+production continues. SYNCING returns to NORMAL only when empty and lease-idle.
+ACK callbacks stage one identity,
+then the connection task processes it before timers or another publish.
+PubSubClient 2.8 dispatches at most one message per `loop()`; the mailbox is
+consumed before the next call, on the same task. Revisit that assumption if the
+MQTT library changes. No firmware delivery caller uses legacy `peek()`/`pop()`.
+ACK staging uses a plain pending flag, not an event group; the ISR-driven safety
+event group is unchanged. No other task reads a mirrored delivery-mode variable.
+
+Connection edges are accounted before blocking reconnect work and inside the
+MQTT connection callbacks. On disconnect, an awaiting lease becomes retry-pending
+immediately; its interrupted ACK wait cannot authorize abandonment. Retry pacing
+survives reconnect. Before the slow threshold, timeout retries normally follow
+3000 ms ACK waits; local failures add exponential backoff. After the threshold,
+probes use a 30-second cooldown regardless of local publish success. The
+ACK timer starts when the synchronous publish returns, not when it begins.
+Connected time is based on **observed** link state AND a successfully written
+ACK subscription request, not proof of bridge health. Subscription failure is
+retried at 1/2/4/8/16/30-second delays (capped at 30 seconds); while unresolved,
+publishes and abandonment are paused and the pin is retained.
+An already eligible ACK is still processed while readiness is false. A new
+session or observed transport loss invalidates local subscription readiness.
+Blocking subscription setup is excluded from the readiness-time diagnostic, just like reconnect.
+
+PubSubClient 2.8 `subscribe()` returns whether it wrote the SUBSCRIBE packet;
+it does not expose broker SUBACK acceptance. Thus `subscriptionSent` means only
+that the request was sent. ACL denial, lost SUBACK, or a dead bridge can still
+produce missing ACKs. With free buffer space the lease keeps slow-retrying; only
+full-buffer pressure can authorize abandonment (§6). Proving broker/bridge readiness is
+outside this landing; no stronger subscription guarantee is claimed.
+
+Serial summaries, limited to once per five seconds of loop service, expose
+active identity/phase, observed readiness time (not an abandonment budget),
+buffer count, subscription attempts/failures, publish failures/retries/timeouts,
+commits/abandonments, stale/mismatched ACKs, and internal errors. A repeated
+failed commit/abandon retains the pin and increments the error counter; it does
+not print every 10 ms or silently clear state. Persistent invariant corruption
+still requires diagnosis/recovery; no automatic unpin or reboot is introduced.
+Blocking network work can delay a summary; this is a rate limit, not a reporting
+deadline. These serial summaries are not the future MQTT diagnostic publisher.
+Mode-entry bits preserve brief transitions until consumed after runtime service.
+Each visited destination is logged once per connection-task iteration, along with
+any subscription request result. Logging happens outside MQTT callbacks; its
+timestamp is observation/report time, not the precise underlying link edge.
+Repeated visits to the same destination before consumption coalesce by design.
+
+`firmware/include/delivery_config.h` is the single production source for pacing,
+retry thresholds, subscription backoff, and reporting intervals. `config.h` includes
+it; native tests and the runtime use it too. Boundary tests may inject LeaseConfig.
+
+The retry countdown is updated with unsigned elapsed time, including during
+outages; there is no duplicate absolute next-attempt timestamp. The owner must
+be serviced at least once per millis wrap. The
+readiness-time accumulator saturates rather than wrapping and never authorizes
+abandonment. All successful attempts receive a full ACK window; after a resolved
+attempt, abandonment additionally requires full-buffer pressure and no fresh
+session attempt owed (§6). With free space, probes continue without a call cap.
+Non-telemetry queue work is capped at one queue-depth per iteration. Its only
+sender is E-Stop, so the queue has four slots rather than 40; a full enqueue
+remains nonblocking and logs a drop. Additional senders require reassessment.
 
 ---
 
 ## 4. Lease state machine
 
 Initial-landing lease fields: `identity {boot_id, sequence_id}`,
-`ever_published`, `publish_calls`, `successful_publishes`,
-`connected_wait_ms`, `sent_at_ms`, and `next_attempt_at_ms`. `generation`
+`publish_calls`, `successful_publishes`, `connected_wait_ms`, and `sent_at_ms`.
+The private retry countdown controls pacing; fresh-attempt and resolved-attempt
+bits protect session recovery and the ACK window. `generation`
 belongs only to the deferred publishing contract in §4.2 and is not present in
 the initial implementation.
 
 `publish_calls` counts every `publish()` invocation, successful or not;
 `successful_publishes` counts only those returning true. Both are needed: a
-budget keyed on successes alone cannot terminate a lease that never publishes
-(§6).
+pressure-abandonment threshold keyed on successes alone cannot move past a record
+whose local publish always fails (§6). Both counters saturate rather than wrap.
 
-`ever_published` is independent of phase and is the sole ACK-eligibility
+Throughout this design, `ever_published` denotes the derived predicate
+`successful_publishes > 0`, exposed as `everPublished()`, not a stored boolean.
+It is independent of phase and is the publish-history ACK-eligibility
 predicate. Gating on phase is wrong: `RETRY_PENDING` is reachable from a publish
 failure, where the record was never transmitted and a matching ACK could only be
-stale or erroneous. (In the current code it is also reachable from an enqueue
-failure at `main.cpp:202`; §3.1 removes telemetry from `g_publishQueue`, so that
-path disappears.)
+stale or erroneous. The legacy enqueue-failure path no longer exists because
+telemetry does not transit `g_publishQueue`. References to setting this predicate
+in the transition table mean updating the successful-publish counter.
 
 ### 4.1 Initial inline-publishing state machine
 
@@ -227,23 +310,39 @@ the window.
 | 6 | `RETRY_PENDING` | `AWAITING_ACK` | retry due, connected, `publish()` returns true | connectionTask | same pin; `publish_calls++`, `successful_publishes++`, `ever_published = true`, ACK timer set |
 | 7 | `RETRY_PENDING` | `RETRY_PENDING` | retry due, connected, `publish()` returns false | connectionTask | same pin; `publish_calls++`; `ever_published` unchanged; next backoff set |
 | 8 | `RETRY_PENDING` | `IDLE` | ACK matches pinned identity and `ever_published` | connectionTask | `commitPinnedHead()`; avoids a duplicate write |
-| 9 | `RETRY_PENDING` | `IDLE` | connected-time/publish-call budget exhausted | connectionTask | `abandonPinnedHead()`; record an abandonment outcome, not an asserted delivery loss |
+| 9 | `RETRY_PENDING` | `IDLE` | attempt threshold reached, latest attempt resolved, no fresh session attempt owed, buffer full (§6) | connectionTask | `abandonPinnedHeadIfFull()`; record an abandonment outcome, not an asserted delivery loss |
 
 `connected_wait_ms` accrues from acquisition through commit or abandonment, but
-only during intervals in which MQTT is connected. It accrues in both active
-lease phases, including while a retry backoff is pending.
+only during intervals in which MQTT is connected and the ACK subscription
+request has been sent successfully. It accrues in both active
+lease phases, including while a retry backoff is pending. It is diagnostic only:
+no amount of observed readiness time can authorize abandonment.
 
 Every commit or abandonment arrow is conditional on the corresponding
-`BufferManager` operation returning true. An identity-validation failure inside
-`commitPinnedHead()` or `abandonPinnedHead()` increments
+`BufferManager` operation succeeding (`true` for commit, `ABANDONED` for release).
+A `NOT_FULL` result leaves the lease active without an error. An identity-validation failure inside
+`commitPinnedHead()` or `abandonPinnedHeadIfFull()` increments
 `lease_internal_errors` and leaves the lease phase, pin, and retry state
 unchanged. Clearing controller state after a failed buffer mutation would
 recreate the split-state failure this design is meant to remove.
 
+An ownership failure also latches `ownershipFault`, exposed in the serial
+summary. No publish or abandonment is permitted while this latch remains set,
+including on iterations that skip pressure checking and across reconnects.
+At the pressure-check cadence, `validatePinnedHead(boot, seq)` checks both the
+pin and current oldest identity under the buffer mutex without changing state.
+Only successful validation clears the latch and allows normal service to resume;
+it never reacquires a different pin or resets attempts/backoff. An eligible ACK
+still runs first: a successful identity-checked commit clears the lease and latch,
+including while disconnected. A failed commit keeps the latch set. This is safe
+without holding the lock during publish because only connectionTask can release
+the pin; producer relocation preserves its identity. Persistent corruption
+stays blocked and requires diagnosis, not an automatic unpin or reboot.
+
 When multiple events are ready in one `connectionTask` iteration, process
 connection-state accounting first, then ACKs, then timeout/abandonment, then a
 due publish attempt. A matching ACK therefore wins over a timeout or abandonment
-budget that matured in the same iteration. Disconnect may first move
+pressure/attempt condition that matured in the same iteration. Disconnect may first move
 `AWAITING_ACK` to `RETRY_PENDING`, but the same-iteration ACK remains eligible
 through `ever_published` and can still commit the record.
 
@@ -275,7 +374,7 @@ Non-transitions that must be explicit in code:
 | Event | Effect |
 |---|---|
 | ACK arrives with no active lease | `ack_stale++`. No state change. |
-| Active lease exists but ACK identity does not match it | `ack_mismatch++`, regardless of `ever_published`. Changes **no** buffer, lease, queue, or retry state. This is the current regression: `main.cpp:521-525` clears the flag. |
+| Active lease exists but ACK identity does not match it | `ack_mismatch++`, regardless of `ever_published`. Changes **no** buffer, lease, queue, or retry state. The legacy regression cleared the flag in this branch. |
 | ACK identity matches the active lease but `ever_published == false` | `ack_stale++`. No state change. |
 | `push()` overflows against a pinned head | Relocate pinned record, evict second-oldest, `protected_evictions++`. Pin **not** released. |
 
@@ -283,9 +382,10 @@ Non-transitions that must be explicit in code:
 
 ## 5. BufferManager API
 
-**Implementation status:** the API below, pin-aware overflow, and buffer counters
-landed in `09e486c`. `main.cpp` forwards push outcomes to LossJournal but does not
-acquire pins yet. `pop()` refuses a pinned
+**Implementation status:** the initial pin API, pin-aware overflow, and buffer counters
+landed in `09e486c`; the pressure-policy revision replaces unconditional abandonment
+with the atomic full-buffer check below. `main.cpp` forwards push outcomes to LossJournal and uses
+DeliveryLease for pin acquisition, commit, and abandonment. `pop()` refuses a pinned
 record; `clear()` and `end()` also refuse an active pin. `begin()` / `end()`
 require exclusive lifecycle access, with no concurrent buffer users.
 
@@ -305,9 +405,11 @@ struct PushOutcome {
 
 PushOutcome push(const TelemetryRecord& rec);
 bool acquirePin(TelemetryRecord& out);                         // pin + record copy, one lock
+bool validatePinnedHead(uint32_t boot_id, uint32_t seq);       // read-only recovery check
 bool commitPinnedHead(uint32_t boot_id, uint32_t seq);         // validate + pop, one lock
-bool abandonPinnedHead(uint32_t boot_id, uint32_t seq,
-                       RecordIdentity& abandoned);             // validate + drop + count
+enum class AbandonResult : uint8_t { ABANDONED, NOT_FULL, INVALID_PIN };
+AbandonResult abandonPinnedHeadIfFull(uint32_t boot_id, uint32_t seq,
+                                     RecordIdentity& abandoned); // validate + full check + drop + count
 ```
 
 Extend the existing atomic `BufferStats` snapshot with cumulative
@@ -321,12 +423,13 @@ The buffer's cumulative `abandoned` value maps to diagnostic
 `observeAbandonment()`, which increments exactly one journal subtype counter,
 `lease_abandoned_unpublished` or `lease_abandoned_after_publish`.
 
-`abandonPinnedHead()` replaces an earlier `releasePin(bool dropRecord)`. A
+`abandonPinnedHeadIfFull()` replaces an earlier `releasePin(bool dropRecord)`. A
 boolean parameter makes it too easy to unpin a transmitted record without
 committing or counting its loss; a named operation encodes the intent and lets
 the implementation guarantee that abandonment always counts. It validates the
-requested identity under the buffer mutex and returns the identity it actually
-removed. It does **not** emit MQTT or mutate the diagnostic journal:
+requested identity AND fullness under the buffer mutex and returns the identity
+it actually removed. NOT_FULL and INVALID_PIN change neither output nor state.
+It does **not** emit MQTT or mutate the diagnostic journal:
 `BufferManager` has neither the lease timers nor ownership of the network path.
 `connectionTask` records the returned identity and its lease metadata as a
 delivery-outcome event in `LossJournal`, then publishes the event later. A
@@ -382,8 +485,9 @@ Both producers forward the exact `PushOutcome` after the buffer lock is
 released; the journal never acquires a buffer lock or calls MQTT. Reordering
 between producer observations can split ranges but never fills sequence gaps.
 The abandonment API derives reason/outcome from successful publish count and
-closes any open range first. It is tested but has no firmware caller until the
-delivery controller lands. It does not release a buffer pin or enforce budgets.
+closes any open range first. DeliveryLease records this event only after the
+buffer successfully abandons the matching pin. The journal itself does not
+release a buffer pin or enforce budgets.
 
 `pop()` transfers an event to the sole consumer; the future publisher must retain
 that local event if sending fails. No firmware code drains the journal yet, so
@@ -429,73 +533,104 @@ generality the algorithm lacks is worse than one that does not.
 
 ---
 
-## 6. Abandonment policy
+## 6. Pressure-gated abandonment and continuing retries
 
-Budget accrues **only while MQTT is connected**. Disconnected wall-clock must
-not consume an ACK retry budget, since ACK receipt is impossible then.
+**Free buffer space means retain and retry, not abandon.** Broker connectivity
+and a successfully written subscription request do not prove the bridge is
+running or the return ACK path works. Even observed link state can be stale.
+The previous five-call/15-second connected-time rule could discard about 40
+records during a ten-minute bridge outage with almost the entire buffer free.
+That rule is removed. `connected_wait_ms` remains diagnostic only.
 
-Abandon when:
+Abandonment requires all of the following:
 
-```
-publish_calls >= ABANDON_MAX_PUBLISH_CALLS
-  && connected_wait_ms >= ABANDON_MIN_CONNECTED_MS
-```
+- The transport is currently observed up and the subscription request was sent.
+  This gates local work; it does **not** establish downstream health.
+- At least `DELIVERY_RAPID_ATTEMPTS` attempts have been made for this identity.
+- The latest attempt has resolved: local publish failure, or its full ACK window
+  elapsed without an eligible ACK. An interrupted ACK wait is not resolved.
+- No fresh attempt is owed to a newly established MQTT session.
+- The buffer is **full**, verified together with pin identity and removal under
+  the BufferManager mutex. An earlier occupancy snapshot is not authority.
 
-`protected_evictions` remains an operational pressure counter but is not an
-abandonment trigger. With the proposed defaults, connected-time abandonment
-matures around 15 seconds while 1000 protected evictions require about 500
-seconds at 2 Hz, so the pressure term cannot win while connected. While
-disconnected, no drain is possible and the pin costs only one buffer slot;
-discarding it under pressure would give up the retry guarantee without
-unblocking delivery. Connected and ACK-capable time directly measures the
-head-of-line blocking the policy needs to bound.
+Process staged ACKs first. `NOT_FULL` is a normal deferral that changes neither
+the pin nor the counters. `INVALID_PIN` fails closed and increments the internal
+error counter. Only `ABANDONED` authorizes clearing the lease and recording its
+identity/outcome. Producers still cannot release pins.
 
-Failed publishes must be **paced**. `publish() == false` moves straight to
-`RETRY_PENDING`, and without a retry-time guard the next delivery signal would
-retry it 100 ms later in `SYNCING`. With the cap reached at call 5 (500 ms) but
-the time condition not maturing until 15 s, the firmware would make **150
-failed `publish()` calls** in that window. The constants below were sized for
-the success path, where
-pacing comes from the 3 s ACK timeout; the failure path has no such pacing.
+Once an exhausted attempt resolves, check pressure immediately on its next
+eligible service iteration, then at most once per `DELIVERY_PRESSURE_CHECK_MS`
+(1000 ms) until another attempt. This also bounds repeated invalid-pin checks.
+The fullness test and release remain one atomic BufferManager operation; no
+cached occupancy authorizes abandonment. New pressure can therefore wait up to
+one interval plus task-service delay while producers retain normal eviction
+behavior. ACK processing is never throttled. Countdown arithmetic handles
+millis rollover and elapsed disconnect time.
 
-Add `next_attempt_at_ms` to the lease. A failed publish schedules the next
-attempt at an exponential backoff starting at `ABANDON_RETRY_BACKOFF_MS`
-(1000 ms) and doubling. The retry transitions in rows 6-7 fire only when
-`millis() >= next_attempt_at_ms`.
-Once `publish_calls >= ABANDON_MAX_PUBLISH_CALLS`, **no further `publish()`
-calls are made** while the connected-time condition matures.
+### Retry pacing and recovery without reconnect
 
-With a 1000 ms doubling backoff, calls land at 0, 1, 3, 7, and 15 s — so call 5
-coincides with `ABANDON_MIN_CONNECTED_MS`, both conditions mature together, and
-the rationale in the table below becomes true for the failure path as well as
-the success path. Backoff persists across reconnects within a lease: a
-deterministic cause such as an oversized payload is not repaired by reconnecting.
+Five attempts is now a threshold for **slow probing**, not a terminal cap.
+Initial successful attempts get the full 3000 ms ACK window; initial local
+failures back off at 1000/2000/4000/8000 ms. Starting with completion of the fifth
+attempt, every further probe is paced by `DELIVERY_SLOW_RETRY_MS` (30000 ms).
+If no pressure exists, retry the same immutable record indefinitely at that
+bounded rate. A bridge restart can therefore resume delivery without an MQTT
+reconnect. Counters are not reset to manufacture more attempts; per-lease
+32-bit attempt counters saturate, and lifetime counters remain cumulative.
 
-The budget keys on `publish_calls`, **not** on successful publishes. A budget
-counting only successes cannot terminate a lease whose `publish()` fails
-deterministically — payload over the transport ceiling (§1.4), an oversized
-topic, or a persistent client-state fault. Without the publish-call budget,
-successes would stay at zero forever, pinning the buffer permanently and
-stalling delivery with no diagnostic.
-`successful_publishes` is retained to attribute the abandonment reason.
+The retry countdown runs in parallel with the ACK timer and continues through
+observed disconnects. Before the slow threshold, a successful publish establishes
+a minimum `DELIVERY_RETRY_BACKOFF_MS` cooldown for reconnect churn; ordinarily
+the longer ACK window controls timeout retries. Local-failure backoff is capped
+at the slow interval. Service uses unsigned elapsed-time subtraction through
+millis rollover; do not compare an absolute deadline with `millis() >= deadline`.
 
-Proposed starting values, to be tuned on hardware:
+### A fresh chance on each new MQTT session
 
-| Constant | Value | Rationale |
+Only the genuine MQTT `onConnect` path calls `onNewSession()`. If a lease exists,
+it owes one fresh attempt, even if its rapid-attempt threshold was exhausted.
+The obligation is a bit, not banked credits: repeated callbacks/sessions cannot
+accumulate attempts, reset counts, clear backoff or make a publish immediate.
+
+Once local subscription setup and preserved pacing permit it, publish the same
+pinned identity. A successful fresh publish gets its complete ACK window before
+abandonment can occur. A local failure resolves immediately; under full-buffer
+pressure it can authorize abandonment on the next iteration. An eligible late
+ACK may commit before the fresh attempt, avoiding an unnecessary duplicate.
+
+When a link drops during an ACK wait, that attempt no longer authorizes
+abandonment; retry pacing is preserved, including when MQTT survives a Wi-Fi
+interruption. No autonomous release occurs while readiness is false.
+
+### Deliberate limits
+
+This prioritizes retention over progressing past a possibly poisonous record
+while storage remains available. At capacity, loss is unavoidable under sustained
+production: producers continue second-oldest eviction (or newest rejection at
+capacity one) while the pin is held. Pressure-gated abandonment then allows the
+drain to move on after fair attempts. It does not claim the abandoned record was
+undeliverable or that the downstream service was healthy.
+
+Reconnect churn can postpone abandonment indefinitely if every fresh ACK window
+is interrupted. Fair retry opportunities and bounded progress cannot both be
+guaranteed under that condition. Pacing prevents a retry storm; cumulative
+counters preserve evidence. Duplicates remain possible.
+
+Defaults, still requiring hardware validation:
+
+| Constant | Value | Meaning |
 |---|---|---|
-| `ABANDON_MAX_PUBLISH_CALLS` | 5 | Success path: 5 × `MQTT_ACK_TIMEOUT_MS` (3000) = 15 s. Failure path: 5 backoff steps = 15 s |
-| `ABANDON_RETRY_BACKOFF_MS` | 1000 | Doubling; paces failed publishes so both conditions mature together |
-| `ABANDON_MIN_CONNECTED_MS` | 15000 | Both conditions required, so a fast retry storm cannot abandon early |
+| `DELIVERY_RAPID_ATTEMPTS` | 5 | Slow-probe threshold and minimum attempts before pressure abandonment |
+| `DELIVERY_RETRY_BACKOFF_MS` | 1000 | Initial local-failure backoff and minimum reconnect retry cooldown |
+| `DELIVERY_SLOW_RETRY_MS` | 30000 | Post-threshold completion-to-next-attempt cooldown |
+| `MQTT_ACK_TIMEOUT_MS` | 3000 | Full ACK window after every successful publish |
+| `DELIVERY_PRESSURE_CHECK_MS` | 1000 | Minimum spacing between repeated pressure checks after an attempt resolves |
 
-Reason codes: `ack_budget_exhausted` (`successful_publishes > 0`),
-and `publish_failure_budget_exhausted` (`successful_publishes == 0`). The former
-means delivery is unknown, not failed: one or more MQTT publishes were accepted,
-but no matching application ACK arrived. The latter is a confirmed local loss
-under the client contract because no publish attempt was accepted.
-
-Because the pin is held across disconnect, a record published-but-unACKed just
-before an outage becomes the head of the post-reconnect drain. The budget
-therefore bounds recovery time from every outage, not only pathological ones.
+Reason codes are `buffer_pressure_ack_exhausted` when any attempt succeeded
+(delivery unknown), and `buffer_pressure_publish_failure` when none succeeded
+(not published under the local-client contract). Both indicate an actual
+full-buffer release, not a connected-time expiry. The journal determines the
+outcome from successful publish count, never from an assumed downstream failure.
 
 ---
 
@@ -508,7 +643,8 @@ telemetry, and must not consume a `sequence_id` or perturb the sequence it
 describes.
 
 Lease abandonment is not itself proof of delivery loss. It means the firmware
-stopped retaining and retrying a record after its bounded budget expired. If
+stopped retaining and retrying a record under full-buffer pressure after the
+attempt threshold and fresh-session rules were satisfied. If
 `successful_publishes > 0`, the record may already be in InfluxDB and the
 missing ACK may be the only failure. The confirmed local loss policies
 `evicted_oldest`, `evicted_protected`, `rejected_newest`, and
@@ -572,7 +708,7 @@ Lease-abandonment outcome event:
   "kind": "lease_abandonment",
   "abandoned_boot": 4,
   "abandoned_seq": 4821,
-  "reason": "ack_budget_exhausted",
+  "reason": "buffer_pressure_ack_exhausted",
   "delivery_outcome": "unknown_after_publish",
   "ever_published": true,
   "publish_calls": 5,
@@ -581,8 +717,8 @@ Lease-abandonment outcome event:
 }
 ```
 
-For `publish_failure_budget_exhausted`, emit `ever_published: false` and
-`delivery_outcome: "not_published"`. For `ack_budget_exhausted`, always emit
+For `buffer_pressure_publish_failure`, emit `ever_published: false` and
+`delivery_outcome: "not_published"`. For `buffer_pressure_ack_exhausted`, always emit
 `delivery_outcome: "unknown_after_publish"`; never label it `lost` merely
 because the firmware stopped retrying.
 
@@ -616,7 +752,7 @@ identity. Both are needed: a bare counter cannot say *which* gap is explained,
 and a best-effort event can itself be lost during the outage that caused it.
 `lease_abandoned_after_publish` is an outcome counter, not a confirmed-loss
 counter, and must never be subtracted from an unrelated gap by magnitude. The
-exact record identity comes from `PushOutcome` or `abandonPinnedHead()`, is
+exact record identity comes from `PushOutcome` or `abandonPinnedHeadIfFull()`, is
 recorded by `LossJournal`, and is never reconstructed from buffer state after
 mutation.
 
@@ -694,13 +830,12 @@ decision rather than as an overlooked counter.
 
 ## 9. Open decisions
 
-**D1 — Task architecture scope.** §3.1 requires `telemetryTask` / `syncTask` to
-stop touching the buffer. Once they are pure cadence, they could collapse into
-an interval check inside `connectionTask` (~4 lines replacing two tasks).
-*Recommendation:* reduce them to signalers now, track the collapse separately.
-Bundling a structural refactor with a correctness fix makes the regression test
-harder to attribute, and the 6-task table is published in `README.md`,
-`project-context.md`, `architecture.md`, and the status notes.
+**D1 — Task architecture scope (resolved).** The initial landing reduced the
+telemetry/sync tasks to signalers. A subsequent native regression demonstrated
+steady-state drift from completion-based 500 ms spacing. The runtime now owns
+producer-paced delivery with a common start-to-start limit (§3.1); both cadence
+tasks and their signal/mirrored mode have been removed. Four application tasks
+remain. The task tables and component README have been updated together.
 
 **D2 — Diagnostic durability.** RAM-only diagnostics lose abandonment identities
 across a reboot. A boot boundary explains why *numbering resets*; it does not
@@ -736,26 +871,38 @@ validation.
 
 ## 10. Test plan
 
-**Harness status:** `firmware/platformio.ini` now defines `env:native`, and
-`test/test_legacy_delivery/test_main.cpp` reproduces the R0/R1 stale-ACK race
-against the production-used `LegacyDeliveryState` seam. The matching-ACK
-control test passes and the desired R0/R1 invariant intentionally fails against
-legacy behaviour. The native suite remains out of CI until the lease controller
-makes that regression green; CI continues to run the ESP32 build.
+**Harness status:** all native suites now pass and are included in CI alongside
+the ESP32 build. The original failing R0/R1 regression and LegacyDeliveryState
+seam remain available in commit `c3c22bf`; both were replaced in the working tree
+by tests against the actual DeliveryLease controller, not suppressed or marked
+as expected failures. The regression retains the invariant that a duplicate R0
+ACK cannot release R1, with injection after pin acquisition but before publish
+completion. Production no longer has an inter-task QUEUED window.
 
-The separate `test_buffer_manager` suite contains seven passing tests, including
-a deque-model comparison for capacities 1–7 and a two-producer concurrency test.
+The separate `test_buffer_manager` suite contains eight passing tests, including
+a deque-model comparison for capacities 1–7, a two-producer concurrency test,
+and a producer-fill versus conditional-abandonment race.
 Run from `firmware/`:
 
 ```sh
 pio test -e native -f test_buffer_manager
 pio test -e native -f test_loss_journal
-pio test -e native -f test_legacy_delivery
+pio test -e native -f test_delivery_lease
+pio test -e native -f test_delivery_runtime
+pio test -e native
 pio run -e esp32s3-n16r8
 ```
 
-The legacy command is intentionally nonzero until the legacy state is replaced;
-`pio test -e native` runs both suites and is **not** an all-green validation.
+`pio test -e native` runs all five suites (including payload serialization);
+no intentional failures remain.
+The runtime suite uses the same coordinator as firmware, real buffer/journal,
+injected subscribe/publish/clock functions, and independently timed 2 Hz production.
+It covers missing connect edges, subscription retry/recovery, readiness diagnostics,
+backlog catch-up, ACK/send coincidence, start-to-start pacing and logging rate.
+Long-run regressions vary publish duration, ACK latency, producer phase and task
+service jitter; additional tests cover pacing rollover, no banked send bursts,
+and preservation of brief mode entries for logging.
+This is broader than the lease-only tests, not a substitute for on-device checks.
 `default_envs = esp32s3-n16r8` keeps plain `pio run` on the firmware target;
 plain `pio test` also selects the board, so use `-e native` for host tests.
 See [`firmware/test/README.md`](../firmware/test/README.md) for scope and limits.
@@ -765,8 +912,9 @@ solved by mutex stubs alone:
 
 - The ACK state originally lived in file-static globals inside `main.cpp`, bound
   to `connectionTask`, Arduino, FreeRTOS event groups, PubSubClient, and hardware
-  setup. It is now mechanically represented by the pure
-  `LegacyDeliveryState` seam; ACK receipt staging remains in `main.cpp`.
+  setup. The initial `LegacyDeliveryState` extraction reproduced the defect;
+  it has now been replaced by DeliveryLease. ACK receipt staging remains in
+  `main.cpp` and contains no authoritative lease state.
 - `BufferManager` originally coupled the ring to Arduino, FreeRTOS, and PSRAM.
   `BufferPlatform.h` now supplies host allocation and a real `std::mutex` for
   native tests, and PSRAM allocation / FreeRTOS mutexes on ESP32. The ring and
@@ -801,7 +949,7 @@ original.
 | 10 | ACK rejected when `ever_published == false` | — |
 | 11 | Mismatched ACK increments `ack_mismatch` and mutates nothing | Yes |
 | 12 | Abandonment emits a delivery-outcome event, increments `lease_abandoned` and its correct subtype, and releases the pin | — |
-| 13 | Persistent `publish() == false` follows backoff, makes no calls after the cap, and abandons when connected time matures | — |
+| 13 | Persistent local failures back off then slow-probe; retain with free space, abandon only at full capacity after fair attempts | — |
 | 14 | `PushOutcome` reports the exact second-oldest victim identity before overwrite | — |
 | 15 | Same-policy losses separated by delivered records produce separate ranges | — |
 | 16 | Counter-only reconciliation is device-reported/unattributed, never exactly explained or PASS | — |
@@ -814,7 +962,11 @@ original.
 | 23 | Abandoned identity outside the covered query range reports `Indeterminate abandonment` | — |
 | 24 | `PushResult::NOT_INITIALISED` maps to `buffer_unavailable` | — |
 | 25 | `lease_abandoned_after_publish` never reconciles an unrelated gap by magnitude | — |
-| 26 | Identity present after `publish_failure_budget_exhausted` reports `Unexpected delivery after local publish failure` | — |
+| 26 | Identity present after `buffer_pressure_publish_failure` reports `Unexpected delivery after local publish failure` | — |
+| 27 | Ten-minute bridge outage retains all records with free space; slow retries recover without MQTT reconnect | Yes (time-based abandonment) |
+| 28 | A capped record gets a fresh paced attempt on each new MQTT session; successful attempt gets full ACK window | Yes (old cap) |
+| 29 | Session churn and millis rollover preserve the slow retry countdown and cumulative attempts | — |
+| 30 | Conditional abandonment atomically validates full capacity and pin; NOT_FULL is a no-op, including concurrent producer fill | — |
 
 Test 1 is the reproducible window in the current implementation and lands first,
 as a failing test against the extracted legacy behaviour, before any lease
@@ -837,8 +989,8 @@ code.
    add the bounded, thread-safe `LossJournal`. *(done: buffer operations and
    seven tests in `09e486c`; RAM journal, producer forwarding, periodic closure,
    and journal tests added 2026-09-29; publishing remains step 6)*
-5. Lease controller in `connectionTask`; `telemetryTask` / `syncTask` reduced to
-   cadence.
+5. Lease controller and pacing in `connectionTask`; legacy telemetry/sync tasks
+   removed. *(implemented and native-tested; not hardware-validated)*
 6. Diagnostics: loss ranges and lease-abandonment outcome events, cumulative
    counters, bridge routing, gap classification, and abandonment reconciliation.
 7. Evidence-backed hardware validation — raw `integrity_check.py` output

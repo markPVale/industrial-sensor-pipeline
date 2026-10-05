@@ -23,7 +23,8 @@
 #include "BufferManager.h"
 #include "LossJournal.h"
 #include "MqttManager.h"
-#include "LegacyDeliveryState.h"
+#include "DeliveryRuntime.h"
+#include "TelemetryPayload.h"
 
 // PubSubClient stores the full MQTT packet in one shared transmit/receive
 // buffer. Keep its capacity tied to the largest declared payload and topic,
@@ -63,7 +64,7 @@ struct RawSample {
 };
 
 // -----------------------------------------------------------------------------
-// MqttMessage — enqueued by telemetryTask/syncTask, drained by connectionTask.
+// MqttMessage — non-leased messages (E-Stop), drained by connectionTask.
 // This is the only mechanism for other tasks to write to the MQTT socket.
 // MqttManager is NOT thread-safe; all publish calls happen in connectionTask.
 // -----------------------------------------------------------------------------
@@ -73,9 +74,6 @@ struct MqttMessage {
     char topic[kTopicCapacity];
     char payload[MQTT_PAYLOAD_SIZE];
     bool retained;
-    bool commit_buffer_record;
-    uint32_t boot_id;
-    uint32_t sequence_id;
 };
 
 static_assert(kMqttLongestTopicLength < MqttMessage::kTopicCapacity,
@@ -127,30 +125,9 @@ struct CalibrationData {
 static CalibrationData g_cal;
 static void loadCalibration();  // defined below initMPU6050()
 
-// -----------------------------------------------------------------------------
-// State machine
-//
-// g_nodeState is the single source of truth for NORMAL/BUFFERING/SYNCING.
-// Written only by MqttManager callbacks (connectionTask, Core 0).
-// Read by telemetryTask and syncTask (also Core 0).
-// Using std::atomic for correctness; all access via getState()/setState().
-// -----------------------------------------------------------------------------
-static std::atomic<NodeState> g_nodeState{NodeState::NORMAL};
-
-static NodeState getState() { return g_nodeState.load(); }
-static void      setState(NodeState s) { g_nodeState.store(s); }
-
-// EventGroup bits for MQTT connection events.
-// kBitConnected / kBitDisconnected are edge notifications set by callbacks,
-// consumed and cleared by connectionTask each loop iteration.
-// kBitReconnect is set by connectionTask to unblock syncTask on reconnect.
-// Disconnect takes precedence: if both are set before connectionTask runs,
-// the connect bit is discarded (bounce — net state is disconnected).
-static EventGroupHandle_t    g_mqttEvents     = nullptr;
-static constexpr EventBits_t kBitReconnect    = BIT0;  // connectionTask -> syncTask
-static constexpr EventBits_t kBitConnected    = BIT1;  // onConnect    -> connectionTask
-static constexpr EventBits_t kBitDisconnected = BIT2;  // onDisconnect -> connectionTask
-static constexpr EventBits_t kBitAckReceived  = BIT3;  // onMessage    -> connectionTask
+// ACK staging is owned by connectionTask, including its synchronous callback.
+// The independent ISR-driven safety event group below remains necessary.
+static bool g_ackPending = false;
 
 // -----------------------------------------------------------------------------
 // Safety interlock
@@ -194,9 +171,11 @@ static LossJournal      g_lossJournal;
 static MqttManager      g_mqttManager;
 static QueueHandle_t    g_sensorQueue  = nullptr;
 static QueueHandle_t    g_publishQueue = nullptr;
-static LegacyDeliveryState g_legacyDeliveryState;
-static std::atomic<uint32_t> g_ackBoot{0};
-static std::atomic<uint32_t> g_ackSeq{0};
+static DeliveryRuntime<> g_delivery(g_buffer, g_lossJournal);
+// PubSubClient 2.8 dispatches at most one message per loop(), synchronously on
+// connectionTask. This mailbox is consumed before the next loop; it is not
+// delivery identity/state and is never read or written by another task.
+static RecordIdentity g_pendingAck{};
 
 // -----------------------------------------------------------------------------
 // mqttEnqueue() — thread-safe helper used for non-buffered MQTT messages.
@@ -209,27 +188,6 @@ static bool mqttEnqueue(const char* topic, const char* payload,
     strlcpy(msg.payload, payload, sizeof(msg.payload));
     msg.retained = retained;
     return xQueueSend(g_publishQueue, &msg, 0) == pdTRUE;
-}
-
-static bool mqttEnqueueTelemetry(const TelemetryRecord& rec,
-                                 const char* payload) {
-    if (!g_legacyDeliveryState.tryReserve()) {
-        return false;
-    }
-
-    MqttMessage msg{};
-    strlcpy(msg.topic,   MQTT_TOPIC_TELEMETRY, sizeof(msg.topic));
-    strlcpy(msg.payload, payload,              sizeof(msg.payload));
-    msg.retained = false;
-    msg.commit_buffer_record = true;
-    msg.boot_id = rec.boot_id;
-    msg.sequence_id = rec.sequence_id;
-
-    if (xQueueSend(g_publishQueue, &msg, 0) != pdTRUE) {
-        g_legacyDeliveryState.release();
-        return false;
-    }
-    return true;
 }
 
 static bool parseAckPayload(const uint8_t* payload, unsigned int length,
@@ -264,39 +222,8 @@ static void handleMqttMessage(char* topic, uint8_t* payload,
         return;
     }
 
-    g_ackBoot.store(boot);
-    g_ackSeq.store(seq);
-    xEventGroupSetBits(g_mqttEvents, kBitAckReceived);
-}
-
-// -----------------------------------------------------------------------------
-// buildPayload() — serialise one TelemetryRecord to a JSON string.
-// Uses snprintf — no heap allocation, deterministic timing.
-//
-// Output examples:
-//   normal: {"boot":1,"seq":42,"ts":123456789,"ax":-9.8123,"ay":0.1234,"az":9.8765,
-//            "gx":0.0012,"gy":-0.0034,"gz":0.0056,"wrms":9.8123,"flags":0}
-//   fault:  {"boot":1,"seq":43,"ts":123456790,"ax":104.0000,"ay":0.0000,"az":0.0000,
-//            "gx":0.0000,"gy":0.0000,"gz":0.0000,"wrms":null,"flags":32}
-// -----------------------------------------------------------------------------
-static void buildPayload(const TelemetryRecord& rec, char* buf, size_t len) {
-    char wrms_str[16];
-    if (isnan(rec.window_rms)) {
-        strlcpy(wrms_str, "null", sizeof(wrms_str));
-    } else {
-        snprintf(wrms_str, sizeof(wrms_str), "%.4f", rec.window_rms);
-    }
-    snprintf(buf, len,
-        "{\"boot\":%u,\"seq\":%u,\"ts\":%llu,"
-        "\"ax\":%.4f,\"ay\":%.4f,\"az\":%.4f,"
-        "\"gx\":%.4f,\"gy\":%.4f,\"gz\":%.4f,"
-        "\"wrms\":%s,"
-        "\"flags\":%u}",
-        rec.boot_id,      rec.sequence_id,  rec.timestamp_ms,
-        rec.accel_x,      rec.accel_y,      rec.accel_z,
-        rec.gyro_x,       rec.gyro_y,       rec.gyro_z,
-        wrms_str,
-        rec.status_flags);
+    g_pendingAck = {boot, seq};
+    g_ackPending = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -310,8 +237,6 @@ static void IRAM_ATTR safetyISR();
 static void connectionTask(void* pvParams);
 static void sensorTask(void* pvParams);
 static void filterTask(void* pvParams);
-static void telemetryTask(void* pvParams);
-static void syncTask(void* pvParams);
 static void safetyTask(void* pvParams);
 
 // =============================================================================
@@ -394,22 +319,14 @@ void setup() {
                   SENSOR_QUEUE_DEPTH, MQTT_PUBLISH_QUEUE_DEPTH);
 
     // -------------------------------------------------------------------------
-    // EventGroup for MQTT reconnect signal (connectionTask → syncTask)
-    // -------------------------------------------------------------------------
-    g_mqttEvents = xEventGroupCreate();
-    if (g_mqttEvents == nullptr) {
-        fatalSetupHalt("[EventGroup] FATAL — could not create mqtt event group.");
-    }
-
-    // -------------------------------------------------------------------------
     // MQTT connection manager — wire state machine callbacks before tasks start
     // -------------------------------------------------------------------------
     g_mqttManager.onConnect([]() {
-        xEventGroupSetBits(g_mqttEvents, kBitConnected);
+        g_delivery.newSession(millis());
     });
 
     g_mqttManager.onDisconnect([]() {
-        xEventGroupSetBits(g_mqttEvents, kBitDisconnected);
+        g_delivery.observeTransport(millis(), false);
     });
 
     g_mqttManager.onMessage(handleMqttMessage);
@@ -449,7 +366,7 @@ void setup() {
     // -------------------------------------------------------------------------
     // FreeRTOS tasks
     //   Core 1: sensorTask + filterTask — time-sensitive sensor pipeline
-    //   Core 0: connectionTask + telemetryTask + syncTask — network I/O
+    //   Core 0: safetyTask + connectionTask — interlock handling and network I/O
     // -------------------------------------------------------------------------
     if (xTaskCreatePinnedToCore(safetyTask,     "SafetyTask",    2048, nullptr, 6, nullptr, 0) != pdPASS) {
         fatalSetupHalt("[Task] FATAL — could not create SafetyTask.");
@@ -462,12 +379,6 @@ void setup() {
     }
     if (xTaskCreatePinnedToCore(filterTask,     "FilterTask",    8192, nullptr, 5, nullptr, 1) != pdPASS) {
         fatalSetupHalt("[Task] FATAL — could not create FilterTask.");
-    }
-    if (xTaskCreatePinnedToCore(telemetryTask,  "TelemetryTask", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
-        fatalSetupHalt("[Task] FATAL — could not create TelemetryTask.");
-    }
-    if (xTaskCreatePinnedToCore(syncTask,       "SyncTask",      4096, nullptr, 3, nullptr, 0) != pdPASS) {
-        fatalSetupHalt("[Task] FATAL — could not create SyncTask.");
     }
 
     {
@@ -489,12 +400,11 @@ void loop() {
 // =============================================================================
 // connectionTask — Core 0, Priority 4
 //
-// Sole owner of MqttManager and the WiFi/MQTT socket. All other tasks that
-// need to publish do so by enqueuing into g_publishQueue; this task drains
-// that queue and calls publish() on the socket.
+// Sole MQTT, pacing and lease owner. This task pins,
+// builds and publishes telemetry inline. g_publishQueue is only for E-Stop etc.
 //
 // Loop cadence: 10ms — fast enough for PubSubClient keepalive (default 15s)
-// while leaving plenty of CPU time for telemetryTask and syncTask.
+// while yielding to other work on core 0. Sensor/filter tasks run on core 1.
 // =============================================================================
 static void connectionTask(void* pvParams) {
     MqttMessage msg;
@@ -503,97 +413,63 @@ static void connectionTask(void* pvParams) {
         // Close ranges even if no further losses arrive or MQTT is offline.
         // Diagnostic publishing is a later milestone; do not drain/discard here.
         g_lossJournal.closeExpired(millis());
-        // Drive WiFi + MQTT connection state machine
+        // Account observed readiness BEFORE potentially blocking reconnect work. MQTT
+        // callbacks also account exact observed edges inside this loop call.
+        g_delivery.observeTransport(millis(), WiFi.status() == WL_CONNECTED &&
+                                             g_mqttManager.isConnected());
         g_mqttManager.loop();
-
-        // ---------------------------------------------------------------------
-        // Consume connection event bits (edge notifications from callbacks).
-        // Disconnect takes precedence: if both bits are set (bounce), discard
-        // the stale connect and handle disconnect only.
-        // ---------------------------------------------------------------------
-        const EventBits_t bits = xEventGroupGetBits(g_mqttEvents);
-
-        if (bits & kBitDisconnected) {
-            xEventGroupClearBits(g_mqttEvents, kBitDisconnected | kBitConnected);
-            g_legacyDeliveryState.release();
-            setState(NodeState::BUFFERING);
-            Serial.println("[State] -> BUFFERING");
-        } else if (bits & kBitConnected) {
-            xEventGroupClearBits(g_mqttEvents, kBitConnected);
-            if (g_mqttManager.subscribe(MQTT_TOPIC_ACK, 1)) {
-                Serial.printf("[MQTT] Subscribed to ACK topic %s (QoS 1).\n",
-                              MQTT_TOPIC_ACK);
-            } else {
-                Serial.printf("[MQTT] WARN — ACK subscribe failed for %s.\n",
-                              MQTT_TOPIC_ACK);
-            }
-            const NodeState prev = getState();
-            if (prev == NodeState::BUFFERING) {
-                setState(NodeState::SYNCING);
-                xEventGroupSetBits(g_mqttEvents, kBitReconnect);
-                Serial.printf("[State] BUFFERING -> SYNCING (%u records)\n",
-                              g_buffer.available());
-            } else {
-                setState(NodeState::NORMAL);
-                Serial.println("[State] -> NORMAL");
-            }
-        }
-
-        if (bits & kBitAckReceived) {
-            xEventGroupClearBits(g_mqttEvents, kBitAckReceived);
-            const uint32_t ackBoot = g_ackBoot.load();
-            const uint32_t ackSeq = g_ackSeq.load();
-
-            const LegacyAckResult ackResult = handleLegacyAck(
-                g_legacyDeliveryState,
-                DeliveryIdentity{ackBoot, ackSeq},
-                [](DeliveryIdentity& oldest) {
-                    TelemetryRecord rec;
-                    if (!g_buffer.peek(rec)) return false;
-                    oldest = {rec.boot_id, rec.sequence_id};
-                    return true;
-                },
-                [](DeliveryIdentity& removed) {
-                    TelemetryRecord rec;
-                    if (!g_buffer.pop(rec)) return false;
-                    removed = {rec.boot_id, rec.sequence_id};
-                    return true;
-                });
-
-            if (ackResult == LegacyAckResult::COMMIT_MISMATCH_CLEARED) {
-                Serial.printf("[ConnTask] WARN — ACK commit mismatch boot=%u seq=%u.\n",
-                              ackBoot, ackSeq);
-            } else if (ackResult == LegacyAckResult::STALE) {
-                Serial.printf("[ConnTask] WARN — stale ACK boot=%u seq=%u.\n",
-                              ackBoot, ackSeq);
-            }
-        }
-
-        const uint32_t sentAt = g_legacyDeliveryState.sentAtMs();
-        if (g_legacyDeliveryState.isInFlight() && sentAt != 0 &&
-            millis() - sentAt > MQTT_ACK_TIMEOUT_MS) {
-            const DeliveryIdentity inFlight = g_legacyDeliveryState.identity();
-            Serial.printf("[ConnTask] WARN — ACK timeout boot=%u seq=%u, retrying.\n",
-                          inFlight.boot_id, inFlight.sequence_id);
-            g_legacyDeliveryState.release();
-        }
-
-        // Drain the publish queue — only while connected
-        while (g_mqttManager.isConnected() &&
-               xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE) {
-            const bool published =
-                g_mqttManager.publish(msg.topic, msg.payload, msg.retained);
-
-            if (msg.commit_buffer_record) {
-                if (published) {
-                    g_legacyDeliveryState.markPublished(
-                        DeliveryIdentity{msg.boot_id, msg.sequence_id}, millis());
-                } else {
-                    Serial.printf("[ConnTask] WARN — publish failed for boot=%u seq=%u, will retry.\n",
-                                  msg.boot_id, msg.sequence_id);
-                    g_legacyDeliveryState.release();
+        const bool ackReceived = g_ackPending;
+        g_ackPending = false;
+        const bool connected = WiFi.status() == WL_CONNECTED && g_mqttManager.isConnected();
+        const RecordIdentity ack = g_pendingAck;
+        const auto subscribeAttempts = g_delivery.subscriptionCounters().attempts;
+        g_delivery.step(
+            millis(), connected,
+            ackReceived ? &ack : nullptr,
+            []() { return g_mqttManager.subscribe(MQTT_TOPIC_ACK, 1); },
+            [](const TelemetryRecord& rec) {
+                char payload[MQTT_PAYLOAD_SIZE];
+                if (!buildPayload(rec, payload, sizeof(payload))) {
+                    // Fail locally: retain the lease, apply normal retry pacing.
+                    Serial.println("[Delivery] payload formatting failed; not published");
+                    return false;
                 }
-            } else if (!published) {
+                return g_mqttManager.publish(MQTT_TOPIC_TELEMETRY, payload, false);
+            }, []() { return millis(); });
+        // Log outside MQTT callbacks. Short-lived modes survive as pending bits;
+        // within this iteration transitions follow BUFFERING -> SYNCING -> NORMAL.
+        const uint8_t changes = g_delivery.takeModeChanges();
+        if (changes & (1U << static_cast<unsigned>(NodeState::BUFFERING)))
+            Serial.printf("[Delivery] t=%u entered BUFFERING\n", millis());
+        if (changes & (1U << static_cast<unsigned>(NodeState::SYNCING)))
+            Serial.printf("[Delivery] t=%u entered SYNCING\n", millis());
+        if (changes & (1U << static_cast<unsigned>(NodeState::NORMAL)))
+            Serial.printf("[Delivery] t=%u entered NORMAL\n", millis());
+        if (subscribeAttempts != g_delivery.subscriptionCounters().attempts)
+            Serial.printf("[Delivery] t=%u ACK subscription request %s (not SUBACK confirmation)\n",
+                          millis(), g_delivery.subscriptionSent() ? "sent" : "failed");
+        if (g_delivery.reportDue(millis())) {
+            const auto& lease = g_delivery.lease().state();
+            const auto& c = g_delivery.lease().counters();
+            const auto& sub = g_delivery.subscriptionCounters();
+            Serial.printf("[Delivery] mode=%u sub_sent=%u phase=%u boot=%u seq=%u calls=%u observed_ready_ms=%u buffered=%u\n",
+                static_cast<unsigned>(g_delivery.mode()), static_cast<unsigned>(g_delivery.subscriptionSent()),
+                static_cast<unsigned>(lease.phase), lease.identity.boot_id, lease.identity.sequence_id,
+                lease.publish_calls, lease.connected_wait_ms, static_cast<unsigned>(g_buffer.available()));
+            Serial.printf("[Delivery] publishes=%llu failures=%llu retries=%llu timeouts=%llu committed=%llu abandoned=%llu\n",
+                (unsigned long long)c.publish_calls, (unsigned long long)c.publish_failures,
+                (unsigned long long)c.retries, (unsigned long long)c.ack_timeouts,
+                (unsigned long long)c.committed, (unsigned long long)c.abandoned);
+            Serial.printf("[Delivery] stale=%llu mismatch=%llu internal_errors=%llu ownership_fault=%u sub_attempts=%llu sub_failures=%llu\n",
+                (unsigned long long)c.ack_stale, (unsigned long long)c.ack_mismatch,
+                (unsigned long long)c.lease_internal_errors,
+                static_cast<unsigned>(g_delivery.lease().ownershipFault()),
+                (unsigned long long)sub.attempts, (unsigned long long)sub.failures);
+        }
+        // Bounded non-telemetry work prevents producers starving lease service.
+        for (size_t n = 0; n < MQTT_PUBLISH_QUEUE_DEPTH && g_mqttManager.isConnected() &&
+             xQueueReceive(g_publishQueue, &msg, 0) == pdTRUE; ++n) {
+            if (!g_mqttManager.publish(msg.topic, msg.payload, msg.retained)) {
                 Serial.println("[ConnTask] WARN — publish failed mid-drain.");
             }
         }
@@ -932,97 +808,6 @@ static void filterTask(void* pvParams) {
             sum_sq            = 0.0f;
             windowCount       = 0;
             accumulated_flags = STATUS_OK;
-        }
-    }
-}
-
-// =============================================================================
-// telemetryTask — Core 0, Priority 3
-//
-// In NORMAL state only: peeks the oldest record from g_buffer, serialises it
-// to JSON, and enqueues it for connectionTask to publish. The record stays in
-// g_buffer until the bridge ACKs a successful InfluxDB write. If publish fails
-// or the ACK times out, the same buffer head is retried.
-//
-// In BUFFERING state: does nothing — records accumulate in PSRAM.
-// In SYNCING state: does nothing — syncTask owns the buffer exclusively to
-// prevent a race where both tasks peek and publish the same record.
-// =============================================================================
-static void telemetryTask(void* pvParams) {
-    char payload[MQTT_PAYLOAD_SIZE];
-
-    for (;;) {
-        const NodeState state = getState();
-
-        if (state == NodeState::NORMAL) {
-            TelemetryRecord rec;
-            if (g_buffer.peek(rec)) {
-                buildPayload(rec, payload, sizeof(payload));
-                if (!mqttEnqueueTelemetry(rec, payload)) {
-                    // Queue full or one buffered record is already in flight.
-                    Serial.println("[TelemetryTask] WARN — telemetry publish busy, will retry.");
-                }
-            }
-        }
-        // BUFFERING state: fall through with no action
-
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_PUBLISH_MS));
-    }
-}
-
-// =============================================================================
-// syncTask — Core 0, Priority 3
-//
-// Waits for the kBitReconnect EventGroup bit, set by the onConnect callback
-// when the state transitions BUFFERING → SYNCING.
-//
-// Drains g_buffer one ACK-gated record at a time. Records are only removed by
-// connectionTask after the bridge ACKs a successful InfluxDB write.
-//
-// When the buffer is empty, transitions SYNCING → NORMAL.
-// If the connection drops mid-drain, exits the inner loop; the outer loop
-// blocks on the EventGroup again and the drain resumes on next reconnect.
-// =============================================================================
-static void syncTask(void* pvParams) {
-    char payload[MQTT_PAYLOAD_SIZE];
-
-    for (;;) {
-        // Block until a reconnect event is signalled
-        xEventGroupWaitBits(g_mqttEvents, kBitReconnect,
-                            pdTRUE,    // clear bit on exit
-                            pdFALSE,   // wait for any set bit
-                            portMAX_DELAY);
-
-        Serial.printf("[SyncTask] Drain starting — %u records buffered.\n",
-                      g_buffer.available());
-
-        // Drain in rate-limited single-record attempts. The ACK path controls
-        // when the next buffered record may be sent.
-        while (!g_buffer.isEmpty()) {
-            if (getState() != NodeState::SYNCING) {
-                // Connection dropped again mid-drain — stop here
-                Serial.println("[SyncTask] Connection lost during drain — pausing.");
-                break;
-            }
-
-            if (!g_legacyDeliveryState.isInFlight()) {
-                TelemetryRecord rec;
-                if (g_buffer.peek(rec)) {
-                    buildPayload(rec, payload, sizeof(payload));
-                    if (!mqttEnqueueTelemetry(rec, payload)) {
-                        // Queue full or an in-flight race; retry next cycle.
-                        Serial.println("[SyncTask] WARN — telemetry publish busy, backing off.");
-                    }
-                }
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(SYNC_BATCH_DELAY_MS));
-        }
-
-        // Transition to NORMAL when drain is complete
-        if (g_buffer.isEmpty() && getState() == NodeState::SYNCING) {
-            setState(NodeState::NORMAL);
-            Serial.println("[State] SYNCING → NORMAL (buffer drained)");
         }
     }
 }

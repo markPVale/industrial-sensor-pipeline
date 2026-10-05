@@ -25,6 +25,11 @@ jobs:
         run: |
           python gateway/bridge/test_integrity_check.py
 
+      - name: Test bridge persistence and nullable telemetry
+        run: |
+          python -m pip install -r gateway/bridge/requirements.txt
+          python gateway/bridge/test_mqtt_to_influx.py
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -38,6 +43,13 @@ jobs:
           npm ci
           npm test
           npm run build
+
+      - name: Test dashboard nullable telemetry
+        working-directory: dashboard
+        run: |
+          npm ci
+          npm test
+          npx tsc --noEmit --incremental false
 
   firmware-build:
     runs-on: ubuntu-latest
@@ -61,3 +73,7 @@ jobs:
         run: |
           cp secrets.ini.template secrets.ini
           pio run
+
+      - name: Run native firmware tests
+        working-directory: firmware
+        run: pio test -e native

@@ -24,24 +24,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { HttpError, InfluxDB } from "@influxdata/influxdb-client";
 import {
-  FLAG_ACCEL_CLIPPED,
-  FLAG_ANOMALY,
-  FLAG_DEGRADED_REBOOT_REQUIRED,
-  FLAG_GYRO_CLIPPED,
-  FLAG_INTERLOCK_OPEN,
-  FLAG_SENSOR_FAULT,
-  FLAG_SENSOR_UNAVAILABLE,
-  InputError,
-  MAX_ANOMALY_EVENTS,
-  NODE_ID_RE,
-  buildAnomalyQueries,
-  capAnomalyEvents,
-  classifyDependencyError,
-  decodeFlags,
-  normalizeWindowMinutes,
-  parseNodeId,
-  validateNodeId,
+  InputError, MAX_ANOMALY_EVENTS, NODE_ID_RE, classifyDependencyError, parseNodeId,
 } from "./tool-utils.js";
+import { createTelemetryTools } from "./telemetry-tools.js";
 
 // ---------------------------------------------------------------------------
 // Configuration — override via environment variables
@@ -70,227 +55,8 @@ async function runFlux(query: string): Promise<Record<string, unknown>[]> {
   return rows;
 }
 
-/**
- * Convert long-format Flux rows (one row per field) into wide-format records
- * (one record per timestamp) by grouping on _time.
- * Avoids the pivot operator which returns 0 rows with some influxdb-client versions.
- */
-function toISOString(t: unknown): string {
-  if (t instanceof Date) return t.toISOString();
-  return String(t);
-}
-
-// ---------------------------------------------------------------------------
-// Tool implementations
-// ---------------------------------------------------------------------------
-
-/**
- * get_latest_telemetry
- * Returns the single most recent vibration record for a node.
- */
-async function getLatestTelemetry(nodeId: string) {
-  validateNodeId(nodeId);
-  const flux = `
-    from(bucket: "${INFLUX_BUCKET}")
-      |> range(start: -1h)
-      |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
-      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> filter(fn: (r) =>
-        exists r.ax and exists r.ay and exists r.az and
-        exists r.gx and exists r.gy and exists r.gz and
-        exists r.boot_id and exists r.sequence_id and
-        exists r.flags and exists r.vibration_rms
-      )
-      |> sort(columns: ["_time"], desc: true)
-      |> limit(n: 1)
-  `;
-
-  const rows = await runFlux(flux);
-  if (rows.length === 0) {
-    return { node_id: nodeId, status: "no_data", message: "No telemetry found in the last hour." };
-  }
-
-  const r     = rows[0];
-  const flags = r["flags"] as number;
-  const windowRms = (r["window_rms"] ?? r["vibration_rms"]) as number;
-  return {
-    node_id:                        nodeId,
-    timestamp:                      toISOString(r["_time"]),
-    vibration_rms_mps2:             windowRms,
-    window_rms_mps2:                windowRms,
-    vector_magnitude_mps2:          r["vibration_rms"],
-    ax: r["ax"], ay: r["ay"], az: r["az"],
-    gx: r["gx"], gy: r["gy"], gz: r["gz"],
-    boot_id:                        r["boot_id"],
-    sequence_id:                    r["sequence_id"],
-    flags,
-    flag_accel_clipped:             (flags & FLAG_ACCEL_CLIPPED)            !== 0,
-    flag_gyro_clipped:              (flags & FLAG_GYRO_CLIPPED)             !== 0,
-    flag_interlock_open:            (flags & FLAG_INTERLOCK_OPEN)           !== 0,
-    flag_anomaly:                   (flags & FLAG_ANOMALY)                  !== 0,
-    flag_sensor_fault:              (flags & FLAG_SENSOR_FAULT)             !== 0,
-    flag_degraded_reboot_required:  (flags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-    flag_sensor_unavailable:        (flags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
-  };
-}
-
-/**
- * get_sensor_health
- * Returns a human-readable health summary for a node.
- */
-async function getSensorHealth(nodeId: string) {
-  validateNodeId(nodeId);
-
-  // Query both measurements in parallel — fault records (0x10/0x20/0x40) are
-  // routed to sensor_faults by the bridge and would be invisible to a
-  // vibration-only query, causing health to report stale "OK" then OFFLINE
-  // instead of DEGRADED or UNAVAILABLE during an I2C fault.
-  const [vibRows, faultRows] = await Promise.all([
-    runFlux(`
-      from(bucket: "${INFLUX_BUCKET}")
-        |> range(start: -5m)
-        |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> filter(fn: (r) => exists r.flags and exists r.vibration_rms)
-        |> sort(columns: ["_time"], desc: true)
-        |> limit(n: 1)
-    `),
-    runFlux(`
-      from(bucket: "${INFLUX_BUCKET}")
-        |> range(start: -5m)
-        |> filter(fn: (r) => r._measurement == "sensor_faults" and r.node_id == "${nodeId}")
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> sort(columns: ["_time"], desc: true)
-        |> limit(n: 1)
-    `),
-  ]);
-
-  const latestVib   = vibRows[0]   ?? null;
-  const latestFault = faultRows[0] ?? null;
-
-  if (!latestVib && !latestFault) {
-    return {
-      node_id:   nodeId,
-      is_online: false,
-      message:   "No telemetry received in the last 5 minutes. Node may be offline or disconnected.",
-    };
-  }
-
-  const vibTime    = latestVib   ? new Date(toISOString(latestVib["_time"])).getTime()   : 0;
-  const faultTime  = latestFault ? new Date(toISOString(latestFault["_time"])).getTime() : 0;
-  const latestTime = Math.max(vibTime, faultTime);
-  const vibFlags   = latestVib ? latestVib["flags"] as number : 0;
-  const faultFlags = latestFault
-    ? (latestFault["flags"] != null ? latestFault["flags"] : FLAG_SENSOR_FAULT) as number
-    : 0;
-  const mergedFlags = vibFlags | faultFlags;
-  const rms = latestVib
-    ? (latestVib["window_rms"] ?? latestVib["vibration_rms"]) as number
-    : 0;
-
-  const age = Math.round((Date.now() - latestTime) / 1000);
-  return {
-    node_id:                        nodeId,
-    is_online:                      age < 30,
-    last_seen_seconds_ago:          age,
-    vibration_rms_mps2:             latestVib ? rms : null,
-    window_rms_mps2:                latestVib ? rms : null,
-    vector_magnitude_mps2:          latestVib ? latestVib["vibration_rms"] : null,
-    flag_interlock_open:            (mergedFlags & FLAG_INTERLOCK_OPEN)           !== 0,
-    flag_anomaly:                   (mergedFlags & FLAG_ANOMALY)                  !== 0,
-    flag_sensor_fault:              (mergedFlags & FLAG_SENSOR_FAULT)             !== 0,
-    flag_degraded_reboot_required:  (mergedFlags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-    flag_sensor_unavailable:        (mergedFlags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
-    whoami_raw:                     latestFault ? latestFault["whoami_raw"] ?? null : null,
-    health_summary:                 buildHealthSummary(age, mergedFlags, rms),
-  };
-}
-
-function buildHealthSummary(ageSeconds: number, flags: number, rms: number): string {
-  if (ageSeconds >= 30)                      return "OFFLINE — no recent telemetry.";
-  if (flags & FLAG_INTERLOCK_OPEN)           return "CRITICAL — E-Stop / safety interlock is active.";
-  if (flags & FLAG_SENSOR_UNAVAILABLE)       return "CRITICAL — Sensor unavailable. Max auto-reboots exhausted. Power-cycle required.";
-  if (flags & FLAG_DEGRADED_REBOOT_REQUIRED) return "DEGRADED — I2C fault detected. Auto-reboot pending.";
-  if (flags & FLAG_SENSOR_FAULT)             return "DEGRADED — I2C sensor fault (legacy flag).";
-  if (flags & FLAG_ANOMALY)                  return `WARNING — Anomaly detected. Vibration RMS: ${rms.toFixed(4)} m/s²`;
-  return `OK — Normal operation. Vibration RMS: ${rms.toFixed(4)} m/s²`;
-}
-
-/**
- * get_recent_anomalies
- * Returns up to MAX_ANOMALY_EVENTS records within the window where an anomaly
- * or E-Stop flag was set.
- * Queries both vibration and sensor_faults so I2C fault events are not missed.
- */
-async function getRecentAnomalies(nodeId: string, windowMinutes: unknown) {
-  validateNodeId(nodeId);
-  const window = normalizeWindowMinutes(windowMinutes);
-
-  const queries = buildAnomalyQueries({
-    bucket: INFLUX_BUCKET,
-    nodeId,
-    windowMinutes: window,
-  });
-
-  const [vibRows, faultRows] = await Promise.all([
-    runFlux(queries.vibration),
-    runFlux(queries.faults),
-  ]);
-
-  if (vibRows.length === 0 && faultRows.length === 0) {
-    return {
-      node_id:              nodeId,
-      window_minutes:       window,
-      returned_event_count: 0,
-      truncated:            false,
-      message:              `No anomalies detected in the last ${window} minutes.`,
-      events:               [],
-    };
-  }
-
-  // Event payloads stay lean: `active_flags` replaces one boolean per flag, and
-  // the redundant vibration_rms_mps2 alias is dropped. Fault events omit the
-  // accel fields entirely rather than carrying nulls.
-  const vibEvents = vibRows.map((r) => {
-    const flags = r["flags"] as number;
-    return {
-      timestamp:             toISOString(r["_time"]),
-      source:                "vibration",
-      window_rms_mps2:       (r["window_rms"] ?? r["vibration_rms"]) as number,
-      vector_magnitude_mps2: r["vibration_rms"] as number,
-      ax: r["ax"], ay: r["ay"], az: r["az"],
-      flags,
-      active_flags:          decodeFlags(flags),
-    };
-  });
-
-  const faultEvents = faultRows.map((r) => {
-    const flags = (r["flags"] != null ? r["flags"] : FLAG_SENSOR_FAULT) as number;
-    return {
-      timestamp:    toISOString(r["_time"]),
-      source:       "sensor_faults",
-      flags,
-      active_flags: decodeFlags(flags),
-    };
-  });
-
-  const allEvents = [...vibEvents, ...faultEvents].sort(
-    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-  );
-  const { events, truncated } = capAnomalyEvents(allEvents);
-
-  // `returned_event_count` is deliberately not named anomaly_count: when
-  // truncated is true this is the size of this page, not the number of matches.
-  // The true total is not computed — both queries are row-bounded — so it is
-  // omitted rather than guessed.
-  return {
-    node_id:              nodeId,
-    window_minutes:       window,
-    returned_event_count: events.length,
-    truncated,
-    events,
-  };
-}
+const { getLatestTelemetry, getSensorHealth, getRecentAnomalies } =
+  createTelemetryTools(runFlux, INFLUX_BUCKET);
 
 // ---------------------------------------------------------------------------
 // MCP Server factory — one instance per SSE connection.
@@ -341,7 +107,7 @@ function createServer(): Server {
       },
       {
         name:        "get_recent_anomalies",
-        description: `Returns up to ${MAX_ANOMALY_EVENTS} most recent anomaly and E-Stop events detected within a lookback window for a sensor node.`,
+        description: `Returns up to ${MAX_ANOMALY_EVENTS} most recent flagged or invalid-data events within a lookback window. Does not assess telemetry coverage; an empty result does not prove healthy operation.`,
         inputSchema: {
           type: "object",
           additionalProperties: false,
