@@ -22,6 +22,12 @@ and an optional stored `reason`. Unavailable numeric values are JSON `null`.
 magnitude; `vector_magnitude_mps2` remains a separate metric. Explicit bridge
 unavailability metadata also overrides a stored legacy fallback value.
 
+When no telemetry row was retrieved, quality was not assessed: `data_complete`,
+`data_status`, and `unavailable_fields` are `null`, as are the numeric metrics.
+This applies both to an empty successful vibration query and to a failed one;
+`sources.vibration.status` distinguishes `no_data` from `error`. A database error
+does not establish that sensor measurements were invalid.
+
 Fresh invalid evidence counts toward last-seen freshness, but produces
 `DATA UNAVAILABLE`, not `OK`. E-Stop and sensor-fault summaries retain priority.
 Old complete records without quality metadata are checked using their fields;
@@ -59,7 +65,7 @@ takes priority over sensor-fault summaries.
 | `CRITICAL — E-Stop / safety interlock is active.` | `STATUS_INTERLOCK_OPEN` set |
 | `CRITICAL — Sensor unavailable. Max auto-reboots exhausted.` | `STATUS_SENSOR_UNAVAILABLE` set |
 | `OFFLINE — no recent telemetry.` | No data in last 30s |
-| `UNKNOWN — database query incomplete` | A telemetry or fault query failed; available evidence is returned without a complete health assessment |
+| `UNKNOWN — source query incomplete` | A telemetry or fault query failed; available evidence is returned without a complete health assessment |
 
 ## Slow Queries and Partial Results
 
@@ -73,25 +79,45 @@ Node's event-loop scheduling, so this is not a hard real-time guarantee.
 
 A process-wide pool permits **four active queries and sixteen waiting queries**
 by default, across all MCP sessions. Extra queries fail with `QUERY_BUSY`.
-Expired queued queries are removed without contacting InfluxDB. Queries are not
+Queued queries whose deadline expires fail with `QUERY_QUEUE_TIMEOUT` and are
+removed without contacting InfluxDB. Queries are not
 automatically retried or cached. Existing Flux lookback and row limits remain;
 small returned row counts do not guarantee cheap scans, pivots, or sorts.
+The single-active-slot/zero-waiting-slot configuration is rejected because it
+cannot complete the paired tools even when idle. One slot plus at least one
+queue entry supports serial execution; two or more slots permit parallel pairs.
+Valid configurations can still encounter contention from other calls.
 
 Health and anomaly tools query `vibration` and `sensor_faults` independently:
 
-- If both succeed, `query_complete` is `true`.
-- If one fails, the tool returns `status: "partial"`, `query_complete: false`,
-  `dependency_status.influxdb: "degraded"`, and the successful source's data.
+- If both succeed, `query_status` is `"ok"` and `query_complete` is `true`.
+- If one fails, the tool returns `query_status: "partial"`, `query_complete: false`,
+  and the successful source's data.
   Each entry in `sources` identifies `ok`, `no_data`, or `error`; failures include
   a safe error code/message. Partial results are successful MCP tool responses,
   so consumers must inspect these completeness fields.
-- Partial health assessments set `assessment_complete: false`, `is_online: null`,
-  and an `UNKNOWN` summary. Observed positive flags remain `true`; unobserved
-  flags become `null`, since the missing source might contain a fault. This also
-  applies when the successful query returns no rows: a database failure never
-  establishes that the sensor is offline.
+- A local `QUERY_BUSY` or `QUERY_QUEUE_TIMEOUT` produces a partial result when the other source succeeds:
+  `dependency_status.query_service` is `"busy"` and `influxdb` remains `"available"`.
+  A failed database request or a timeout after a request starts sets
+  `influxdb: "degraded"`. Queue expiry before request execution, local rejection,
+  or caller cancellation alone does not establish database degradation. These
+  fields describe outcomes of this call, not a separately monitored database.
+- Partial health assessments set `assessment_complete: false` and an `UNKNOWN`
+  overall summary. `is_online` remains `true` if either source provides evidence
+  less than 30 seconds old. With only older observations or no observations it
+  is `null`, because the missing source might contain a newer record. If both
+  queries succeed, `is_online` is the usual freshness-based `true`/`false`.
+  Observed positive flags remain `true`; unobserved flags become `null` when a
+  source fails. Recent reporting does not establish a complete health assessment
+  or prove the device is still connected.
 - If both queries fail, the tool returns an MCP error (`isError: true`). A
   latest-telemetry query failure also returns an error rather than `no_data`.
+
+All tools use `query_status` for query outcome. Latest telemetry retains its
+legacy `status: "no_data"` for data presence when empty, alongside
+`query_status: "ok"`. Health and anomaly results no longer use top-level `status`.
+For example, `query_status: "ok"` with an `OFFLINE` health summary means the
+queries succeeded and found no recent reporting; it does not mean a healthy node.
 
 Responses include `queried_at` and per-source `timestamp`/`age_seconds` for the
 newest returned observation. These are observation ages, not proof of a live
@@ -101,14 +127,19 @@ describes measurement quality. Even complete anomaly queries retain
 `coverage_status: "not_assessed"`.
 
 Each query emits a compact JSON diagnostic to **stderr** with duration (including
-queue time), outcome code, active/queued counts, and cumulative query/timeout
-counts. Query text and credentials are omitted. Counters reset on process restart.
+queue time), outcome code, active/queued counts, `queries_total`, and
+`query_timeouts_total`. Counts refer to individual queries, not tool calls: one
+health call that times out both queries adds two timeouts. Queue and execution
+timeouts both count; their outcome codes distinguish them. Query text and
+credentials are omitted. Counters reset on process restart.
 
 Tests use the installed InfluxDB client against loopback HTTP stubs to verify
 deadlines before headers and during slow streams, connection closure, queue
 expiry, cancellation, repeated cleanup, and recovery. A real MCP stdio client
 checks responsiveness and error responses. These tests do not execute Flux on
 a live InfluxDB instance or validate hardware safety behavior.
+Transport tests also force admission contention with one admitted source and one
+rejected source, and verify serial paired queries with a single active slot.
 
 ## Setup
 
@@ -247,6 +278,7 @@ Failed tool calls return `isError: true` with a JSON body:
 | `INVALID_ARGUMENT` | Bad tool arguments or unknown tool name. The `message` is safe to surface to the caller. |
 | `DEPENDENCY_MISCONFIGURED` | InfluxDB rejected authentication/authorization or a configured resource was not found (HTTP 401/403/404). Correct the token, organization, bucket, or URL before retrying. |
 | `DEPENDENCY_FAILURE` | InfluxDB is unreachable, a query failed for another reason, or an internal bug occurred. The message is deliberately generic; the underlying error is written to stderr (`~/mcp-server.log` on the Pi), so check there rather than the tool response when diagnosing. |
-| `QUERY_TIMEOUT` | The shared tool deadline expired, including time spent waiting for a query slot. |
+| `QUERY_TIMEOUT` | The shared deadline expired after starting a database request. Queue time still consumes this same budget. |
+| `QUERY_QUEUE_TIMEOUT` | The shared deadline expired before a database request started; local query admission was delayed. |
 | `QUERY_BUSY` | The active-query limit and waiting queue are both full. |
 | `QUERY_CANCELLED` | The MCP request was cancelled; its queued and active queries are cancelled too. |

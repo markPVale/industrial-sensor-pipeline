@@ -24,7 +24,14 @@ function finite(value: unknown): number | null {
 // Preserve evidence even when measurements are unavailable. Older rows without
 // quality metadata are checked from their fields; absence never proves a legacy
 // vector value was a measured window RMS.
-function measurements(row: FluxRow) {
+function measurements(row: FluxRow | null) {
+  // No retrieved telemetry row means quality was not assessed. A query failure
+  // or an empty result is not evidence that the sensor emitted invalid values.
+  if (row === null) return {
+    ax: null, ay: null, az: null, gx: null, gy: null, gz: null,
+    vibration_rms_mps2: null, window_rms_mps2: null, vector_magnitude_mps2: null,
+    data_complete: null, data_status: null, unavailable_fields: null, reason: null,
+  };
   const reported = new Set(typeof row.unavailable_fields === "string"
     ? row.unavailable_fields.split(",") : []);
   const value = (wire: string, field = wire) => reported.has(wire) ? null : finite(row[field]);
@@ -71,14 +78,24 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     // Complete failure is an MCP error, never an empty result or sensor status.
     if (vib.status === "rejected" && fault.status === "rejected") throw vib.reason;
     const complete = vib.status === "fulfilled" && fault.status === "fulfilled";
+    const failures = [vib, fault].flatMap(result => result.status === "rejected"
+      ? [classifyToolError(result.reason)] : []);
+    const busy = failures.some(error => error.code === "QUERY_BUSY" || error.code === "QUERY_QUEUE_TIMEOUT");
+    // A successful source establishes that the dependency responded. Local
+    // admission failure or client cancellation does not imply database failure.
+    const dependencyFailed = failures.some(error =>
+      error.code !== "QUERY_BUSY" && error.code !== "QUERY_QUEUE_TIMEOUT" && error.code !== "QUERY_CANCELLED");
     return {
       vibRows: vib.status === "fulfilled" ? vib.value : [],
       faultRows: fault.status === "fulfilled" ? fault.value : [],
       metadata: {
-        status: complete ? "ok" : "partial",
+        query_status: complete ? "ok" : "partial",
         query_complete: complete,
         queried_at: new Date(now()).toISOString(),
-        dependency_status: { influxdb: complete ? "available" : "degraded" },
+        dependency_status: {
+          influxdb: dependencyFailed ? "degraded" : "available",
+          query_service: busy ? "busy" : "available",
+        },
         sources: { vibration: source(vib), sensor_faults: source(fault) },
       },
     };
@@ -104,7 +121,7 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     `;
 
     const rows = await runFlux(flux);
-    const metadata = { queried_at: new Date(now()).toISOString(), query_complete: true,
+    const metadata = { queried_at: new Date(now()).toISOString(), query_status: "ok", query_complete: true,
       sources: { vibration: source({ status: "fulfilled", value: rows }) } };
     if (rows.length === 0) {
       return { ...metadata, node_id: nodeId, status: "no_data", message: "No telemetry found in the last hour." };
@@ -163,11 +180,12 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     if (!latestVib && !latestFault) {
       return {
         ...metadata,
+        ...measurements(null),
         assessment_complete: metadata.query_complete,
         node_id:   nodeId,
         is_online: metadata.query_complete ? false : null,
         health_summary: metadata.query_complete ? "OFFLINE — no recent telemetry."
-          : "UNKNOWN — database query incomplete; sensor health cannot be assessed.",
+          : "UNKNOWN — source query incomplete; sensor health cannot be assessed.",
         message: metadata.query_complete
           ? "No telemetry received in the last 5 minutes. Node may be offline or disconnected."
           : "One data source could not be queried; absence of telemetry cannot be established.",
@@ -182,7 +200,7 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
       ? (latestFault["flags"] != null ? latestFault["flags"] : FLAG_SENSOR_FAULT) as number
       : 0;
     const mergedFlags = vibFlags | faultFlags;
-    const metrics = measurements(latestVib ?? {});
+    const metrics = measurements(latestVib);
     const rms = metrics.window_rms_mps2;
 
     const age = Math.round((now() - latestTime) / 1000);
@@ -194,7 +212,7 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
       ...metadata,
       assessment_complete: metadata.query_complete,
       node_id:                        nodeId,
-      is_online:                      metadata.query_complete ? age < 30 : null,
+      is_online:                      age < 30 ? true : metadata.query_complete ? false : null,
       last_seen_seconds_ago:          age,
       vibration_rms_mps2:             rms,
       window_rms_mps2:                rms,
@@ -211,11 +229,11 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
       whoami_raw:                     latestFault ? latestFault["whoami_raw"] ?? null : null,
       health_summary:                 metadata.query_complete
         ? buildHealthSummary(age, mergedFlags, rms, metrics.data_complete)
-        : "UNKNOWN — database query incomplete; observed readings and flags are partial evidence.",
+        : "UNKNOWN — source query incomplete; observed readings and flags are partial evidence.",
     };
   }
 
-  function buildHealthSummary(ageSeconds: number, flags: number, rms: number | null, complete: boolean): string {
+  function buildHealthSummary(ageSeconds: number, flags: number, rms: number | null, complete: boolean | null): string {
     if (ageSeconds >= 30)                      return "OFFLINE — no recent telemetry.";
     if (flags & FLAG_INTERLOCK_OPEN)           return "CRITICAL — E-Stop / safety interlock is active.";
     if (flags & FLAG_SENSOR_UNAVAILABLE)       return "CRITICAL — Sensor unavailable. Max auto-reboots exhausted. Power-cycle required.";

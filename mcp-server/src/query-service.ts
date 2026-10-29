@@ -11,11 +11,19 @@ export function querySettings(env: NodeJS.ProcessEnv) {
     }
     return value;
   };
-  return {
+  const settings = {
     deadlineMs: integer("MCP_QUERY_DEADLINE_MS", 4000),
     concurrency: integer("MCP_QUERY_CONCURRENCY", 4),
     maxQueue: integer("MCP_QUERY_MAX_QUEUE", 16, true),
   };
+  requirePairedCapacity(settings);
+  return settings;
+}
+
+function requirePairedCapacity(limits: { concurrency: number; maxQueue: number }) {
+  if (limits.concurrency === 1 && limits.maxQueue === 0) {
+    throw new Error("Paired telemetry/fault queries require MCP_QUERY_CONCURRENCY >= 2 or MCP_QUERY_MAX_QUEUE >= 1");
+  }
 }
 
 // One scope per tool call: queueing and all its queries share the same budget.
@@ -60,7 +68,8 @@ export class QueryPool {
           signal,
           grant: resolve,
           abort: () => {
-            this.queue.splice(this.queue.indexOf(waiter), 1);
+            const index = this.queue.indexOf(waiter);
+            if (index >= 0) this.queue.splice(index, 1);
             reject(signal.reason);
           },
         };
@@ -86,7 +95,7 @@ export class QueryPool {
 type Connection = { url: string; token: string; org: string };
 type QueryLog = {
   event: "influx_query"; duration_ms: number; outcome: string;
-  queries_total: number; timeouts_total: number; active: number; queued: number;
+  queries_total: number; query_timeouts_total: number; active: number; queued: number;
 };
 
 export class QueryService {
@@ -98,6 +107,7 @@ export class QueryService {
     limits: { concurrency: number; maxQueue: number },
     private readonly log: (event: QueryLog) => void = event => console.error(JSON.stringify(event)),
   ) {
+    requirePairedCapacity(limits);
     this.pool = new QueryPool(limits.concurrency, limits.maxQueue);
   }
 
@@ -108,6 +118,7 @@ export class QueryService {
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
     let release: (() => void) | undefined;
+    let requestStarted = false;
     let outcome = "ok";
     try {
       release = await this.pool.acquire(signal);
@@ -120,11 +131,18 @@ export class QueryService {
         url: this.connection.url, token: this.connection.token,
         timeout: 0, transportOptions: { signal: request.signal },
       }).getQueryApi(this.connection.org);
+      requestStarted = true;
       return await api.collectRows<FluxRow>(query);
     } catch (error) {
-      const failure = signal.aborted ? signal.reason : error;
+      let failure = signal.aborted ? signal.reason : error;
       outcome = classifyToolError(failure).code;
-      if (outcome === "QUERY_TIMEOUT") ++this.timeouts;
+      if (outcome === "QUERY_TIMEOUT" && !requestStarted) {
+        // Do not mutate the shared deadline reason: another source in the same
+        // tool call may have started a database request and timed out there.
+        failure = new QueryError("QUERY_QUEUE_TIMEOUT");
+        outcome = failure.code;
+      }
+      if (outcome === "QUERY_TIMEOUT" || outcome === "QUERY_QUEUE_TIMEOUT") ++this.timeouts;
       throw failure;
     } finally {
       // Close any unfinished response on errors as well as on deadlines.
@@ -133,7 +151,7 @@ export class QueryService {
       release?.();
       ++this.queries;
       this.log({ event: "influx_query", duration_ms: Math.round(performance.now() - start),
-        outcome, queries_total: this.queries, timeouts_total: this.timeouts, ...this.pool.state });
+        outcome, queries_total: this.queries, query_timeouts_total: this.timeouts, ...this.pool.state });
     }
   }
 }

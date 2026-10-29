@@ -126,14 +126,17 @@ function partialRig(vibration: FluxRow[] | Error, faults: FluxRow[] | Error) {
   }, "sensors", () => NOW);
 }
 
-test("fault query failure preserves telemetry but makes health and absent flags unknown", async () => {
+test("fault query failure preserves recent reporting while health and absent flags stay unknown", async () => {
   const tools = partialRig([complete()], new QueryError("QUERY_TIMEOUT"));
   const r = await tools.getSensorHealth("node01");
-  assert.equal(r.status, "partial");
+  assert.equal(r.query_status, "partial");
   assert.equal(r.assessment_complete, false);
-  assert.equal(r.is_online, null);
+  assert.equal(r.is_online, true);
   assert.match(r.health_summary, /^UNKNOWN/);
   assert.equal(r.window_rms_mps2, 10);
+  assert.equal(r.data_complete, true);
+  assert.equal(r.data_status, "complete");
+  assert.deepEqual(r.unavailable_fields, []);
   assert.equal(r.flag_sensor_fault, null);
   assert.equal(r.sources.vibration.timestamp, new Date(NOW).toISOString());
   assert.equal(r.sources.vibration.age_seconds, 0);
@@ -145,8 +148,12 @@ test("partial fault evidence retains positive flags without inventing healthy te
   const r = await partialRig(new Error("database failed"), [fault]).getSensorHealth("node01");
   assert.equal(r.flag_sensor_unavailable, true);
   assert.equal(r.flag_interlock_open, null);
-  assert.equal(r.is_online, null);
+  assert.equal(r.is_online, true);
   assert.equal(r.window_rms_mps2, null);
+  assert.equal(r.data_complete, null);
+  assert.equal(r.data_status, null);
+  assert.equal(r.unavailable_fields, null);
+  assert.equal(r.reason, null);
   assert.equal(r.sources.sensor_faults.age_seconds, 10);
   assert.match(r.health_summary, /^UNKNOWN/);
 });
@@ -165,7 +172,7 @@ test("empty successful source with a failed source is unknown, never offline", a
 
 test("partial anomaly results preserve events and declare missing source coverage", async () => {
   const r = await partialRig([invalid()], new QueryError("QUERY_TIMEOUT")).getRecentAnomalies("node01", 60);
-  assert.equal(r.status, "partial");
+  assert.equal(r.query_status, "partial");
   assert.equal(r.query_complete, false);
   assert.equal(r.events.length, 1);
   assert.equal(r.sources.sensor_faults.error?.code, "QUERY_TIMEOUT");
@@ -174,10 +181,64 @@ test("partial anomaly results preserve events and declare missing source coverag
 
 test("partial empty anomaly results do not claim no matching events", async () => {
   const r = await partialRig([], new Error("failed")).getRecentAnomalies("node01", 60);
-  assert.equal(r.status, "partial");
+  assert.equal(r.query_status, "partial");
   assert.equal(r.returned_event_count, 0);
   assert.match(r.message!, /unavailable source/);
   assert.doesNotMatch(r.message!, /No flagged/);
+});
+
+test("old positive evidence cannot establish offline status while another source is missing", async () => {
+  const row = complete(); row._time = new Date(NOW - 60000).toISOString();
+  const fault = { _time: new Date(NOW - 60000).toISOString(), flags: 0x40 };
+  for (const tools of [partialRig([row], new QueryError("QUERY_TIMEOUT")),
+    partialRig(new QueryError("QUERY_TIMEOUT"), [fault])]) {
+    const r = await tools.getSensorHealth("node01");
+    assert.equal(r.is_online, null);
+    assert.equal(r.query_status, "partial");
+    assert.equal(r.assessment_complete, false);
+    assert.equal(r.last_seen_seconds_ago, 60);
+    assert.match(r.health_summary, /^UNKNOWN/);
+  }
+});
+
+test("query status is consistent across tools and independent of data presence or health", async () => {
+  const tools = rig([]).tools;
+  const latest = await tools.getLatestTelemetry("node01");
+  assert.equal(latest.query_status, "ok");
+  assert.equal(latest.status, "no_data"); // legacy data-presence status
+  const health = await tools.getSensorHealth("node01");
+  assert.equal(health.query_status, "ok");
+  assert.equal(health.is_online, false);
+  assert.match(health.health_summary, /^OFFLINE/);
+  assert.equal(health.data_complete, null);
+  assert.equal(health.data_status, null);
+  assert.equal(health.unavailable_fields, null);
+  const anomalies = await tools.getRecentAnomalies("node01", 60);
+  assert.equal(anomalies.query_status, "ok");
+  assert.equal((await rig([complete()]).tools.getLatestTelemetry("node01")).query_status, "ok");
+  assert.equal("status" in health, false);
+  assert.equal("status" in anomalies, false);
+});
+
+test("successful vibration query with no rows leaves quality unassessed", async () => {
+  const fault = { _time: new Date(NOW).toISOString(), flags: 0x40 };
+  const r = await rig([], [fault]).tools.getSensorHealth("node01");
+  assert.equal(r.query_complete, true);
+  assert.equal(r.sources.vibration.status, "no_data");
+  assert.equal(r.data_status, null);
+  assert.equal(r.data_complete, null);
+  assert.equal(r.unavailable_fields, null);
+  assert.equal(r.window_rms_mps2, null);
+  assert.equal(r.is_online, true);
+  assert.equal(r.flag_sensor_unavailable, true);
+});
+
+test("invalid telemetry stays invalid when only the fault query fails", async () => {
+  const r = await partialRig([invalid()], new QueryError("QUERY_TIMEOUT")).getSensorHealth("node01");
+  assert.equal(r.data_status, "unavailable");
+  assert.equal(r.data_complete, false);
+  assert.deepEqual(r.unavailable_fields, ["ax", "ay", "az", "gx", "gy", "gz", "wrms"]);
+  assert.equal(r.is_online, true);
 });
 
 test("query completion, measurement completeness, and observation age are independent", async () => {
@@ -188,4 +249,25 @@ test("query completion, measurement completeness, and observation age are indepe
   assert.equal(r.data_complete, false);
   assert.equal(r.sources.vibration.age_seconds, 60);
   assert.equal(r.queried_at, new Date(NOW).toISOString());
+});
+
+test("partial results attribute queue expiry to local capacity, whichever source expired", async () => {
+  const fault = { _time: new Date(NOW).toISOString(), flags: 0x40 };
+  for (const tools of [
+    partialRig([complete()], new QueryError("QUERY_QUEUE_TIMEOUT")),
+    partialRig(new QueryError("QUERY_QUEUE_TIMEOUT"), [fault]),
+  ]) {
+    const health = await tools.getSensorHealth("node01");
+    assert.equal(health.query_status, "partial");
+    assert.equal(health.assessment_complete, false);
+    assert.equal(health.is_online, true);
+    assert.equal(health.dependency_status.influxdb, "available");
+    assert.equal(health.dependency_status.query_service, "busy");
+    assert.match(health.health_summary, /^UNKNOWN/);
+    const anomalies = await tools.getRecentAnomalies("node01", 60);
+    assert.equal(anomalies.query_status, "partial");
+    assert.equal(anomalies.dependency_status.influxdb, "available");
+    assert.equal(anomalies.dependency_status.query_service, "busy");
+    assert.equal(anomalies.events.length, 1);
+  }
 });

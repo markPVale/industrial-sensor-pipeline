@@ -52,6 +52,14 @@ test("query settings default conservatively and reject invalid values", () => {
   }
 });
 
+test("settings reject a single slot without queueing but permit serial and parallel pairs", () => {
+  assert.throws(() => querySettings({ MCP_QUERY_CONCURRENCY: "1", MCP_QUERY_MAX_QUEUE: "0" }), /Paired/);
+  assert.equal(querySettings({ MCP_QUERY_CONCURRENCY: "1", MCP_QUERY_MAX_QUEUE: "1" }).concurrency, 1);
+  assert.equal(querySettings({ MCP_QUERY_CONCURRENCY: "2", MCP_QUERY_MAX_QUEUE: "0" }).maxQueue, 0);
+  assert.throws(() => new QueryService({ url: "http://localhost:8086", token: "test", org: "industrial" },
+    { concurrency: 1, maxQueue: 0 }), /Paired/);
+});
+
 test("deadline destroys an HTTP request stalled before headers and releases its slot", async t => {
   let closed!: () => void;
   const closure = new Promise<void>(resolve => { closed = resolve; });
@@ -66,7 +74,8 @@ test("deadline destroys an HTTP request stalled before headers and releases its 
   await bounded(closure);
   assert.deepEqual(service.pool.state, { active: 0, queued: 0 });
   assert.equal(logs[0].outcome, "QUERY_TIMEOUT");
-  assert.equal(logs[0].timeouts_total, 1);
+  assert.equal(logs[0].query_timeouts_total, 1);
+  assert.equal("timeouts_total" in logs[0], false);
   assert.doesNotMatch(JSON.stringify(logs), /private-token|stall/);
   const rows = await withQueryDeadline(500, signal => service.run("recover", signal));
   assert.equal(rows[0].window_rms, 10);
@@ -197,10 +206,11 @@ test("a shared deadline preserves completed telemetry when the fault query stall
     if (!query.includes('r._measurement == "sensor_faults"')) res.end(csv);
   });
   const result = await withQueryDeadline(120, signal =>
-    createTelemetryTools(query => service.run(query, signal), "sensors").getSensorHealth("node01"));
-  assert.equal(result.status, "partial");
+    createTelemetryTools(query => service.run(query, signal), "sensors",
+      () => Date.parse("2026-10-28T12:00:01Z")).getSensorHealth("node01"));
+  assert.equal(result.query_status, "partial");
   assert.equal(result.assessment_complete, false);
-  assert.equal(result.is_online, null);
+  assert.equal(result.is_online, true);
   assert.match(result.health_summary, /^UNKNOWN/);
   assert.ok("window_rms_mps2" in result);
   assert.equal(result.window_rms_mps2, 10);
@@ -238,4 +248,149 @@ test("HTTP failures retain classification and never turn into sensor offline", a
       return true;
     });
   assert.equal(service.pool.state.active, 0);
+});
+
+for (const tool of ["health", "anomalies"] as const) {
+  test(`${tool} preserves admitted results and reports real local contention separately from InfluxDB`, async t => {
+    const requests: string[] = [];
+    let received!: () => void;
+    const started = new Promise<void>(resolve => { received = resolve; });
+    const { url } = await fixture(t, (query, res) => {
+      requests.push(query);
+      if (query === "occupy") received();
+      else res.end(csv);
+    });
+    const settings = querySettings({ MCP_QUERY_CONCURRENCY: "2", MCP_QUERY_MAX_QUEUE: "0" });
+    const service = new QueryService({ url, token: "test", org: "industrial" }, settings, () => {});
+    const occupying = new AbortController();
+    const blocker = service.run("occupy", occupying.signal).catch(error => {
+      assert.equal(classifyToolError(error).code, "QUERY_CANCELLED");
+    });
+    try {
+      await bounded(started);
+      const result = await withQueryDeadline(500, async signal => {
+        const tools = createTelemetryTools(query => service.run(query, signal), "sensors",
+          () => Date.parse("2026-10-28T12:00:01Z"));
+        return tool === "health" ? await tools.getSensorHealth("node01") : await tools.getRecentAnomalies("node01", 60);
+      });
+      assert.equal(result.query_status, "partial");
+      assert.equal(result.query_complete, false);
+      assert.equal(result.dependency_status.influxdb, "available");
+      assert.equal(result.dependency_status.query_service, "busy");
+      assert.equal(result.sources.vibration.status, "ok");
+      assert.equal(result.sources.sensor_faults.error?.code, "QUERY_BUSY");
+      assert.equal(requests.length, 2, "only the occupying and admitted queries reach HTTP");
+      assert.ok(requests.every(query => !query.includes('r._measurement == "sensor_faults"')));
+      if ("is_online" in result) {
+        assert.equal(result.is_online, true);
+        assert.equal(result.assessment_complete, false);
+        assert.match(result.health_summary, /^UNKNOWN/);
+      } else {
+        assert.equal(result.events.length, 1);
+        assert.equal(result.coverage_status, "not_assessed");
+      }
+    } finally {
+      occupying.abort(new QueryError("QUERY_CANCELLED"));
+      await blocker;
+    }
+    assert.deepEqual(service.pool.state, { active: 0, queued: 0 });
+  });
+}
+
+test("one active slot with one waiting slot completes a healthy serial pair", async t => {
+  let queries = 0;
+  const { url } = await fixture(t, (_query, res) => { ++queries; res.end(csv); });
+  const service = new QueryService({ url, token: "test", org: "industrial" },
+    querySettings({ MCP_QUERY_CONCURRENCY: "1", MCP_QUERY_MAX_QUEUE: "1" }), () => {});
+  const result = await withQueryDeadline(500, signal =>
+    createTelemetryTools(query => service.run(query, signal), "sensors",
+      () => Date.parse("2026-10-28T12:00:01Z")).getSensorHealth("node01"));
+  assert.equal(result.query_status, "ok");
+  assert.equal(result.query_complete, true);
+  assert.equal(result.assessment_complete, true);
+  assert.equal(result.is_online, true);
+  assert.equal(result.dependency_status.query_service, "available");
+  assert.equal(queries, 2);
+  assert.deepEqual(service.pool.state, { active: 0, queued: 0 });
+});
+
+test("one timed-out health call counts two underlying query timeouts", async t => {
+  const { service, logs } = await fixture(t, () => {});
+  await assert.rejects(withQueryDeadline(150, signal =>
+    createTelemetryTools(query => service.run(query, signal), "sensors").getSensorHealth("node01")),
+    error => classifyToolError(error).code === "QUERY_TIMEOUT");
+  assert.equal(logs.length, 2);
+  assert.equal(logs.at(-1)?.query_timeouts_total, 2);
+  assert.equal(logs.at(-1)?.queries_total, 2);
+  assert.deepEqual(service.pool.state, { active: 0, queued: 0 });
+});
+
+test("default-capacity queue expiry never contacts InfluxDB and reports local queue timeout", async t => {
+  const settings = querySettings({});
+  const requests: string[] = [];
+  let received!: () => void;
+  const started = new Promise<void>(resolve => { received = resolve; });
+  const { url } = await fixture(t, (query, _res) => {
+    requests.push(query);
+    if (requests.length === settings.concurrency) received();
+  });
+  const logs: Record<string, unknown>[] = [];
+  const service = new QueryService({ url, token: "test", org: "industrial" }, settings,
+    event => logs.push(event));
+  const occupying = new AbortController();
+  const blockers = Array.from({ length: settings.concurrency }, () =>
+    service.run("occupy", occupying.signal).catch(error => {
+      assert.equal(classifyToolError(error).code, "QUERY_CANCELLED");
+    }));
+  try {
+    await bounded(started);
+    await assert.rejects(withQueryDeadline(120, signal =>
+      createTelemetryTools(query => service.run(query, signal), "sensors").getSensorHealth("node01")),
+      error => classifyToolError(error).code === "QUERY_QUEUE_TIMEOUT");
+    assert.deepEqual(requests, ["occupy", "occupy", "occupy", "occupy"]);
+    assert.deepEqual(service.pool.state, { active: 4, queued: 0 });
+    assert.equal(logs.length, 2);
+    assert.ok(logs.every(event => event.outcome === "QUERY_QUEUE_TIMEOUT"));
+    assert.equal(logs.at(-1)?.query_timeouts_total, 2);
+  } finally {
+    occupying.abort(new QueryError("QUERY_CANCELLED"));
+    await Promise.all(blockers);
+  }
+  assert.deepEqual(service.pool.state, { active: 0, queued: 0 });
+});
+
+test("a shared deadline distinguishes an active request timeout from its queued sibling", async t => {
+  const requests: string[] = [];
+  let received!: () => void;
+  const started = new Promise<void>(resolve => { received = resolve; });
+  const { url } = await fixture(t, (query, _res) => {
+    requests.push(query);
+    if (query === "occupy") received();
+  });
+  const logs: Record<string, unknown>[] = [];
+  const service = new QueryService({ url, token: "test", org: "industrial" },
+    querySettings({ MCP_QUERY_CONCURRENCY: "2", MCP_QUERY_MAX_QUEUE: "1" }), event => logs.push(event));
+  const occupying = new AbortController();
+  const blocker = service.run("occupy", occupying.signal).catch(error => {
+    assert.equal(classifyToolError(error).code, "QUERY_CANCELLED");
+  });
+  try {
+    await bounded(started);
+    let deadlineSignal!: AbortSignal;
+    await assert.rejects(withQueryDeadline(150, signal => {
+      deadlineSignal = signal;
+      return createTelemetryTools(query => service.run(query, signal), "sensors").getSensorHealth("node01");
+    }), error => classifyToolError(error).code === "QUERY_TIMEOUT");
+    assert.deepEqual(logs.map(event => event.outcome).sort(), ["QUERY_QUEUE_TIMEOUT", "QUERY_TIMEOUT"]);
+    assert.equal(classifyToolError(deadlineSignal.reason).code, "QUERY_TIMEOUT",
+      "per-query attribution must not mutate the shared deadline reason");
+    assert.equal(logs.at(-1)?.query_timeouts_total, 2);
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every(query => !query.includes('r._measurement == "sensor_faults"')));
+    assert.deepEqual(service.pool.state, { active: 1, queued: 0 });
+  } finally {
+    occupying.abort(new QueryError("QUERY_CANCELLED"));
+    await blocker;
+  }
+  assert.deepEqual(service.pool.state, { active: 0, queued: 0 });
 });

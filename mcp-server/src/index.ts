@@ -75,7 +75,7 @@ function createServer(): Server {
       },
       {
         name:        "get_sensor_health",
-        description: "Returns sensor health, observation ages and status flags. Incomplete database queries return partial evidence with unknown health and nullable status flags.",
+        description: "Returns sensor health, observation ages and status flags. Recent reporting remains online even if a source query fails; overall health stays incomplete and unobserved flags or measurement quality may be null. Inspect query_status and assessment_complete.",
         inputSchema: {
           type: "object",
           additionalProperties: false,

@@ -16,9 +16,10 @@ export class InputError extends Error {
 }
 
 export class QueryError extends Error {
-  constructor(public readonly code: "QUERY_TIMEOUT" | "QUERY_BUSY" | "QUERY_CANCELLED") {
+  constructor(public readonly code: "QUERY_TIMEOUT" | "QUERY_QUEUE_TIMEOUT" | "QUERY_BUSY" | "QUERY_CANCELLED") {
     super({
       QUERY_TIMEOUT: "Sensor data query exceeded its deadline.",
+      QUERY_QUEUE_TIMEOUT: "Sensor data query deadline expired before a database request could start.",
       QUERY_BUSY: "Sensor data service is busy. Try again later.",
       QUERY_CANCELLED: "Sensor data query was cancelled.",
     }[code]);
