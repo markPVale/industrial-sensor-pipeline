@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createTelemetryTools, FluxRow } from "../src/telemetry-tools.js";
+import { QueryError } from "../src/tool-utils.js";
 
 const NOW = Date.parse("2026-10-05T12:00:00Z");
 const complete = (): FluxRow => ({ _time: new Date(NOW).toISOString(),
@@ -115,4 +116,76 @@ test("database errors propagate instead of becoming healthy or empty results", a
   await assert.rejects(tools.getLatestTelemetry("node01"), /database offline/);
   await assert.rejects(tools.getSensorHealth("node01"), /database offline/);
   await assert.rejects(tools.getRecentAnomalies("node01", 60), /database offline/);
+});
+
+function partialRig(vibration: FluxRow[] | Error, faults: FluxRow[] | Error) {
+  return createTelemetryTools(async query => {
+    const value = query.includes('_measurement == "sensor_faults"') ? faults : vibration;
+    if (value instanceof Error) throw value;
+    return value;
+  }, "sensors", () => NOW);
+}
+
+test("fault query failure preserves telemetry but makes health and absent flags unknown", async () => {
+  const tools = partialRig([complete()], new QueryError("QUERY_TIMEOUT"));
+  const r = await tools.getSensorHealth("node01");
+  assert.equal(r.status, "partial");
+  assert.equal(r.assessment_complete, false);
+  assert.equal(r.is_online, null);
+  assert.match(r.health_summary, /^UNKNOWN/);
+  assert.equal(r.window_rms_mps2, 10);
+  assert.equal(r.flag_sensor_fault, null);
+  assert.equal(r.sources.vibration.timestamp, new Date(NOW).toISOString());
+  assert.equal(r.sources.vibration.age_seconds, 0);
+  assert.equal(r.sources.sensor_faults.error?.code, "QUERY_TIMEOUT");
+});
+
+test("partial fault evidence retains positive flags without inventing healthy telemetry", async () => {
+  const fault = { _time: new Date(NOW - 10000).toISOString(), flags: 0x40, whoami_raw: 255 };
+  const r = await partialRig(new Error("database failed"), [fault]).getSensorHealth("node01");
+  assert.equal(r.flag_sensor_unavailable, true);
+  assert.equal(r.flag_interlock_open, null);
+  assert.equal(r.is_online, null);
+  assert.equal(r.window_rms_mps2, null);
+  assert.equal(r.sources.sensor_faults.age_seconds, 10);
+  assert.match(r.health_summary, /^UNKNOWN/);
+});
+
+test("empty successful source with a failed source is unknown, never offline", async () => {
+  const cases: [FluxRow[] | Error, FluxRow[] | Error][] = [
+    [[], new QueryError("QUERY_TIMEOUT")], [new QueryError("QUERY_BUSY"), []],
+  ];
+  for (const sources of cases) {
+    const r = await partialRig(sources[0], sources[1]).getSensorHealth("node01");
+    assert.equal(r.is_online, null);
+    assert.equal(r.assessment_complete, false);
+    assert.match(r.health_summary, /^UNKNOWN/);
+  }
+});
+
+test("partial anomaly results preserve events and declare missing source coverage", async () => {
+  const r = await partialRig([invalid()], new QueryError("QUERY_TIMEOUT")).getRecentAnomalies("node01", 60);
+  assert.equal(r.status, "partial");
+  assert.equal(r.query_complete, false);
+  assert.equal(r.events.length, 1);
+  assert.equal(r.sources.sensor_faults.error?.code, "QUERY_TIMEOUT");
+  assert.equal(r.coverage_status, "not_assessed");
+});
+
+test("partial empty anomaly results do not claim no matching events", async () => {
+  const r = await partialRig([], new Error("failed")).getRecentAnomalies("node01", 60);
+  assert.equal(r.status, "partial");
+  assert.equal(r.returned_event_count, 0);
+  assert.match(r.message!, /unavailable source/);
+  assert.doesNotMatch(r.message!, /No flagged/);
+});
+
+test("query completion, measurement completeness, and observation age are independent", async () => {
+  const row = invalid(); row._time = new Date(NOW - 60000).toISOString();
+  const r = await rig([row]).tools.getSensorHealth("node01");
+  assert.equal(r.query_complete, true);
+  assert.equal(r.assessment_complete, true);
+  assert.equal(r.data_complete, false);
+  assert.equal(r.sources.vibration.age_seconds, 60);
+  assert.equal(r.queried_at, new Date(NOW).toISOString());
 });

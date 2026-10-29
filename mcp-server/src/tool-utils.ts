@@ -1,3 +1,5 @@
+import { HttpError, RequestTimedOutError } from "@influxdata/influxdb-client";
+
 // Bound tool responses so a sustained fault cannot flood an LLM context with
 // an entire day of 2 Hz telemetry. A pretty-printed 500-event response measured
 // ~236 KB (~59k tokens) — far too large for a single tool result. 50 compact
@@ -11,6 +13,26 @@ export class InputError extends Error {
     super(message);
     this.name = "InputError";
   }
+}
+
+export class QueryError extends Error {
+  constructor(public readonly code: "QUERY_TIMEOUT" | "QUERY_BUSY" | "QUERY_CANCELLED") {
+    super({
+      QUERY_TIMEOUT: "Sensor data query exceeded its deadline.",
+      QUERY_BUSY: "Sensor data service is busy. Try again later.",
+      QUERY_CANCELLED: "Sensor data query was cancelled.",
+    }[code]);
+    this.name = "QueryError";
+  }
+}
+
+export function classifyToolError(error: unknown) {
+  if (error instanceof InputError) return { code: "INVALID_ARGUMENT", message: error.message };
+  if (error instanceof QueryError) return { code: error.code, message: error.message };
+  if (error instanceof RequestTimedOutError) {
+    return { code: "QUERY_TIMEOUT", message: "Sensor data query exceeded its deadline." };
+  }
+  return classifyDependencyError(error instanceof HttpError ? error.statusCode : undefined);
 }
 
 export type DependencyError = {

@@ -22,11 +22,11 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { HttpError, InfluxDB } from "@influxdata/influxdb-client";
 import {
-  InputError, MAX_ANOMALY_EVENTS, NODE_ID_RE, classifyDependencyError, parseNodeId,
+  InputError, MAX_ANOMALY_EVENTS, NODE_ID_RE, classifyToolError, parseNodeId,
 } from "./tool-utils.js";
 import { createTelemetryTools } from "./telemetry-tools.js";
+import { QueryService, querySettings, withQueryDeadline } from "./query-service.js";
 
 // ---------------------------------------------------------------------------
 // Configuration — override via environment variables
@@ -39,24 +39,8 @@ const INFLUX_BUCKET = process.env.INFLUX_BUCKET ?? "sensors";
 // ---------------------------------------------------------------------------
 // InfluxDB client
 // ---------------------------------------------------------------------------
-const influx   = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
-const queryApi = influx.getQueryApi(INFLUX_ORG);
-
-/** Execute a Flux query and return all result rows as plain objects. */
-async function runFlux(query: string): Promise<Record<string, unknown>[]> {
-  const rows: Record<string, unknown>[] = [];
-  await new Promise<void>((resolve, reject) => {
-    queryApi.queryRows(query, {
-      next(row, meta) { rows.push(meta.toObject(row)); },
-      error: reject,
-      complete: resolve,
-    });
-  });
-  return rows;
-}
-
-const { getLatestTelemetry, getSensorHealth, getRecentAnomalies } =
-  createTelemetryTools(runFlux, INFLUX_BUCKET);
+const settings = querySettings(process.env);
+const queries = new QueryService({ url: INFLUX_URL, token: INFLUX_TOKEN, org: INFLUX_ORG }, settings);
 
 // ---------------------------------------------------------------------------
 // MCP Server factory — one instance per SSE connection.
@@ -91,7 +75,7 @@ function createServer(): Server {
       },
       {
         name:        "get_sensor_health",
-        description: "Returns a health summary for a sensor node: online status, seconds since last message, current vibration RMS, and whether an anomaly or E-Stop is active.",
+        description: "Returns sensor health, observation ages and status flags. Incomplete database queries return partial evidence with unknown health and nullable status flags.",
         inputSchema: {
           type: "object",
           additionalProperties: false,
@@ -131,26 +115,25 @@ function createServer(): Server {
     ],
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
 
     try {
       const nodeId = parseNodeId(args?.node_id);
-      let result: unknown;
-
-      switch (name) {
-        case "get_latest_telemetry":
-          result = await getLatestTelemetry(nodeId);
-          break;
-        case "get_sensor_health":
-          result = await getSensorHealth(nodeId);
-          break;
-        case "get_recent_anomalies":
-          result = await getRecentAnomalies(nodeId, args?.window_minutes);
-          break;
-        default:
-          throw new InputError(`Unknown tool: ${name}`);
-      }
+      const result = await withQueryDeadline(settings.deadlineMs, async signal => {
+        const { getLatestTelemetry, getSensorHealth, getRecentAnomalies } =
+          createTelemetryTools(query => queries.run(query, signal), INFLUX_BUCKET);
+        switch (name) {
+          case "get_latest_telemetry":
+            return getLatestTelemetry(nodeId);
+          case "get_sensor_health":
+            return getSensorHealth(nodeId);
+          case "get_recent_anomalies":
+            return getRecentAnomalies(nodeId, args?.window_minutes);
+          default:
+            throw new InputError(`Unknown tool: ${name}`);
+        }
+      }, extra.signal);
 
       // Compact, not pretty-printed — indentation is pure token cost for an
       // LLM consumer and roughly a third of a large anomaly response.
@@ -158,9 +141,7 @@ function createServer(): Server {
         content: [{ type: "text", text: JSON.stringify(result) }],
       };
     } catch (err) {
-      const error = err instanceof InputError
-        ? { code: "INVALID_ARGUMENT", message: err.message }
-        : classifyDependencyError(err instanceof HttpError ? err.statusCode : undefined);
+      const error = classifyToolError(err);
 
       if (!(err instanceof InputError)) {
         console.error(`MCP tool "${name}" failed:`, err);

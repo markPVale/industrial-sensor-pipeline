@@ -59,13 +59,63 @@ takes priority over sensor-fault summaries.
 | `CRITICAL — E-Stop / safety interlock is active.` | `STATUS_INTERLOCK_OPEN` set |
 | `CRITICAL — Sensor unavailable. Max auto-reboots exhausted.` | `STATUS_SENSOR_UNAVAILABLE` set |
 | `OFFLINE — no recent telemetry.` | No data in last 30s |
+| `UNKNOWN — database query incomplete` | A telemetry or fault query failed; available evidence is returned without a complete health assessment |
+
+## Slow Queries and Partial Results
+
+Each tool call has a configurable **4-second wall-clock budget**, shared by
+queueing and all its InfluxDB queries. The deadline and MCP request cancellation
+propagate through a per-query `AbortSignal` to Node's HTTP transport. This closes
+stalled requests, including those that have not returned headers. It does not
+prove that InfluxDB immediately stops executing the query; server-side execution
+and real Pi latency still need deployment measurements. Timers are subject to
+Node's event-loop scheduling, so this is not a hard real-time guarantee.
+
+A process-wide pool permits **four active queries and sixteen waiting queries**
+by default, across all MCP sessions. Extra queries fail with `QUERY_BUSY`.
+Expired queued queries are removed without contacting InfluxDB. Queries are not
+automatically retried or cached. Existing Flux lookback and row limits remain;
+small returned row counts do not guarantee cheap scans, pivots, or sorts.
+
+Health and anomaly tools query `vibration` and `sensor_faults` independently:
+
+- If both succeed, `query_complete` is `true`.
+- If one fails, the tool returns `status: "partial"`, `query_complete: false`,
+  `dependency_status.influxdb: "degraded"`, and the successful source's data.
+  Each entry in `sources` identifies `ok`, `no_data`, or `error`; failures include
+  a safe error code/message. Partial results are successful MCP tool responses,
+  so consumers must inspect these completeness fields.
+- Partial health assessments set `assessment_complete: false`, `is_online: null`,
+  and an `UNKNOWN` summary. Observed positive flags remain `true`; unobserved
+  flags become `null`, since the missing source might contain a fault. This also
+  applies when the successful query returns no rows: a database failure never
+  establishes that the sensor is offline.
+- If both queries fail, the tool returns an MCP error (`isError: true`). A
+  latest-telemetry query failure also returns an error rather than `no_data`.
+
+Responses include `queried_at` and per-source `timestamp`/`age_seconds` for the
+newest returned observation. These are observation ages, not proof of a live
+connection. For anomaly queries they describe matching events, not ordinary
+telemetry coverage. `query_complete` describes query success; `data_complete`
+describes measurement quality. Even complete anomaly queries retain
+`coverage_status: "not_assessed"`.
+
+Each query emits a compact JSON diagnostic to **stderr** with duration (including
+queue time), outcome code, active/queued counts, and cumulative query/timeout
+counts. Query text and credentials are omitted. Counters reset on process restart.
+
+Tests use the installed InfluxDB client against loopback HTTP stubs to verify
+deadlines before headers and during slow streams, connection closure, queue
+expiry, cancellation, repeated cleanup, and recovery. A real MCP stdio client
+checks responsiveness and error responses. These tests do not execute Flux on
+a live InfluxDB instance or validate hardware safety behavior.
 
 ## Setup
 
 ```bash
 npm install
 npm run build       # compiles src/index.ts → dist/index.js
-npm test            # tool helpers and production query/response paths with mocked DB
+npm test            # tool tests, loopback HTTP cancellation, and MCP stdio integration
 ```
 
 ## Running
@@ -139,11 +189,15 @@ cp .mcp.example.json .mcp.json
 | `INFLUX_TOKEN` | `dev-token-change-in-production` | InfluxDB API token |
 | `INFLUX_ORG` | `industrial` | InfluxDB organisation |
 | `INFLUX_BUCKET` | `sensors` | InfluxDB bucket |
+| `MCP_QUERY_DEADLINE_MS` | `4000` | Shared wall-clock budget per tool call, including queue time |
+| `MCP_QUERY_CONCURRENCY` | `4` | Maximum active InfluxDB queries across all sessions |
+| `MCP_QUERY_MAX_QUEUE` | `16` | Maximum waiting queries; `0` rejects immediately when all slots are occupied |
 
 ## Architecture Notes
 
-- **Stateless query layer** — no MQTT subscription, no in-memory state. Every
-  tool call is a fresh Flux query against InfluxDB.
+- **Fresh database queries** — no MQTT subscription or telemetry cache. Every
+  tool call queries InfluxDB; only query admission and diagnostic counters are
+  held in memory.
 - **Bounded anomaly responses** — `get_recent_anomalies` returns at most 50
   events and sets `truncated: true` when more matches exist. The bound is
   enforced twice: `limit(n: 51)` in both Flux queries (so InfluxDB never streams
@@ -163,8 +217,9 @@ cp .mcp.example.json .mcp.json
   guessed at.
 - **Compact JSON responses** — tool results are serialised without indentation;
   whitespace is pure token cost for an LLM consumer.
-- **Data freshness** — ~500ms lag from firmware publish to queryable data
-  (bridge write interval).
+- **Data freshness** — responses expose observation timestamps and ages. Actual
+  publish-to-query latency depends on transport, synchronous bridge writes, and
+  database load; it is not guaranteed by the approximately 500 ms production cadence.
 - **Flux pivot pattern** — InfluxDB stores each field as a separate row. Queries
   use `pivot()` to combine fields into one row per timestamp before returning results.
 - **Flag decoding** — `get_latest_telemetry` and `get_sensor_health` return one
@@ -192,3 +247,6 @@ Failed tool calls return `isError: true` with a JSON body:
 | `INVALID_ARGUMENT` | Bad tool arguments or unknown tool name. The `message` is safe to surface to the caller. |
 | `DEPENDENCY_MISCONFIGURED` | InfluxDB rejected authentication/authorization or a configured resource was not found (HTTP 401/403/404). Correct the token, organization, bucket, or URL before retrying. |
 | `DEPENDENCY_FAILURE` | InfluxDB is unreachable, a query failed for another reason, or an internal bug occurred. The message is deliberately generic; the underlying error is written to stderr (`~/mcp-server.log` on the Pi), so check there rather than the tool response when diagnosing. |
+| `QUERY_TIMEOUT` | The shared tool deadline expired, including time spent waiting for a query slot. |
+| `QUERY_BUSY` | The active-query limit and waiting queue are both full. |
+| `QUERY_CANCELLED` | The MCP request was cancelled; its queued and active queries are cancelled too. |

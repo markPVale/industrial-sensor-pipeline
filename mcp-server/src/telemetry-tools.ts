@@ -8,6 +8,7 @@ import {
   FLAG_SENSOR_UNAVAILABLE,
   buildAnomalyQueries,
   capAnomalyEvents,
+  classifyToolError,
   decodeFlags,
   normalizeWindowMinutes,
   validateNodeId,
@@ -55,6 +56,34 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     return String(t);
   }
 
+  function source(result: PromiseSettledResult<FluxRow[]>) {
+    if (result.status === "rejected") {
+      return { status: "error", timestamp: null, age_seconds: null,
+        error: classifyToolError(result.reason) };
+    }
+    const timestamp = result.value[0] ? toISOString(result.value[0]._time) : null;
+    return { status: timestamp ? "ok" : "no_data", timestamp,
+      age_seconds: timestamp ? Math.max(0, Math.round((now() - Date.parse(timestamp)) / 1000)) : null };
+  }
+
+  async function paired(vibration: string, faults: string) {
+    const [vib, fault] = await Promise.allSettled([runFlux(vibration), runFlux(faults)]);
+    // Complete failure is an MCP error, never an empty result or sensor status.
+    if (vib.status === "rejected" && fault.status === "rejected") throw vib.reason;
+    const complete = vib.status === "fulfilled" && fault.status === "fulfilled";
+    return {
+      vibRows: vib.status === "fulfilled" ? vib.value : [],
+      faultRows: fault.status === "fulfilled" ? fault.value : [],
+      metadata: {
+        status: complete ? "ok" : "partial",
+        query_complete: complete,
+        queried_at: new Date(now()).toISOString(),
+        dependency_status: { influxdb: complete ? "available" : "degraded" },
+        sources: { vibration: source(vib), sensor_faults: source(fault) },
+      },
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Tool implementations
   // ---------------------------------------------------------------------------
@@ -75,13 +104,16 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     `;
 
     const rows = await runFlux(flux);
+    const metadata = { queried_at: new Date(now()).toISOString(), query_complete: true,
+      sources: { vibration: source({ status: "fulfilled", value: rows }) } };
     if (rows.length === 0) {
-      return { node_id: nodeId, status: "no_data", message: "No telemetry found in the last hour." };
+      return { ...metadata, node_id: nodeId, status: "no_data", message: "No telemetry found in the last hour." };
     }
 
     const r     = rows[0];
     const flags = r["flags"] as number;
     return {
+      ...metadata,
       node_id:                        nodeId,
       timestamp:                      toISOString(r["_time"]),
       ...measurements(r),
@@ -109,33 +141,36 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     // routed to sensor_faults by the bridge and would be invisible to a
     // vibration-only query, causing health to report stale "OK" then OFFLINE
     // instead of DEGRADED or UNAVAILABLE during an I2C fault.
-    const [vibRows, faultRows] = await Promise.all([
-      runFlux(`
+    const { vibRows, faultRows, metadata } = await paired(`
         from(bucket: "${INFLUX_BUCKET}")
           |> range(start: -5m)
           |> filter(fn: (r) => r._measurement == "vibration" and r.node_id == "${nodeId}")
           |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 1)
-      `),
-      runFlux(`
+      `, `
         from(bucket: "${INFLUX_BUCKET}")
           |> range(start: -5m)
           |> filter(fn: (r) => r._measurement == "sensor_faults" and r.node_id == "${nodeId}")
           |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
           |> sort(columns: ["_time"], desc: true)
           |> limit(n: 1)
-      `),
-    ]);
+      `);
 
     const latestVib   = vibRows[0]   ?? null;
     const latestFault = faultRows[0] ?? null;
 
     if (!latestVib && !latestFault) {
       return {
+        ...metadata,
+        assessment_complete: metadata.query_complete,
         node_id:   nodeId,
-        is_online: false,
-        message:   "No telemetry received in the last 5 minutes. Node may be offline or disconnected.",
+        is_online: metadata.query_complete ? false : null,
+        health_summary: metadata.query_complete ? "OFFLINE — no recent telemetry."
+          : "UNKNOWN — database query incomplete; sensor health cannot be assessed.",
+        message: metadata.query_complete
+          ? "No telemetry received in the last 5 minutes. Node may be offline or disconnected."
+          : "One data source could not be queried; absence of telemetry cannot be established.",
       };
     }
 
@@ -151,9 +186,15 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     const rms = metrics.window_rms_mps2;
 
     const age = Math.round((now() - latestTime) / 1000);
+    // An observed flag remains evidence; missing flags are unknown when a source
+    // failed, because the unavailable source may contain a fault or interlock.
+    const flag = (mask: number) => (mergedFlags & mask) !== 0 ? true
+      : metadata.query_complete ? false : null;
     return {
+      ...metadata,
+      assessment_complete: metadata.query_complete,
       node_id:                        nodeId,
-      is_online:                      age < 30,
+      is_online:                      metadata.query_complete ? age < 30 : null,
       last_seen_seconds_ago:          age,
       vibration_rms_mps2:             rms,
       window_rms_mps2:                rms,
@@ -162,13 +203,15 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
       data_status:                   metrics.data_status,
       unavailable_fields:            metrics.unavailable_fields,
       reason:                        metrics.reason,
-      flag_interlock_open:            (mergedFlags & FLAG_INTERLOCK_OPEN)           !== 0,
-      flag_anomaly:                   (mergedFlags & FLAG_ANOMALY)                  !== 0,
-      flag_sensor_fault:              (mergedFlags & FLAG_SENSOR_FAULT)             !== 0,
-      flag_degraded_reboot_required:  (mergedFlags & FLAG_DEGRADED_REBOOT_REQUIRED) !== 0,
-      flag_sensor_unavailable:        (mergedFlags & FLAG_SENSOR_UNAVAILABLE)       !== 0,
+      flag_interlock_open:            flag(FLAG_INTERLOCK_OPEN),
+      flag_anomaly:                   flag(FLAG_ANOMALY),
+      flag_sensor_fault:              flag(FLAG_SENSOR_FAULT),
+      flag_degraded_reboot_required:  flag(FLAG_DEGRADED_REBOOT_REQUIRED),
+      flag_sensor_unavailable:        flag(FLAG_SENSOR_UNAVAILABLE),
       whoami_raw:                     latestFault ? latestFault["whoami_raw"] ?? null : null,
-      health_summary:                 buildHealthSummary(age, mergedFlags, rms, metrics.data_complete),
+      health_summary:                 metadata.query_complete
+        ? buildHealthSummary(age, mergedFlags, rms, metrics.data_complete)
+        : "UNKNOWN — database query incomplete; observed readings and flags are partial evidence.",
     };
   }
 
@@ -198,19 +241,19 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
       windowMinutes: window,
     });
 
-    const [vibRows, faultRows] = await Promise.all([
-      runFlux(queries.vibration),
-      runFlux(queries.faults),
-    ]);
+    const { vibRows, faultRows, metadata } = await paired(queries.vibration, queries.faults);
 
     if (vibRows.length === 0 && faultRows.length === 0) {
       return {
+        ...metadata,
         node_id:              nodeId,
         window_minutes:       window,
         returned_event_count: 0,
         truncated:            false,
         coverage_status:      "not_assessed",
-        message:              `No flagged or invalid-data events found in the last ${window} minutes; data coverage has not been assessed.`,
+        message: metadata.query_complete
+          ? `No flagged or invalid-data events found in the last ${window} minutes; data coverage has not been assessed.`
+          : "Query incomplete; events from an unavailable source may be missing. Data coverage has not been assessed.",
         events:               [],
       };
     }
@@ -248,6 +291,7 @@ export function createTelemetryTools(runFlux: FluxRunner, INFLUX_BUCKET: string,
     // The true total is not computed — both queries are row-bounded — so it is
     // omitted rather than guessed.
     return {
+      ...metadata,
       node_id:              nodeId,
       window_minutes:       window,
       returned_event_count: events.length,
